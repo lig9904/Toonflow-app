@@ -1,6 +1,6 @@
 {
   "validationMode": "local-app-with-mocked-upstream",
-  "importThroughRealApi": false,
+  "importThroughLocalApplicationApi": true,
   "models": 30,
   "textSdkRoundtrip": true,
   "imageRoundtrip": true,

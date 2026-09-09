@@ -1,0 +1,15 @@
+{
+  "validationMode": "local-app-with-mocked-upstream",
+  "importThroughRealApi": false,
+  "models": 30,
+  "textSdkRoundtrip": true,
+  "imageRoundtrip": true,
+  "uploadMultipartBytesPreserved": true,
+  "uploads": 1,
+  "createPosts": 1,
+  "queries": 2,
+  "processRestart": true,
+  "jobStatus": "SUCCEEDED",
+  "downloadSaved": true,
+  "paidCalls": 0
+}

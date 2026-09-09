@@ -1,9 +1,9 @@
-import { createHash } from "node:crypto";
 import { generateText, streamText, wrapLanguageModel, stepCountIs, extractReasoningMiddleware } from "ai";
 import { devToolsMiddleware } from "@ai-sdk/devtools";
 import axios from "axios";
 import { transform } from "sucrase";
 import u from "@/utils";
+import { createPersistentVideoTaskProvider, type PersistentVideoTaskProvider } from "@/lib/persistentVideoAdapter";
 
 type AiType =
   | "scriptAgent"
@@ -152,21 +152,7 @@ async function getVendorTemplateFn(fnName: FnName, modelName: `${string}:${strin
   else return <T>(input: T) => fn(input, selectedModel);
 }
 
-export interface PersistentVideoTaskProvider {
-  fingerprint: string;
-  submit(config: unknown): Promise<{ taskId: string }>;
-  query(taskId: string): Promise<{ status: "pending" | "succeeded" | "failed"; outputUrl?: string; error?: string }>;
-}
-
-function withPersistentTaskTimeout<T>(operation: () => Promise<T>, timeoutMs = 60_000): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error("持久化视频任务适配器超时")), timeoutMs);
-    operation().then(
-      (value) => { clearTimeout(timeout); resolve(value); },
-      (error) => { clearTimeout(timeout); reject(error); },
-    );
-  });
-}
+export type { PersistentVideoTaskProvider } from "@/lib/persistentVideoAdapter";
 
 /**
  * Only adapters that explicitly export submitVideoTask/queryVideoTask can be
@@ -176,21 +162,17 @@ function withPersistentTaskTimeout<T>(operation: () => Promise<T>, timeoutMs = 6
 export async function getPersistentVideoTaskProvider(key: `${string}:${string}`): Promise<PersistentVideoTaskProvider> {
   const modelName = await resolveModelName(key);
   const { id, selectedModel, running, enabled } = await loadVendorRuntime(modelName);
-  if (!enabled) throw new Error(`供应商 ${id} 未启用，不能提交或恢复持久化视频任务`);
-  if (id !== "volcengine" || typeof running.submitVideoTask !== "function" || typeof running.queryVideoTask !== "function") {
-    throw new Error(`模型 ${modelName} 未提供可恢复的视频任务适配器`);
-  }
-  const endpoint = String(running.vendor?.inputValues?.baseUrl ?? "").replace(/\/+$/, "");
-  const fingerprint = createHash("sha256")
-    .update(JSON.stringify({ vendorId: id, endpoint, modelName: selectedModel.modelName }))
-    .digest("hex");
-  return {
-    fingerprint,
-    // The vendor template owns fetch. This bounds the durable worker even if a
-    // template's fetch cannot be aborted; a timed-out POST is reconciled, never retried.
-    submit: async (config) => withPersistentTaskTimeout(() => running.submitVideoTask(config, selectedModel)),
-    query: async (taskId) => withPersistentTaskTimeout(() => running.queryVideoTask(taskId)),
-  };
+  return createPersistentVideoTaskProvider({
+    vendorId: id,
+    modelName: selectedModel.modelName,
+    endpoint: String(running.vendor?.inputValues?.baseUrl ?? running.vendor?.inputValues?.endpoint ?? ""),
+    model: selectedModel,
+    enabled,
+    persistentVideoTaskVersion: running.persistentVideoTaskVersion,
+    runtime: running,
+    submitVideoTask: running.submitVideoTask,
+    queryVideoTask: running.queryVideoTask,
+  });
 }
 
 async function withTaskRecord<T>(

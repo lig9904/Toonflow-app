@@ -3,6 +3,7 @@ import u from "@/utils";
 import { z } from "zod";
 import { success } from "@/lib/responseFormat";
 import { validateFields } from "@/middleware/middleware";
+import { insertRowsReturningIds } from "@/lib/insertRows";
 const router = express.Router();
 
 // 新增原文数据
@@ -28,7 +29,7 @@ export default router.post(
       lastChapterIndex = getLastChapterIndex.chapterIndex!;
     }
     for (const item of data) {
-      const [id] = await u.db("o_novel").insert({
+      const [id] = await insertRowsReturningIds(u.db, "o_novel", {
         projectId,
         chapterIndex: ++lastChapterIndex,
         reel: item.reel,

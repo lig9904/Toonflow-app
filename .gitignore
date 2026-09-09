@@ -55,3 +55,7 @@ database.d.ts
 data/oss/*
 data/test.sqlite
 version.txt
+
+# Host-specific operations records and local work files must not be published.
+/docs/custom/DEPLOYMENT-*.md
+.local/

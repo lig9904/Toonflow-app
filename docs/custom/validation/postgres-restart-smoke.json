@@ -1,0 +1,13 @@
+{
+  "database": "PostgreSQL 18.6",
+  "realHttpProjectScriptStoryboardCreation": true,
+  "fractionalDuration": 5.5,
+  "realProcessRestart": true,
+  "createPosts": 1,
+  "queriesBeforeRestart": 1,
+  "totalQueries": 2,
+  "jobStatus": "SUCCEEDED",
+  "separateMediaDirectory": true,
+  "realNasConnected": false,
+  "modelWasMock": true
+}

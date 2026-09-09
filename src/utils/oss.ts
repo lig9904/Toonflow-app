@@ -3,6 +3,7 @@ import getPath, { isEletron } from "@/utils/getPath";
 import fs from "node:fs/promises";
 import path from "node:path";
 import sharp from "sharp";
+import { ensureMediaDirectory } from "./mediaStorage";
 
 // 规范化路径：去除前导斜杠，并将路径分隔符统一转换为系统分隔符
 function normalizeUserPath(userPath: string): string {
@@ -26,19 +27,23 @@ function resolveSafeLocalPath(userPath: string, rootDir: string): string {
 class OSS {
   private rootDir: string;
   private initPromise: Promise<void>;
+  private readonly external = Boolean(process.env.TOONFLOW_MEDIA_DIR);
 
   constructor() {
     this.rootDir = getPath("oss");
     // 初始化时自动创建根目录
-    this.initPromise = fs.mkdir(this.rootDir, { recursive: true }).then(() => {});
+    this.initPromise = ensureMediaDirectory(this.rootDir, this.external);
   }
 
   /**
    * 等待根目录初始化完成。用于保证所有文件操作在目录已创建后执行。
    * @private
    */
+  async ready() { await this.initPromise; }
+
   private async ensureInit() {
     await this.initPromise;
+    if (this.external) await ensureMediaDirectory(this.rootDir, true);
   }
 
   /**
@@ -99,7 +104,15 @@ class OSS {
       ".tiff": "image/tiff",
       ".tif": "image/tiff",
       ".mp4": "video/mp4",
+      ".webm": "video/webm",
       ".mp3": "audio/mpeg",
+      ".wav": "audio/wav",
+      ".m4a": "audio/mp4",
+      ".aif": "audio/aiff",
+      ".aiff": "audio/aiff",
+      ".flac": "audio/flac",
+      ".ogg": "audio/ogg",
+      ".aac": "audio/aac",
     };
 
     const mimeType = mimeTypes[ext];

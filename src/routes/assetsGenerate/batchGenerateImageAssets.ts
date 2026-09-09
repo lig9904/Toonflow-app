@@ -5,6 +5,7 @@ import { z } from "zod";
 import { v4 as uuidv4 } from "uuid";
 import { error, success } from "@/lib/responseFormat";
 import { validateFields } from "@/middleware/middleware";
+import { insertRowsReturningIds } from "@/lib/insertRows";
 
 const router = express.Router();
 
@@ -83,7 +84,7 @@ export default router.post("/", validateFields(requestSchema), async (req, res) 
   // 2. 逐条插入 o_image 占位记录，收集 imageId 列表
   const totalNovelId: number[] = [];
   for (const item of items) {
-    const [imageId] = await u.db("o_image").insert({
+      const [imageId] = await insertRowsReturningIds(u.db, "o_image", {
       type: item.type,
       state: "生成中",
       assetsId: item.id,

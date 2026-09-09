@@ -3,6 +3,7 @@ import { success } from "@/lib/responseFormat";
 import u from "@/utils";
 import { z } from "zod";
 import { validateFields } from "@/middleware/middleware";
+import { insertRowsReturningIds } from "@/lib/insertRows";
 const router = express.Router();
 
 export default router.post(
@@ -16,7 +17,7 @@ export default router.post(
     const row = await u.db("o_agentWorkData").where({ projectId: projectId, key: agentType }).first();
 
     if (!row) {
-      const [id] = await u.db("o_agentWorkData").insert({
+      const [id] = await insertRowsReturningIds(u.db, "o_agentWorkData", {
         projectId: projectId,
         key: agentType,
         data: JSON.stringify({

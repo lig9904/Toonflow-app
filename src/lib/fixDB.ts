@@ -52,7 +52,7 @@ export default async (knex: Knex): Promise<void> => {
     state: "生成失败",
     reason: "软件退出导致失败",
   });
-  await db("o_video").where("state", "生成中").update({
+  await db("o_video").where("state", "生成中").whereNotIn("id", knex("ext_video_jobs").select("videoId")).update({
     state: "生成失败",
     errorReason: "软件退出导致失败",
   });

@@ -61,6 +61,7 @@ export interface o_assets {
 }
 export interface o_assets2Storyboard {
   'assetId'?: number;
+  'id'?: number;
   'storyboardId'?: number;
 }
 export interface o_assetsRole2Audio {
@@ -170,7 +171,7 @@ export interface o_skillList {
 }
 export interface o_storyboard {
   'createTime'?: number | null;
-  'duration'?: string | null;
+  'duration'?: number | null;
   'filePath'?: string | null;
   'flowId'?: number | null;
   'id'?: number;

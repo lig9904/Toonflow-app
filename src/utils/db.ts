@@ -1,47 +1,41 @@
 import { readFile, writeFile } from "fs/promises";
-import getPath from "@/utils/getPath";
-import fs from "fs";
-import path from "path";
 import knex from "knex";
 import initDB from "@/lib/initDB";
-// import fixDB from "@/lib/fixDB";
 import type { DB } from "@/types/database";
 import crypto from "crypto";
 import fixDB from "@/lib/fixDB";
+import { configurePostgresTypeParsers, requirePostgresDatabaseUrl, requirePostgres18Version } from "@/lib/dbDialect";
+import { ensureVideoJobsSchema } from "@/services/videoJobs";
+import { ensureAgentGatewaySchema } from "@/services/agentGateway";
+import { ensureProductionStateSchema } from "@/services/productionState";
 
 type TableName = keyof DB & string;
 type RowType<TName extends TableName> = DB[TName];
 
-const dbPath = getPath("db2.sqlite");
-console.log("数据库目录:", dbPath);
-const dbDir = path.dirname(dbPath);
-
-// 确保数据库目录存在
-if (!fs.existsSync(dbDir)) {
-  fs.mkdirSync(dbDir, { recursive: true });
-}
-
-// 创建空数据库文件
-if (!fs.existsSync(dbPath)) {
-  fs.writeFileSync(dbPath, "");
-}
+const connectionString = requirePostgresDatabaseUrl();
+configurePostgresTypeParsers();
 
 const db = knex({
-  client: "better-sqlite3",
-  connection: {
-    filename: dbPath,
-  },
-  useNullAsDefault: true,
+  client: "pg",
+  connection: connectionString,
+  pool: { min: 0, max: 10 },
 });
 
-(async () => {
+export const dbReady = (async () => {
+  const version = await db.raw("SHOW server_version_num");
+  requirePostgres18Version(version.rows[0].server_version_num);
   await initDB(db);
+  await ensureAgentGatewaySchema(db);
+  await ensureProductionStateSchema(db);
+  await ensureVideoJobsSchema(db);
   await fixDB(db);
-  if (process.env.NODE_ENV == "dev") initKnexType(db);
+  if (process.env.NODE_ENV == "dev") await initKnexType(db);
 })();
 
-const dbClient = Object.assign(<TName extends TableName>(table: TName) => db<RowType<TName>, RowType<TName>[]>(table), db);
-dbClient.schema = db.schema;
+// Preserve Knex's non-enumerable transaction/destroy methods. Object.assign
+// onto a wrapper function silently drops them even though TypeScript accepts it.
+const typedQuery = <TName extends TableName>(table: TName) => db<RowType<TName>, RowType<TName>[]>(table);
+const dbClient = db as typeof typedQuery & typeof db;
 export default dbClient;
 
 export { db };

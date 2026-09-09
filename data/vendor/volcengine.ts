@@ -122,6 +122,8 @@ declare const exports: {
   textRequest: (m: TextModel, t: boolean, tl: 0 | 1 | 2 | 3) => any;
   imageRequest: (c: ImageConfig, m: ImageModel) => Promise<string>;
   videoRequest: (c: VideoConfig, m: VideoModel) => Promise<string>;
+  submitVideoTask: (c: VideoConfig, m: VideoModel) => Promise<{ taskId: string }>;
+  queryVideoTask: (taskId: string) => Promise<{ status: "pending" | "succeeded" | "failed"; outputUrl?: string; error?: string }>;
   ttsRequest: (c: TTSConfig, m: TTSModel) => Promise<string>;
   checkForUpdates?: () => Promise<{ hasUpdate: boolean; latestVersion: string; notice: string }>;
   updateVendor?: () => Promise<string>;
@@ -452,7 +454,8 @@ const imageRequest = async (config: ImageConfig, model: ImageModel): Promise<str
   throw new Error("图片生成失败：未返回有效结果");
 };
 
-const videoRequest = async (config: VideoConfig, model: VideoModel): Promise<string> => {
+/** Builds and submits the same Seedance request used by videoRequest without polling it. */
+const submitVideoTask = async (config: VideoConfig, model: VideoModel): Promise<{ taskId: string }> => {
   const baseUrl = getBaseUrl();
   const headers = getHeaders();
 
@@ -537,35 +540,37 @@ const videoRequest = async (config: VideoConfig, model: VideoModel): Promise<str
     const videoRefs = config.referenceList?.filter((r) => r.type === "video") ?? [];
     const audioRefs = config.referenceList?.filter((r) => r.type === "audio") ?? [];
 
-    for (const refDef of config.mode) {
-      if (typeof refDef === "string") {
-        if (refDef.startsWith("imageReference:")) {
-          const maxCount = parseInt(refDef.split(":")[1], 10);
-          for (const ref of imageRefs.slice(0, maxCount)) {
-            content.push({
-              type: "image_url",
-              image_url: { url: ref.base64 },
-              role: "reference_image",
-            });
-          }
-        } else if (refDef.startsWith("videoReference:")) {
-          const maxCount = parseInt(refDef.split(":")[1], 10);
-          for (const ref of videoRefs.slice(0, maxCount)) {
-            content.push({
-              type: "video_url",
-              video_url: { url: ref.base64 },
-              role: "reference_video",
-            });
-          }
-        } else if (refDef.startsWith("audioReference:")) {
-          const maxCount = parseInt(refDef.split(":")[1], 10);
-          for (const ref of audioRefs.slice(0, maxCount)) {
-            content.push({
-              type: "audio_url",
-              audio_url: { url: ref.base64 },
-              role: "reference_audio",
-            });
-          }
+    // Models may declare reference limits as a nested group, e.g.
+    // ["imageReference:9", "videoReference:3", "audioReference:3"].
+    // Flatten the declaration before dispatching each media type.
+    const referenceModes = config.mode.flatMap((refDef) => (Array.isArray(refDef) ? refDef : [refDef]));
+    for (const refDef of referenceModes) {
+      if (refDef.startsWith("imageReference:")) {
+        const maxCount = parseInt(refDef.split(":")[1], 10);
+        for (const ref of imageRefs.slice(0, maxCount)) {
+          content.push({
+            type: "image_url",
+            image_url: { url: ref.base64 },
+            role: "reference_image",
+          });
+        }
+      } else if (refDef.startsWith("videoReference:")) {
+        const maxCount = parseInt(refDef.split(":")[1], 10);
+        for (const ref of videoRefs.slice(0, maxCount)) {
+          content.push({
+            type: "video_url",
+            video_url: { url: ref.base64 },
+            role: "reference_video",
+          });
+        }
+      } else if (refDef.startsWith("audioReference:")) {
+        const maxCount = parseInt(refDef.split(":")[1], 10);
+        for (const ref of audioRefs.slice(0, maxCount)) {
+          content.push({
+            type: "audio_url",
+            audio_url: { url: ref.base64 },
+            role: "reference_audio",
+          });
         }
       }
     }
@@ -609,35 +614,43 @@ const videoRequest = async (config: VideoConfig, model: VideoModel): Promise<str
 
   logger(`[视频生成] 任务已创建, ID: ${taskId}`);
 
+  return { taskId };
+};
+
+const queryVideoTask = async (taskId: string): Promise<{ status: "pending" | "succeeded" | "failed"; outputUrl?: string; error?: string }> => {
+  const queryRes = await fetch(`${getBaseUrl()}/contents/generations/tasks/${taskId}`, {
+    method: "GET",
+    headers: getHeaders(),
+  });
+  if (!queryRes.ok) {
+    const errorText = await queryRes.text();
+    throw new Error(`查询视频生成任务状态失败: ${errorText}`);
+  }
+  const task = await queryRes.json();
+  logger(`[视频生成] 任务状态: ${JSON.stringify(task)}`);
+  switch (task.status) {
+    case "succeeded":
+      return { status: "succeeded", outputUrl: task.content?.video_url };
+    case "failed":
+      return { status: "failed", error: task.error?.message || "视频生成失败" };
+    case "expired":
+      return { status: "failed", error: "视频生成任务超时" };
+    case "cancelled":
+      return { status: "failed", error: "视频生成任务已取消" };
+    default:
+      return { status: "pending" };
+  }
+};
+
+const videoRequest = async (config: VideoConfig, model: VideoModel): Promise<string> => {
+  const { taskId } = await submitVideoTask(config, model);
   const result = await pollTask(
     async (): Promise<PollResult> => {
-      const queryRes = await fetch(`${baseUrl}/contents/generations/tasks/${taskId}`, {
-        method: "GET",
-        headers,
-      });
-      if (!queryRes.ok) {
-        const errorText = await queryRes.text();
-        throw new Error(`查询视频生成任务状态失败: ${errorText}`);
-      }
-      const task = await queryRes.json();
-
-      logger(`[视频生成] 任务状态: ${JSON.stringify(task)}`);
-
-      switch (task.status) {
-        case "succeeded":
-          if (task.content?.video_url) {
-            return { completed: true, data: task.content.video_url };
-          }
-          return { completed: true, error: "任务成功但未返回视频URL" };
-        case "failed":
-          return { completed: true, error: task.error?.message || "视频生成失败" };
-        case "expired":
-          return { completed: true, error: "视频生成任务超时" };
-        case "cancelled":
-          return { completed: true, error: "视频生成任务已取消" };
-        default:
-          return { completed: false };
-      }
+      const task = await queryVideoTask(taskId);
+      if (task.status === "pending") return { completed: false };
+      return task.status === "succeeded"
+        ? { completed: true, data: task.outputUrl }
+        : { completed: true, error: task.error };
     },
     10000,
     600000 * 3,
@@ -670,6 +683,8 @@ exports.vendor = vendor;
 exports.textRequest = textRequest;
 exports.imageRequest = imageRequest;
 exports.videoRequest = videoRequest;
+exports.submitVideoTask = submitVideoTask;
+exports.queryVideoTask = queryVideoTask;
 exports.ttsRequest = ttsRequest;
 exports.checkForUpdates = checkForUpdates;
 exports.updateVendor = updateVendor;

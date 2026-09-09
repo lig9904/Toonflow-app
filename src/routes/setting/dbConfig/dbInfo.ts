@@ -1,21 +1,18 @@
 import express from "express";
 import { success, error } from "@/lib/responseFormat";
 import { db } from "@/utils/db";
+import { listUserTables } from "@/lib/dbPortable";
 
 const router = express.Router();
 
 export default router.get("/", async (req, res) => {
   try {
-    const tables: { name: string }[] = await db.raw(
-      `SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'knex_%'`,
-    );
-
     const tableInfo = [];
-    for (const table of tables) {
-      const countResult = await db.raw(`SELECT COUNT(*) as count FROM "${table.name}"`);
+    for (const tableName of await listUserTables(db)) {
+      const countResult = await db(tableName).count<{ count: string | number }>("* as count").first();
       tableInfo.push({
-        name: table.name,
-        rowCount: countResult[0]?.count ?? 0,
+        name: tableName,
+        rowCount: Number(countResult?.count ?? 0),
       });
     }
 

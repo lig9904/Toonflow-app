@@ -12,6 +12,9 @@ import path from "path";
 import fs from "fs";
 import u from "@/utils";
 import jwt from "jsonwebtoken";
+import { agentGatewayConfigFromEnv, createAgentGateway } from "@/services/agentGateway";
+import { resumeVideoJobs, getRuntimeVideoJobService } from "@/services/videoJobs/runtime";
+import { dbReady } from "@/utils/db";
 import socketInit from "@/socket/index";
 import { isEletron } from "@/utils/getPath";
 import { ensureThumbnail, ThumbnailSize } from "@/utils/image";
@@ -44,7 +47,10 @@ async function checkPermissions() {
 }
 
 export default async function startServe(randomPort: Boolean = false) {
+  await dbReady;
   await checkPermissions();
+  await u.oss.ready();
+  void resumeVideoJobs().catch((error) => console.error("[videoJobs] recovery failed", error instanceof Error ? error.name : "UnknownError"));
 
   await u.writeVersion();
   const io = new Server(server, { cors: { origin: "*" } });
@@ -61,7 +67,7 @@ export default async function startServe(randomPort: Boolean = false) {
 
   // oss 静态资源
   const ossDir = u.getPath("oss");
-  if (!fs.existsSync(ossDir)) {
+  if (!process.env.TOONFLOW_MEDIA_DIR && !fs.existsSync(ossDir)) {
     fs.mkdirSync(ossDir, { recursive: true });
   }
   console.log("文件目录:", ossDir);
@@ -149,6 +155,8 @@ export default async function startServe(randomPort: Boolean = false) {
     console.warn("静态网站目录不存在:", webDir);
   }
 
+  app.use("/api/agent", createAgentGateway(u.db, agentGatewayConfigFromEnv(process.env), (path) => u.oss.getSmallImageUrl(path)));
+
   app.use(async (req, res, next) => {
     const setting = await u.db("o_setting").where("key", "tokenKey").select("value").first();
     if (!setting) return res.status(444).send({ message: "服务器秘钥未配置，请联系管理员" });
@@ -163,6 +171,11 @@ export default async function startServe(randomPort: Boolean = false) {
     try {
       const decoded = jwt.verify(token, tokenKey as string);
       (req as any).user = decoded;
+      const userId = typeof decoded === "object" ? Number(decoded.id) : NaN;
+      const ownAccountRoutes = ["/api/setting/loginConfig/getUser", "/api/setting/loginConfig/updateUserPwd"];
+      if (req.path.startsWith("/api/setting/") && !ownAccountRoutes.includes(req.path) && userId !== Number(process.env.TOONFLOW_ADMIN_USER_ID || 1)) {
+        return res.status(403).send({ message: "此设置仅限管理员访问" });
+      }
       next();
     } catch (err) {
       return res.status(401).send({ message: "无效的token" });
@@ -185,9 +198,9 @@ export default async function startServe(randomPort: Boolean = false) {
     res.status(err.status || 500).send(err);
   });
 
-  const port = randomPort ? 0 : 10588;
+  const port = randomPort ? 0 : Number(process.env.TOONFLOW_PORT || 10588);
   return await new Promise((resolve) => {
-    server.listen(port, async () => {
+    server.listen(port, process.env.TOONFLOW_HOST || "127.0.0.1", async () => {
       const address = server.address();
       const realPort = typeof address === "string" ? address : address?.port;
       console.log(`[服务启动成功]: http://localhost:${realPort}`);
@@ -198,6 +211,7 @@ export default async function startServe(randomPort: Boolean = false) {
 
 // 支持await关闭
 export function closeServe(): Promise<void> {
+  getRuntimeVideoJobService().stop();
   return new Promise((resolve, reject) => {
     if (server) {
       server.close((err?: Error) => {

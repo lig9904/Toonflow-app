@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { generateText, streamText, wrapLanguageModel, stepCountIs, extractReasoningMiddleware } from "ai";
 import { devToolsMiddleware } from "@ai-sdk/devtools";
 import axios from "axios";
@@ -110,12 +111,14 @@ async function getModelConfig(value: AiType | `${string}:${string}`) {
   return null;
 }
 
-async function getVendorTemplateFn(
-  fnName: "textRequest",
-  modelName: `${string}:${string}`,
-): Promise<(think?: boolean, thinkLevel?: 0 | 1 | 2 | 3) => any>;
-async function getVendorTemplateFn(fnName: Exclude<FnName, "textRequest">, modelName: `${string}:${string}`): Promise<(input: any) => any>;
-async function getVendorTemplateFn(fnName: FnName, modelName: `${string}:${string}`): Promise<any> {
+interface VendorRuntime {
+  id: string;
+  selectedModel: any;
+  running: any;
+  enabled: boolean;
+}
+
+async function loadVendorRuntime(modelName: `${string}:${string}`): Promise<VendorRuntime> {
   const [id, name] = modelName.split(/:(.+)/);
   const vendorConfigData = await u.db("o_vendorConfig").where("id", id).first();
   if (!vendorConfigData) throw new Error(`未找到供应商配置 id=${id}`);
@@ -129,6 +132,16 @@ async function getVendorTemplateFn(fnName: FnName, modelName: `${string}:${strin
     Object.assign(running.vendor.inputValues, JSON.parse(vendorConfigData.inputValues ?? "{}"));
     running.vendor.models = modelList;
   }
+  return { id, selectedModel, running, enabled: vendorConfigData.enable === 1 };
+}
+
+async function getVendorTemplateFn(
+  fnName: "textRequest",
+  modelName: `${string}:${string}`,
+): Promise<(think?: boolean, thinkLevel?: 0 | 1 | 2 | 3) => any>;
+async function getVendorTemplateFn(fnName: Exclude<FnName, "textRequest">, modelName: `${string}:${string}`): Promise<(input: any) => any>;
+async function getVendorTemplateFn(fnName: FnName, modelName: `${string}:${string}`): Promise<any> {
+  const { id, selectedModel, running } = await loadVendorRuntime(modelName);
   const fn = running[fnName];
   if (!fn) throw new Error(`未找到供应商配置中的函数 ${fnName} id=${id}`);
   if (fnName == "textRequest")
@@ -137,6 +150,47 @@ async function getVendorTemplateFn(fnName: FnName, modelName: `${string}:${strin
       return fn(selectedModel, effectiveThink, thinkLevel);
     };
   else return <T>(input: T) => fn(input, selectedModel);
+}
+
+export interface PersistentVideoTaskProvider {
+  fingerprint: string;
+  submit(config: unknown): Promise<{ taskId: string }>;
+  query(taskId: string): Promise<{ status: "pending" | "succeeded" | "failed"; outputUrl?: string; error?: string }>;
+}
+
+function withPersistentTaskTimeout<T>(operation: () => Promise<T>, timeoutMs = 60_000): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("持久化视频任务适配器超时")), timeoutMs);
+    operation().then(
+      (value) => { clearTimeout(timeout); resolve(value); },
+      (error) => { clearTimeout(timeout); reject(error); },
+    );
+  });
+}
+
+/**
+ * Only adapters that explicitly export submitVideoTask/queryVideoTask can be
+ * resumed after process restart. Existing videoRequest-only vendors keep their
+ * legacy path and are never misrepresented as recoverable.
+ */
+export async function getPersistentVideoTaskProvider(key: `${string}:${string}`): Promise<PersistentVideoTaskProvider> {
+  const modelName = await resolveModelName(key);
+  const { id, selectedModel, running, enabled } = await loadVendorRuntime(modelName);
+  if (!enabled) throw new Error(`供应商 ${id} 未启用，不能提交或恢复持久化视频任务`);
+  if (id !== "volcengine" || typeof running.submitVideoTask !== "function" || typeof running.queryVideoTask !== "function") {
+    throw new Error(`模型 ${modelName} 未提供可恢复的视频任务适配器`);
+  }
+  const endpoint = String(running.vendor?.inputValues?.baseUrl ?? "").replace(/\/+$/, "");
+  const fingerprint = createHash("sha256")
+    .update(JSON.stringify({ vendorId: id, endpoint, modelName: selectedModel.modelName }))
+    .digest("hex");
+  return {
+    fingerprint,
+    // The vendor template owns fetch. This bounds the durable worker even if a
+    // template's fetch cannot be aborted; a timed-out POST is reconciled, never retried.
+    submit: async (config) => withPersistentTaskTimeout(() => running.submitVideoTask(config, selectedModel)),
+    query: async (taskId) => withPersistentTaskTimeout(() => running.queryVideoTask(taskId)),
+  };
 }
 
 async function withTaskRecord<T>(

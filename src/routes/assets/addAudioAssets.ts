@@ -3,6 +3,7 @@ import u from "@/utils";
 import { z } from "zod";
 import { success } from "@/lib/responseFormat";
 import { validateFields } from "@/middleware/middleware";
+import { insertRowsReturningIds } from "@/lib/insertRows";
 const router = express.Router();
 
 // 新增资产
@@ -44,7 +45,7 @@ export default router.post(
       }),
     );
 
-    const [id] = await u.db("o_assets").insert({
+    const [id] = await insertRowsReturningIds(u.db, "o_assets", {
       name,
       describe,
       type: "audio",
@@ -52,7 +53,7 @@ export default router.post(
       startTime: Date.now(),
     });
     for (const item of assetsItem) {
-      const [assetsId] = await u.db("o_assets").insert({
+      const [assetsId] = await insertRowsReturningIds(u.db, "o_assets", {
         prompt: item.prompt,
         assetsId: id,
         type: "audio",
@@ -61,7 +62,7 @@ export default router.post(
         projectId,
         startTime: Date.now(),
       });
-      const [imageId] = await u.db("o_image").insert({
+      const [imageId] = await insertRowsReturningIds(u.db, "o_image", {
         filePath: item.src,
         type: "audio",
         assetsId,

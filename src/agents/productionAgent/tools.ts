@@ -3,6 +3,11 @@ import { z } from "zod";
 import _ from "lodash";
 import ResTool from "@/socket/resTool";
 import u from "@/utils";
+import { addProductionStoryboards, readProductionFlow } from "@/services/productionFlow";
+import { notifyProductionChange } from "@/services/productionEvents";
+import { createOrUpdateDerivedAsset, deleteDerivedAsset } from "@/services/productionAssets";
+import { generateDerivedAssetImages, generateStoryboardImages } from "@/services/productionImages";
+import { createProductionImageRuntime } from "@/services/productionImageRuntime";
 
 const deriveAssetSchema = z.object({
   id: z.number().describe("衍生资产ID,如果新增则为空"),
@@ -63,27 +68,8 @@ interface ToolConfig {
   msg: ReturnType<ResTool["newMessage"]>;
 }
 
-/**
- * 串行队列：确保 socket 操作排队执行，避免并发过高导致假死
- * @param delayMs 每个操作之间的最小间隔(ms)
- */
-function createSocketQueue(delayMs = 800) {
-  let lastPromise: Promise<any> = Promise.resolve();
-  return <T>(fn: () => Promise<T>): Promise<T> => {
-    lastPromise = lastPromise.then(
-      () =>
-        new Promise<T>((resolve, reject) => {
-          setTimeout(() => fn().then(resolve, reject), delayMs);
-        }),
-    );
-    return lastPromise;
-  };
-}
-
 export default (toolCpnfig: ToolConfig) => {
   const { resTool, toolsNames, msg } = toolCpnfig;
-  const { socket } = resTool;
-  const socketQueue = createSocketQueue(800);
   const workMap: Record<any, any> = {};
   const tools: Record<string, Tool> = {
     get_flowData: tool({
@@ -98,7 +84,7 @@ export default (toolCpnfig: ToolConfig) => {
       execute: async ({ key }) => {
         const thinking = msg.thinking(`正在获取${flowDataKeyLabels[key]}工作区数据...`);
 
-        const flowData: FlowData = await new Promise((resolve) => socket.emit("getFlowData", { key }, (res: any) => resolve(res)));
+        const flowData = await readProductionFlow(u.db, Number(resTool.data.projectId), Number(resTool.data.scriptId), (path) => u.oss.getSmallImageUrl(path));
         thinking.appendText(`获取到${flowDataKeyLabels[key]}:\n` + JSON.stringify(flowData[key], null, 2));
         thinking.updateTitle(`获取${flowDataKeyLabels[key]}完成`);
         thinking.complete();
@@ -130,32 +116,11 @@ export default (toolCpnfig: ToolConfig) => {
 
         const thinking = msg.thinking("正在操作资产...");
         const { projectId, scriptId } = resTool.data;
-        const startTime = Date.now();
-        const parentAssets = await u.db("o_assets").where("id", deriveAsset.assetsId).select("id", "type").first();
-        if (!parentAssets) return "关联的资产不存在";
-
-        const data = {
-          id: deriveAsset.id ?? undefined,
-          assetsId: deriveAsset.assetsId,
-          projectId,
-          name: deriveAsset.name,
-          type: parentAssets.type,
-          describe: deriveAsset.desc,
-          startTime,
-        };
-        if (deriveAsset.id) {
-          await u.db("o_assets").where("id", deriveAsset.id).update(data);
-          thinking.appendText(`已更新衍生资产，ID: ${deriveAsset.id}\n`);
-        } else {
-          const [insertedId] = await u.db("o_assets").insert(data);
-          data.id = insertedId;
-          await u.db("o_scriptAssets").insert({ scriptId, assetId: insertedId });
-          thinking.appendText(`已新增衍生资产，ID: ${insertedId}\n`);
-        }
-        const res = await new Promise((resolve) => socket.emit("addDeriveAsset", data, (res: any) => resolve(res)));
+        const result = await createOrUpdateDerivedAsset(u.db, { projectId: Number(projectId), scriptId: Number(scriptId), parentAssetId: deriveAsset.assetsId, id: deriveAsset.id, name: deriveAsset.name, description: deriveAsset.desc });
+        thinking.appendText(`${result.created ? "已新增" : "已更新"}衍生资产，ID: ${result.id}\n`);
         thinking.updateTitle("资产操作完成");
         thinking.complete();
-        return res ?? "操作成功";
+        return result;
       },
     }),
     del_deriveAsset: tool({
@@ -170,14 +135,12 @@ export default (toolCpnfig: ToolConfig) => {
       ),
       execute: async ({ assetsId, id }) => {
         const thinking = msg.thinking("正在操作资产...");
-        const { scriptId } = resTool.data;
-        await u.db("o_assets").where("id", id).del();
-        await u.db("o_scriptAssets").where({ scriptId, assetId: id }).del();
+        const { scriptId, projectId } = resTool.data;
+        const result = await deleteDerivedAsset(u.db, { projectId: Number(projectId), scriptId: Number(scriptId), parentAssetId: assetsId, id });
         thinking.appendText(`已删除衍生资产，ID: ${id}\n`);
-        const res = await new Promise((resolve) => socket.emit("delDeriveAsset", { assetsId, id }, (res: any) => resolve(res)));
         thinking.updateTitle("资产操作完成");
         thinking.complete();
-        return res ?? "删除成功";
+        return result;
       },
     }),
     generate_deriveAsset: tool({
@@ -191,19 +154,11 @@ export default (toolCpnfig: ToolConfig) => {
       ),
       execute: async ({ ids }) => {
         const thinking = msg.thinking("正在生成衍生资产...");
-        new Promise((resolve) => socket.emit("generateDeriveAsset", { ids }, (res: any) => resolve(res)))
-          .then((res) => {
-            thinking.appendText(`已生成衍生资产，ID: ${JSON.stringify(res, null, 2)}\n`);
-            thinking.updateTitle("衍生资产开始完成");
-            thinking.complete();
-          })
-          .catch((e) => {
-            thinking.appendText("衍生资产生成失败:\n" + u.error(e).message);
-            thinking.updateTitle("衍生资产生成失败");
-            thinking.complete();
-          });
-
-        return "开始生成衍生资产";
+        const result = await generateDerivedAssetImages(u.db, { projectId: Number(resTool.data.projectId), scriptId: Number(resTool.data.scriptId), assetIds: ids, runtime: createProductionImageRuntime() });
+        thinking.appendText(`衍生资产生成结果:\n${JSON.stringify(result, null, 2)}\n`);
+        thinking.updateTitle("衍生资产生成完成");
+        thinking.complete();
+        return result;
       },
     }),
     generate_storyboard: tool({
@@ -217,27 +172,11 @@ export default (toolCpnfig: ToolConfig) => {
       ),
       execute: async ({ ids }) => {
         const thinking = msg.thinking("正在生成分镜...");
-        socketQueue(
-          () =>
-            new Promise((resolve, reject) =>
-              socket.emit("generateStoryboard", { ids }, (res: any) => {
-                if (res?.error) return reject(new Error(res.error));
-                resolve(res);
-              }),
-            ),
-        )
-          .then((res) => {
-            thinking.appendText("生成的分镜数据:\n" + JSON.stringify(res, null, 2));
-            thinking.updateTitle("分镜生成完成");
-            thinking.complete();
-          })
-          .catch((e) => {
-            thinking.appendText("分镜生成失败:\n" + u.error(e).message);
-            thinking.updateTitle("分镜生成失败");
-            thinking.complete();
-          });
-
-        return "开始生成分镜";
+        const result = await generateStoryboardImages(u.db, { projectId: Number(resTool.data.projectId), scriptId: Number(resTool.data.scriptId), storyboardIds: ids, runtime: createProductionImageRuntime() });
+        thinking.appendText("生成的分镜数据:\n" + JSON.stringify(result, null, 2));
+        thinking.updateTitle("分镜生成完成");
+        thinking.complete();
+        return result;
       },
     }),
     add_flowData_storyboard: tool({
@@ -263,34 +202,18 @@ export default (toolCpnfig: ToolConfig) => {
       ),
       execute: async (raw) => {
         const thinking = msg.thinking("正在新增 分镜面板 数据...");
-        const data = {
-          videoDesc: raw.videoDesc,
-          prompt: raw.prompt,
-          track: raw.track,
-          duration: raw.duration,
-          associateAssetsIds: raw.associateAssetsIds ?? [],
-          shouldGenerateImage: raw.shouldGenerateImage,
-        };
-        socketQueue(
-          () =>
-            new Promise((resolve, reject) =>
-              socket.emit("addStoryboard", { ...data }, (res: any) => {
-                if (res?.error) return reject(new Error(res.error));
-                resolve(res);
-              }),
-            ),
-        )
-          .then((res) => {
-            thinking.appendText("新增的分镜数据:\n" + JSON.stringify(data, null, 2));
-            thinking.updateTitle("新增分镜成功");
-            thinking.complete();
-          })
-          .catch((e) => {
-            thinking.appendText("新增的分镜数据:\n" + JSON.stringify(data, null, 2));
-            thinking.updateTitle("新增分镜失败");
-            thinking.complete();
-          });
-        return true;
+        const projectId = Number(resTool.data.projectId);
+        const scriptId = Number(resTool.data.scriptId);
+        const ids = await addProductionStoryboards(u.db, projectId, scriptId, [{
+          videoDesc: raw.videoDesc, prompt: raw.prompt ?? "", track: raw.track,
+          duration: raw.duration, associateAssetsIds: raw.associateAssetsIds ?? [],
+          shouldGenerateImage: raw.shouldGenerateImage === "true" ? 1 : 0,
+        }]);
+        notifyProductionChange({ projectId, scriptId });
+        thinking.appendText("新增分镜 ID: " + ids.join(", "));
+        thinking.updateTitle("新增分镜成功");
+        thinking.complete();
+        return { success: true, ids };
       },
     }),
   };

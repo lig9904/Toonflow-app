@@ -1,29 +1,12 @@
 import express from "express";
-import { success, error } from "@/lib/responseFormat";
-import { db } from "@/utils/db";
-import initDB from "@/lib/initDB";
+import { error } from "@/lib/responseFormat";
 
 const router = express.Router();
 
-export default router.get("/", async (req, res) => {
-  try {
-    // 获取所有表名
-    const tables: { name: string }[] = await db.raw(
-      `SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'knex_%'`,
-    );
-
-    // 禁用外键约束，逐一删除所有表
-    await db.raw("PRAGMA foreign_keys = OFF");
-    for (const table of tables) {
-      await db.schema.dropTableIfExists(table.name);
-    }
-    await db.raw("PRAGMA foreign_keys = ON");
-
-    // 重新初始化数据库
-    await initDB(db as any);
-
-    res.status(200).send(success("数据库已清空并重新初始化"));
-  } catch (err: any) {
-    res.status(500).send(error(err?.message || "清除失败"));
-  }
+// Whole-database destruction is intentionally disabled during the SQLite to
+// PostgreSQL migration. It must be implemented as an authenticated maintenance
+// job with an explicit confirmation and migration-aware transaction semantics.
+export default router.post("/", async (req, res) => {
+  if (req.body?.confirm !== "CLEAR_DATABASE") return res.status(400).send(error("需要 confirm=CLEAR_DATABASE 才能请求清库"));
+  return res.status(410).send(error("清库接口在 PostgreSQL 迁移完成前已禁用"));
 });

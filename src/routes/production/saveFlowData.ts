@@ -2,64 +2,22 @@ import express from "express";
 import u from "@/utils";
 import { z } from "zod";
 import { success } from "@/lib/responseFormat";
-import { validateFields } from "@/middleware/middleware";
-const router = express.Router();
-import { flowDataSchema } from "@/agents/productionAgent/tools";
-
-export default router.post(
-  "/",
-  validateFields({
-    projectId: z.number(),
-    episodesId: z.number(),
-    data: z.any(),
-  }),
-  async (req, res) => {
-    const {
-      data,
-      projectId,
-      episodesId,
-    }: {
-      data: z.infer<typeof flowDataSchema>;
-      projectId: number;
-      episodesId: number;
-    } = req.body;
-    const sqlData = await u.db("o_agentWorkData").where("projectId", String(projectId)).andWhere("episodesId", String(episodesId)).first();
-    if (data.storyboard && data.storyboard.length) {
-      const filterDatas = data?.storyboard.filter((i) => !i.id);
-      if (!filterDatas.length) {
-        try {
-          await Promise.all(
-            data.storyboard
-              .filter((i) => i.id)
-              .map(async (i, index) => {
-                await u.db("o_storyboard").where("id", i.id).update({
-                  index: index,
-                });
-              }),
-          );
-        } catch (error) {
-          console.error("更新分镜排序失败", error);
-        }
-      }
-    }
-
-    if (!sqlData) {
-      await u.db("o_agentWorkData").insert({
-        projectId,
-        episodesId,
-        key: "productionAgent",
-        data: JSON.stringify(data),
-      });
-    } else {
-      await u
-        .db("o_agentWorkData")
-        .where("projectId", String(projectId))
-        .where("key", "productionAgent")
-        .andWhere("episodesId", String(episodesId))
-        .update({
-          data: JSON.stringify(data),
-        });
-    }
-    return res.status(200).send(success());
-  },
-);
+import { saveProductionPlanning } from "@/services/productionFlow";
+import { requireProductionOwner, sendProductionError } from "@/services/productionHttp";
+import { notifyProductionChange } from "@/services/productionEvents";
+const schema = z.object({
+  projectId: z.coerce.number().int().positive(), episodesId: z.coerce.number().int().positive(),
+  expectedPlanningVersion: z.number().int().nonnegative(),
+  data: z.object({ scriptPlan: z.string(), storyboardTable: z.string(), storyboard: z.array(z.object({
+    id: z.number().int().positive().optional(), collaboration: z.object({ version: z.number().int().nonnegative() }).optional(),
+  })).optional() }),
+}).strict();
+export default express.Router().post("/", async (req, res) => {
+  try {
+    const data = schema.parse(req.body);
+    await requireProductionOwner(req, data.projectId, u.db);
+    const result = await saveProductionPlanning(u.db, data.projectId, data.episodesId, data.expectedPlanningVersion, data.data);
+    notifyProductionChange({ projectId: data.projectId, scriptId: data.episodesId });
+    res.send(success(result));
+  } catch (error) { sendProductionError(res, error); }
+});

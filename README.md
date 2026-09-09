@@ -1,3 +1,6 @@
+> **定制维护分支：`custom/main`（1.1.8-yd.1）**
+> 本分支使用 PostgreSQL 18.6、Node.js 22，并支持独立 NAS 媒体目录和服务器部署。请优先阅读[定制运行说明](docs/custom/RUN-LOCAL.md)、[部署说明](docs/custom/LOCAL-SERVER.md)和[上游同步约定](UPSTREAM.md)。在线下载安装已停用，更新由管理员构建部署。下方保留上游项目介绍。
+
 ﻿<img src="https://capsule-render.vercel.app/api?type=waving&color=gradient&customColorList=6,11,20&height=200&section=header&text=Toonflow&fontSize=90&fontColor=ffffff&animation=fadeIn&fontAlignY=50" width="100%"/>
 
 <p>

@@ -4,6 +4,7 @@ import jwt from "jsonwebtoken";
 import { success, error } from "@/lib/responseFormat";
 import { validateFields } from "@/middleware/middleware";
 import { z } from "zod";
+import { hashLegacyPassword, isPasswordHash, verifyPassword } from "@/lib/password";
 const router = express.Router();
 
 export function setToken(payload: string | object, expiresIn: string | number, secret: string): string {
@@ -17,8 +18,8 @@ export function setToken(payload: string | object, expiresIn: string | number, s
 export default router.post(
   "/",
   validateFields({
-    username: z.string(),
-    password: z.string(),
+    username: z.string().min(1).max(128),
+    password: z.string().min(1).max(1024),
   }),
   async (req, res) => {
     const { username, password } = req.body;
@@ -26,7 +27,10 @@ export default router.post(
     const data = await u.db("o_user").where("name", "=", username).first();
     if (!data) return res.status(400).send(error("登录失败"));
 
-    if (data!.password == password && data!.name == username) {
+    if (data!.name == username && verifyPassword(password, data!.password)) {
+      if (!isPasswordHash(data!.password)) {
+        await u.db("o_user").where({ id: data.id }).update({ password: hashLegacyPassword(password) });
+      }
       const tokenData = await u.db("o_setting").where("key", "tokenKey").first();
       if (!tokenData) return res.status(400).send(error("未找到tokenKey"));
       const token = setToken(
@@ -34,7 +38,7 @@ export default router.post(
           id: data!.id,
           name: data!.name,
         },
-        "180Days",
+        process.env.TOONFLOW_SESSION_TTL || "8h",
         tokenData?.value as string,
       );
 

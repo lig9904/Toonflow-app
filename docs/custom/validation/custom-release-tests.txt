@@ -1,0 +1,766 @@
+TAP version 13
+# Subtest: agent configuration fails closed for incomplete or malformed scope
+ok 1 - agent configuration fails closed for incomplete or malformed scope
+  ---
+  duration_ms: 142.6585
+  type: 'test'
+  ...
+# Subtest: agent credential is independent and scope checks happen for every request
+ok 2 - agent credential is independent and scope checks happen for every request
+  ---
+  duration_ms: 62.291958
+  type: 'test'
+  ...
+# Subtest: agent writes require explicit capability, an observed version, and durable idempotency
+ok 3 - agent writes require explicit capability, an observed version, and durable idempotency
+  ---
+  duration_ms: 58.097875
+  type: 'test'
+  ...
+# Subtest: managed custom update policy
+    # Subtest: does not call fetch for legacy or custom update sources and returns no URL
+    ok 1 - does not call fetch for legacy or custom update sources and returns no URL
+      ---
+      duration_ms: 2.618333
+      type: 'test'
+      ...
+    # Subtest: rejects both reinstall and incremental download requests without external or file operations
+    ok 2 - rejects both reinstall and incremental download requests without external or file operations
+      ---
+      duration_ms: 0.483125
+      type: 'test'
+      ...
+    1..2
+ok 4 - managed custom update policy
+  ---
+  duration_ms: 3.698667
+  type: 'suite'
+  ...
+# Subtest: MCP initialization, validation, unavailable tool and controlled write capability
+ok 5 - MCP initialization, validation, unavailable tool and controlled write capability
+  ---
+  duration_ms: 2.239583
+  type: 'test'
+  ...
+# Subtest: MCP upstream errors stay bounded and do not expose credentials
+ok 6 - MCP upstream errors stay bounded and do not expose credentials
+  ---
+  duration_ms: 0.328458
+  type: 'test'
+  ...
+# Subtest: actual stdio process emits only JSON-RPC and calls authenticated HTTP without a browser
+ok 7 - actual stdio process emits only JSON-RPC and calls authenticated HTTP without a browser
+  ---
+  duration_ms: 193.814625
+  type: 'test'
+  ...
+# Subtest: NAS media override leaves local application data separate
+ok 8 - NAS media override leaves local application data separate
+  ---
+  duration_ms: 0.52775
+  type: 'test'
+  ...
+# Subtest: an absent NAS or missing mount marker never creates a local media fallback
+ok 9 - an absent NAS or missing mount marker never creates a local media fallback
+  ---
+  duration_ms: 4.44825
+  type: 'test'
+  ...
+# Subtest: password handling
+    # Subtest: hashes with a random salt and verifies without exposing plaintext
+    ok 1 - hashes with a random salt and verifies without exposing plaintext
+      ---
+      duration_ms: 91.685542
+      type: 'test'
+      ...
+    # Subtest: accepts legacy plaintext only for compatibility and upgrades it through a hash
+    ok 2 - accepts legacy plaintext only for compatibility and upgrades it through a hash
+      ---
+      duration_ms: 84.472334
+      type: 'test'
+      ...
+    # Subtest: rejects the default seed password for new or changed credentials
+    ok 3 - rejects the default seed password for new or changed credentials
+      ---
+      duration_ms: 0.273292
+      type: 'test'
+      ...
+    1..3
+ok 10 - password handling
+  ---
+  duration_ms: 176.878666
+  type: 'suite'
+  ...
+# [初始化数据库] 创建数据表: o_user
+# [初始化数据库] 表数据初始化: o_user
+# [初始化数据库] 创建数据表: o_project
+# [初始化数据库] 创建数据表: o_artStyle
+# [初始化数据库] 表数据初始化: o_artStyle
+# [初始化数据库] 创建数据表: o_agentDeploy
+# [初始化数据库] 表数据初始化: o_agentDeploy
+# [初始化数据库] 创建数据表: o_setting
+# [初始化数据库] 表数据初始化: o_setting
+# [初始化数据库] 创建数据表: o_tasks
+# [初始化数据库] 表数据初始化: o_tasks
+# [初始化数据库] 创建数据表: o_prompt
+# [初始化数据库] 表数据初始化: o_prompt
+# [初始化数据库] 创建数据表: o_modelPrompt
+# [初始化数据库] 表数据初始化: o_modelPrompt
+# [初始化数据库] 创建数据表: o_novel
+# [初始化数据库] 创建数据表: o_event
+# [初始化数据库] 创建数据表: o_eventChapter
+# [初始化数据库] 创建数据表: o_script
+# [初始化数据库] 创建数据表: o_image
+# [初始化数据库] 创建数据表: o_assets
+# [初始化数据库] 表数据初始化: o_assets
+# [初始化数据库] 创建数据表: o_storyboard
+# [初始化数据库] 创建数据表: o_agentWorkData
+# [初始化数据库] 创建数据表: o_video
+# [初始化数据库] 创建数据表: o_videoTrack
+# [初始化数据库] 创建数据表: o_vendorConfig
+# [初始化数据库] 表数据初始化: o_vendorConfig
+# [初始化数据库] 创建数据表: o_imageFlow
+# [初始化数据库] 创建数据表: o_assets2Storyboard
+# [初始化数据库] 创建数据表: o_scriptAssets
+# [初始化数据库] 创建数据表: o_skillList
+# [初始化数据库] 表数据初始化: o_skillList
+# [初始化数据库] 创建数据表: o_skillAttribution
+# [初始化数据库] 表数据初始化: o_skillAttribution
+# [初始化数据库] 创建数据表: memories
+# [初始化数据库] 创建数据表: o_assetsRole2Audio
+# Subtest: PostgreSQL base schema is idempotent and returns generated bigint IDs
+ok 11 - PostgreSQL base schema is idempotent and returns generated bigint IDs
+  ---
+  duration_ms: 479.483416
+  type: 'test'
+  ...
+# Subtest: DATABASE_URL rejects non-PostgreSQL protocols
+ok 12 - DATABASE_URL rejects non-PostgreSQL protocols
+  ---
+  duration_ms: 0.246792
+  type: 'test'
+  ...
+# Subtest: runtime requires PostgreSQL 18.6 while allowing later 18.x security patches
+ok 13 - runtime requires PostgreSQL 18.6 while allowing later 18.x security patches
+  ---
+  duration_ms: 0.139375
+  type: 'test'
+  ...
+# [初始化数据库] 创建数据表: o_user
+# [初始化数据库] 表数据初始化: o_user
+# [初始化数据库] 创建数据表: o_project
+# [初始化数据库] 创建数据表: o_artStyle
+# [初始化数据库] 表数据初始化: o_artStyle
+# [初始化数据库] 创建数据表: o_agentDeploy
+# [初始化数据库] 表数据初始化: o_agentDeploy
+# [初始化数据库] 创建数据表: o_setting
+# [初始化数据库] 表数据初始化: o_setting
+# [初始化数据库] 创建数据表: o_tasks
+# [初始化数据库] 表数据初始化: o_tasks
+# [初始化数据库] 创建数据表: o_prompt
+# [初始化数据库] 表数据初始化: o_prompt
+# [初始化数据库] 创建数据表: o_modelPrompt
+# [初始化数据库] 表数据初始化: o_modelPrompt
+# [初始化数据库] 创建数据表: o_novel
+# [初始化数据库] 创建数据表: o_event
+# [初始化数据库] 创建数据表: o_eventChapter
+# [初始化数据库] 创建数据表: o_script
+# [初始化数据库] 创建数据表: o_image
+# [初始化数据库] 创建数据表: o_assets
+# [初始化数据库] 表数据初始化: o_assets
+# [初始化数据库] 创建数据表: o_storyboard
+# [初始化数据库] 创建数据表: o_agentWorkData
+# [初始化数据库] 创建数据表: o_video
+# [初始化数据库] 创建数据表: o_videoTrack
+# [初始化数据库] 创建数据表: o_vendorConfig
+# [初始化数据库] 表数据初始化: o_vendorConfig
+# [初始化数据库] 创建数据表: o_imageFlow
+# [初始化数据库] 创建数据表: o_assets2Storyboard
+# [初始化数据库] 创建数据表: o_scriptAssets
+# [初始化数据库] 创建数据表: o_skillList
+# [初始化数据库] 表数据初始化: o_skillList
+# [初始化数据库] 创建数据表: o_skillAttribution
+# [初始化数据库] 表数据初始化: o_skillAttribution
+# [初始化数据库] 创建数据表: memories
+# [初始化数据库] 创建数据表: o_assetsRole2Audio
+# Subtest: PostgreSQL production flow keeps ordered references and numeric fractional track duration
+ok 14 - PostgreSQL production flow keeps ordered references and numeric fractional track duration
+  ---
+  duration_ms: 414.041875
+  type: 'test'
+  ...
+# [初始化数据库] 创建数据表: o_user
+# [初始化数据库] 表数据初始化: o_user
+# [初始化数据库] 创建数据表: o_project
+# [初始化数据库] 创建数据表: o_artStyle
+# [初始化数据库] 表数据初始化: o_artStyle
+# [初始化数据库] 创建数据表: o_agentDeploy
+# [初始化数据库] 表数据初始化: o_agentDeploy
+# [初始化数据库] 创建数据表: o_setting
+# [初始化数据库] 表数据初始化: o_setting
+# [初始化数据库] 创建数据表: o_tasks
+# [初始化数据库] 表数据初始化: o_tasks
+# [初始化数据库] 创建数据表: o_prompt
+# [初始化数据库] 表数据初始化: o_prompt
+# [初始化数据库] 创建数据表: o_modelPrompt
+# [初始化数据库] 表数据初始化: o_modelPrompt
+# [初始化数据库] 创建数据表: o_novel
+# [初始化数据库] 创建数据表: o_event
+# [初始化数据库] 创建数据表: o_eventChapter
+# [初始化数据库] 创建数据表: o_script
+# [初始化数据库] 创建数据表: o_image
+# [初始化数据库] 创建数据表: o_assets
+# [初始化数据库] 表数据初始化: o_assets
+# [初始化数据库] 创建数据表: o_storyboard
+# [初始化数据库] 创建数据表: o_agentWorkData
+# [初始化数据库] 创建数据表: o_video
+# [初始化数据库] 创建数据表: o_videoTrack
+# [初始化数据库] 创建数据表: o_vendorConfig
+# [初始化数据库] 表数据初始化: o_vendorConfig
+# [初始化数据库] 创建数据表: o_imageFlow
+# [初始化数据库] 创建数据表: o_assets2Storyboard
+# [初始化数据库] 创建数据表: o_scriptAssets
+# [初始化数据库] 创建数据表: o_skillList
+# [初始化数据库] 表数据初始化: o_skillList
+# [初始化数据库] 创建数据表: o_skillAttribution
+# [初始化数据库] 表数据初始化: o_skillAttribution
+# [初始化数据库] 创建数据表: memories
+# [初始化数据库] 创建数据表: o_assetsRole2Audio
+# Subtest: PostgreSQL concurrent initial planning saves have exactly one winner
+ok 15 - PostgreSQL concurrent initial planning saves have exactly one winner
+  ---
+  duration_ms: 92.95575
+  type: 'test'
+  ...
+# [初始化数据库] 创建数据表: o_user
+# [初始化数据库] 表数据初始化: o_user
+# [初始化数据库] 创建数据表: o_project
+# [初始化数据库] 创建数据表: o_artStyle
+# [初始化数据库] 表数据初始化: o_artStyle
+# [初始化数据库] 创建数据表: o_agentDeploy
+# [初始化数据库] 表数据初始化: o_agentDeploy
+# [初始化数据库] 创建数据表: o_setting
+# [初始化数据库] 表数据初始化: o_setting
+# [初始化数据库] 创建数据表: o_tasks
+# [初始化数据库] 表数据初始化: o_tasks
+# [初始化数据库] 创建数据表: o_prompt
+# [初始化数据库] 表数据初始化: o_prompt
+# [初始化数据库] 创建数据表: o_modelPrompt
+# [初始化数据库] 表数据初始化: o_modelPrompt
+# [初始化数据库] 创建数据表: o_novel
+# [初始化数据库] 创建数据表: o_event
+# [初始化数据库] 创建数据表: o_eventChapter
+# [初始化数据库] 创建数据表: o_script
+# [初始化数据库] 创建数据表: o_image
+# [初始化数据库] 创建数据表: o_assets
+# [初始化数据库] 表数据初始化: o_assets
+# [初始化数据库] 创建数据表: o_storyboard
+# [初始化数据库] 创建数据表: o_agentWorkData
+# [初始化数据库] 创建数据表: o_video
+# [初始化数据库] 创建数据表: o_videoTrack
+# [初始化数据库] 创建数据表: o_vendorConfig
+# [初始化数据库] 表数据初始化: o_vendorConfig
+# [初始化数据库] 创建数据表: o_imageFlow
+# [初始化数据库] 创建数据表: o_assets2Storyboard
+# [初始化数据库] 创建数据表: o_scriptAssets
+# [初始化数据库] 创建数据表: o_skillList
+# [初始化数据库] 表数据初始化: o_skillList
+# [初始化数据库] 创建数据表: o_skillAttribution
+# [初始化数据库] 表数据初始化: o_skillAttribution
+# [初始化数据库] 创建数据表: memories
+# [初始化数据库] 创建数据表: o_assetsRole2Audio
+# Subtest: PostgreSQL prepare does not invoke model, claimed generation then saves result
+ok 16 - PostgreSQL prepare does not invoke model, claimed generation then saves result
+  ---
+  duration_ms: 103.349166
+  type: 'test'
+  ...
+# [初始化数据库] 创建数据表: o_user
+# [初始化数据库] 表数据初始化: o_user
+# [初始化数据库] 创建数据表: o_project
+# [初始化数据库] 创建数据表: o_artStyle
+# [初始化数据库] 表数据初始化: o_artStyle
+# [初始化数据库] 创建数据表: o_agentDeploy
+# [初始化数据库] 表数据初始化: o_agentDeploy
+# [初始化数据库] 创建数据表: o_setting
+# [初始化数据库] 表数据初始化: o_setting
+# [初始化数据库] 创建数据表: o_tasks
+# [初始化数据库] 表数据初始化: o_tasks
+# [初始化数据库] 创建数据表: o_prompt
+# [初始化数据库] 表数据初始化: o_prompt
+# [初始化数据库] 创建数据表: o_modelPrompt
+# [初始化数据库] 表数据初始化: o_modelPrompt
+# [初始化数据库] 创建数据表: o_novel
+# [初始化数据库] 创建数据表: o_event
+# [初始化数据库] 创建数据表: o_eventChapter
+# [初始化数据库] 创建数据表: o_script
+# [初始化数据库] 创建数据表: o_image
+# [初始化数据库] 创建数据表: o_assets
+# [初始化数据库] 表数据初始化: o_assets
+# [初始化数据库] 创建数据表: o_storyboard
+# [初始化数据库] 创建数据表: o_agentWorkData
+# [初始化数据库] 创建数据表: o_video
+# [初始化数据库] 创建数据表: o_videoTrack
+# [初始化数据库] 创建数据表: o_vendorConfig
+# [初始化数据库] 表数据初始化: o_vendorConfig
+# [初始化数据库] 创建数据表: o_imageFlow
+# [初始化数据库] 创建数据表: o_assets2Storyboard
+# [初始化数据库] 创建数据表: o_scriptAssets
+# [初始化数据库] 创建数据表: o_skillList
+# [初始化数据库] 表数据初始化: o_skillList
+# [初始化数据库] 创建数据表: o_skillAttribution
+# [初始化数据库] 表数据初始化: o_skillAttribution
+# [初始化数据库] 创建数据表: memories
+# [初始化数据库] 创建数据表: o_assetsRole2Audio
+# Subtest: PostgreSQL scoped agent HTTP write and audit commit once across retries
+ok 17 - PostgreSQL scoped agent HTTP write and audit commit once across retries
+  ---
+  duration_ms: 124.087167
+  type: 'test'
+  ...
+# Subtest: production derived asset service
+    # Subtest: creates and updates a child with project, episode, and parent binding
+    ok 1 - creates and updates a child with project, episode, and parent binding
+      ---
+      duration_ms: 78.772167
+      type: 'test'
+      ...
+    # Subtest: rejects a parent or episode outside the authenticated project
+    ok 2 - rejects a parent or episode outside the authenticated project
+      ---
+      duration_ms: 23.685833
+      type: 'test'
+      ...
+    # Subtest: rejects locked storyboard references before deleting image, links, or asset rows
+    ok 3 - rejects locked storyboard references before deleting image, links, or asset rows
+      ---
+      duration_ms: 39.21375
+      type: 'test'
+      ...
+    # Subtest: deletes the child, source image, links, and orphaned image flow in one transaction
+    ok 4 - deletes the child, source image, links, and orphaned image flow in one transaction
+      ---
+      duration_ms: 45.338084
+      type: 'test'
+      ...
+    1..4
+ok 18 - production derived asset service
+  ---
+  duration_ms: 187.620584
+  type: 'suite'
+  ...
+# Subtest: production flow relational source of truth
+    # Subtest: returns existing storyboards when the planning cache is absent
+    ok 1 - returns existing storyboards when the planning cache is absent
+      ---
+      duration_ms: 53.611708
+      type: 'test'
+      ...
+    # Subtest: does not let damaged or forged cache replace core script, storyboard, or asset rows
+    ok 2 - does not let damaged or forged cache replace core script, storyboard, or asset rows
+      ---
+      duration_ms: 29.909875
+      type: 'test'
+      ...
+    # Subtest: rejects project and episode mismatches before reading or writing
+    ok 3 - rejects project and episode mismatches before reading or writing
+      ---
+      duration_ms: 33.132542
+      type: 'test'
+      ...
+    # Subtest: adds storyboards, asset links, and one track atomically
+    ok 4 - adds storyboards, asset links, and one track atomically
+      ---
+      duration_ms: 27.64825
+      type: 'test'
+      ...
+    # Subtest: rolls back all writes when any referenced asset belongs to another project
+    ok 5 - rolls back all writes when any referenced asset belongs to another project
+      ---
+      duration_ms: 34.603625
+      type: 'test'
+      ...
+    # Subtest: reuses a track without rewriting an existing locked storyboard
+    ok 6 - reuses a track without rewriting an existing locked storyboard
+      ---
+      duration_ms: 23.363958
+      type: 'test'
+      ...
+    # Subtest: rejects a stale planning version and preserves the newer planning document
+    ok 7 - rejects a stale planning version and preserves the newer planning document
+      ---
+      duration_ms: 16.82525
+      type: 'test'
+      ...
+    # Subtest: rejects cross-project storyboard sorting and rolls back the planning transaction
+    ok 8 - rejects cross-project storyboard sorting and rolls back the planning transaction
+      ---
+      duration_ms: 26.080875
+      type: 'test'
+      ...
+    # Subtest: saves planning without rewriting an unchanged locked legacy order
+    ok 9 - saves planning without rewriting an unchanged locked legacy order
+      ---
+      duration_ms: 30.7175
+      type: 'test'
+      ...
+    # Subtest: normalizes all sparse indexes when a reorder changes their relative order
+    ok 10 - normalizes all sparse indexes when a reorder changes their relative order
+      ---
+      duration_ms: 16.699917
+      type: 'test'
+      ...
+    1..10
+ok 19 - production flow relational source of truth
+  ---
+  duration_ms: 293.444875
+  type: 'suite'
+  ...
+# Subtest: HTTP owner authorization, project binding and body actor rejection
+ok 20 - HTTP owner authorization, project binding and body actor rejection
+  ---
+  duration_ms: 117.826584
+  type: 'test'
+  ...
+# Subtest: HTTP simultaneous edits reject stale version and only successful commit emits change
+ok 21 - HTTP simultaneous edits reject stale version and only successful commit emits change
+  ---
+  duration_ms: 40.786
+  type: 'test'
+  ...
+# Subtest: HTTP lock protects edits, image replacement and atomic batch deletion
+ok 22 - HTTP lock protects edits, image replacement and atomic batch deletion
+  ---
+  duration_ms: 54.906084
+  type: 'test'
+  ...
+# Subtest: production image generation service
+    # Subtest: validates all asset IDs and parent image material before any model call
+    ok 1 - validates all asset IDs and parent image material before any model call
+      ---
+      duration_ms: 59.448958
+      type: 'test'
+      ...
+    # Subtest: persists prompt failure and successful images while respecting bounded concurrency
+    ok 2 - persists prompt failure and successful images while respecting bounded concurrency
+      ---
+      duration_ms: 57.149042
+      type: 'test'
+      ...
+    # Subtest: claims and previews before model execution; run starts the injected model
+    ok 3 - claims and previews before model execution; run starts the injected model
+      ---
+      duration_ms: 31.758709
+      type: 'test'
+      ...
+    # Subtest: rejects a second asset claim while its current image is generating
+    ok 4 - rejects a second asset claim while its current image is generating
+      ---
+      duration_ms: 36.280834
+      type: 'test'
+      ...
+    # Subtest: rejects locked storyboard material before any paid generation and persists save failures
+    ok 5 - rejects locked storyboard material before any paid generation and persists save failures
+      ---
+      duration_ms: 33.364959
+      type: 'test'
+      ...
+    # Subtest: rejects a storyboard changed after material read before any model call
+    ok 6 - rejects a storyboard changed after material read before any model call
+      ---
+      duration_ms: 35.562708
+      type: 'test'
+      ...
+    # Subtest: releases a stale generating state after a human edit without clearing content or old image
+    ok 7 - releases a stale generating state after a human edit without clearing content or old image
+      ---
+      duration_ms: 28.917417
+      type: 'test'
+      ...
+    # Subtest: rejects incomplete storyboard batches instead of silently dropping IDs
+    ok 8 - rejects incomplete storyboard batches instead of silently dropping IDs
+      ---
+      duration_ms: 14.398584
+      type: 'test'
+      ...
+    1..8
+ok 23 - production image generation service
+  ---
+  duration_ms: 298.227416
+  type: 'suite'
+  ...
+# Subtest: PostgreSQL CAS, raw lock triggers, and rollback are durable
+ok 24 - PostgreSQL CAS, raw lock triggers, and rollback are durable
+  ---
+  duration_ms: 376.585041
+  type: 'test'
+  ...
+# Subtest: PostgreSQL raw updates advance version and return approved work to draft
+ok 25 - PostgreSQL raw updates advance version and return approved work to draft
+  ---
+  duration_ms: 51.754792
+  type: 'test'
+  ...
+# Subtest: PostgreSQL transaction rolls back the state reservation when legacy write fails
+ok 26 - PostgreSQL transaction rolls back the state reservation when legacy write fails
+  ---
+  duration_ms: 39.040792
+  type: 'test'
+  ...
+# Subtest: PostgreSQL production-state migration is repeatable and preserves an active lock
+ok 27 - PostgreSQL production-state migration is repeatable and preserves an active lock
+  ---
+  duration_ms: 43.263333
+  type: 'test'
+  ...
+# Subtest: read returns default state without persisting it
+ok 28 - read returns default state without persisting it
+  ---
+  duration_ms: 52.65025
+  type: 'test'
+  ...
+# Subtest: content state persists across a real SQLite reopen
+ok 29 - content state persists across a real SQLite reopen
+  ---
+  duration_ms: 33.776958
+  type: 'test'
+  ...
+# Subtest: two independent SQLite clients with one version have one winner
+ok 30 - two independent SQLite clients with one version have one winner
+  ---
+  duration_ms: 37.764541
+  type: 'test'
+  ...
+# Subtest: locks reject service, raw storyboard, relationship, and delete writes
+ok 31 - locks reject service, raw storyboard, relationship, and delete writes
+  ---
+  duration_ms: 21.180625
+  type: 'test'
+  ...
+# Subtest: project binding and human-only mutations are enforced
+ok 32 - project binding and human-only mutations are enforced
+  ---
+  duration_ms: 25.798125
+  type: 'test'
+  ...
+# Subtest: a generating referenced asset blocks a storyboard lock until it completes
+ok 33 - a generating referenced asset blocks a storyboard lock until it completes
+  ---
+  duration_ms: 37.15325
+  type: 'test'
+  ...
+# Subtest: review transitions version state and content changes approved to draft
+ok 34 - review transitions version state and content changes approved to draft
+  ---
+  duration_ms: 16.516041
+  type: 'test'
+  ...
+# Subtest: a failed legacy write rolls back its CAS reservation
+ok 35 - a failed legacy write rolls back its CAS reservation
+  ---
+  duration_ms: 16.968791
+  type: 'test'
+  ...
+# Subtest: legacy storyboard writes advance versions and reject stale expected versions
+ok 36 - legacy storyboard writes advance versions and reject stale expected versions
+  ---
+  duration_ms: 24.890875
+  type: 'test'
+  ...
+# Subtest: fresh relationship insert and delete create state and invalidate version zero
+ok 37 - fresh relationship insert and delete create state and invalidate version zero
+  ---
+  duration_ms: 24.959125
+  type: 'test'
+  ...
+# Subtest: relationship update invalidates old and new storyboard exactly once
+ok 38 - relationship update invalidates old and new storyboard exactly once
+  ---
+  duration_ms: 13.704541
+  type: 'test'
+  ...
+# Subtest: raw storyboard and relationship writes move approved work back to draft
+ok 39 - raw storyboard and relationship writes move approved work back to draft
+  ---
+  duration_ms: 13.624041
+  type: 'test'
+  ...
+# Subtest: runtime entity ids and content patch types are validated
+ok 40 - runtime entity ids and content patch types are validated
+  ---
+  duration_ms: 9.657375
+  type: 'test'
+  ...
+# Subtest: Seedance prompt media references
+    # Subtest: numbers image, video, and audio references independently
+    ok 1 - numbers image, video, and audio references independently
+      ---
+      duration_ms: 0.930042
+      type: 'test'
+      ...
+    1..1
+ok 41 - Seedance prompt media references
+  ---
+  duration_ms: 1.351292
+  type: 'suite'
+  ...
+# Subtest: Seedance provider local contract
+    # Subtest: keeps only image/video/audio reference kinds in the Seedance 2 model config
+    ok 1 - keeps only image/video/audio reference kinds in the Seedance 2 model config
+      ---
+      duration_ms: 0.678959
+      type: 'test'
+      ...
+    # Subtest: uses the expected create/query paths, Bearer header, and typed media references
+    ok 2 - uses the expected create/query paths, Bearer header, and typed media references
+      ---
+      duration_ms: 10.71225
+      type: 'test'
+      ...
+    # Subtest: surfaces task creation failures without polling
+    ok 3 - surfaces task creation failures without polling
+      ---
+      duration_ms: 0.958334
+      type: 'test'
+      ...
+    # Subtest: surfaces failed task results
+    ok 4 - surfaces failed task results
+      ---
+      duration_ms: 0.891125
+      type: 'test'
+      ...
+    1..4
+ok 42 - Seedance provider local contract
+  ---
+  duration_ms: 48.468
+  type: 'suite'
+  ...
+# Subtest: PostgreSQL idempotent reservation and restart query use one upstream task
+ok 43 - PostgreSQL idempotent reservation and restart query use one upstream task
+  ---
+  duration_ms: 147.559042
+  type: 'test'
+  ...
+# Subtest: same idempotency key and payload reserves one upstream task
+ok 44 - same idempotency key and payload reserves one upstream task
+  ---
+  duration_ms: 26.758417
+  type: 'test'
+  ...
+# Subtest: same idempotency key with a different payload is a conflict
+ok 45 - same idempotency key with a different payload is a conflict
+  ---
+  duration_ms: 8.504042
+  type: 'test'
+  ...
+# Subtest: cross-project video, track, or script references are rejected
+ok 46 - cross-project video, track, or script references are rejected
+  ---
+  duration_ms: 6.990792
+  type: 'test'
+  ...
+# Subtest: restart only queries persisted upstream task and writes before success
+ok 47 - restart only queries persisted upstream task and writes before success
+  ---
+  duration_ms: 11.514458
+  type: 'test'
+  ...
+# Subtest: stranded reservation requires reconciliation and never posts again
+ok 48 - stranded reservation requires reconciliation and never posts again
+  ---
+  duration_ms: 10.024708
+  type: 'test'
+  ...
+# Subtest: a changed provider endpoint or model fingerprint requires reconciliation
+ok 49 - a changed provider endpoint or model fingerprint requires reconciliation
+  ---
+  duration_ms: 9.625291
+  type: 'test'
+  ...
+# Subtest: download retries never resubmit an upstream video
+ok 50 - download retries never resubmit an upstream video
+  ---
+  duration_ms: 12.125625
+  type: 'test'
+  ...
+# Subtest: one service observes its configured upstream submission concurrency limit
+ok 51 - one service observes its configured upstream submission concurrency limit
+  ---
+  duration_ms: 31.696125
+  type: 'test'
+  ...
+# Subtest: concurrent idempotent new-video reservations create exactly one video row
+ok 52 - concurrent idempotent new-video reservations create exactly one video row
+  ---
+  duration_ms: 7.180084
+  type: 'test'
+  ...
+# Subtest: batch reservation rolls back every video when any request is invalid
+ok 53 - batch reservation rolls back every video when any request is invalid
+  ---
+  duration_ms: 6.994166
+  type: 'test'
+  ...
+# Subtest: restart schedules a persisted future poll instead of leaving it dormant
+ok 54 - restart schedules a persisted future poll instead of leaving it dormant
+  ---
+  duration_ms: 29.310417
+  type: 'test'
+  ...
+# Subtest: exhausted upstream query retries require reconciliation rather than marking generation failed
+ok 55 - exhausted upstream query retries require reconciliation rather than marking generation failed
+  ---
+  duration_ms: 7.326583
+  type: 'test'
+  ...
+# Subtest: upstream succeeded without a video URL is a retryable protocol fault, never a generation failure
+ok 56 - upstream succeeded without a video URL is a retryable protocol fault, never a generation failure
+  ---
+  duration_ms: 11.5745
+  type: 'test'
+  ...
+# Subtest: exhausted download retries preserve result URL and require reconciliation
+ok 57 - exhausted download retries preserve result URL and require reconciliation
+  ---
+  duration_ms: 9.21425
+  type: 'test'
+  ...
+# Subtest: stop prevents a pending in-flight query from scheduling another poll
+ok 58 - stop prevents a pending in-flight query from scheduling another poll
+  ---
+  duration_ms: 29.699417
+  type: 'test'
+  ...
+# Subtest: invalid concurrency bounds are rejected before work begins
+ok 59 - invalid concurrency bounds are rejected before work begins
+  ---
+  duration_ms: 4.540666
+  type: 'test'
+  ...
+# Subtest: media references are available to first submit then compacted from durable payload without breaking idempotency or restart
+ok 60 - media references are available to first submit then compacted from durable payload without breaking idempotency or restart
+  ---
+  duration_ms: 11.192292
+  type: 'test'
+  ...
+# Subtest: startup reconciliation compacts a stranded submitting payload without retrying its media POST
+ok 61 - startup reconciliation compacts a stranded submitting payload without retrying its media POST
+  ---
+  duration_ms: 7.173542
+  type: 'test'
+  ...
+# Subtest: video download deadline covers a stalled body after successful headers
+ok 62 - video download deadline covers a stalled body after successful headers
+  ---
+  duration_ms: 47.104625
+  type: 'test'
+  ...
+1..62
+# tests 87
+# suites 7
+# pass 87
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 1137.979916

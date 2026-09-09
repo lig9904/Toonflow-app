@@ -3,7 +3,8 @@ import u from "@/utils";
 import { z } from "zod";
 import { success } from "@/lib/responseFormat";
 import { validateFields } from "@/middleware/middleware";
-import { id } from "zod/locales";
+import { requireProductionOwner, sendProductionError } from "@/services/productionHttp";
+import { updateDerivedAssetImage } from "@/services/productionAssets";
 const router = express.Router();
 
 export default router.post(
@@ -12,15 +13,15 @@ export default router.post(
     id: z.number(),
     url: z.string(),
     flowId: z.number(),
+    projectId: z.number(),
+    scriptId: z.number(),
   }),
   async (req, res) => {
-    const { id, url, flowId } = req.body;
-    const [imageId] = await u.db("o_image").insert({
-      filePath: u.replaceUrl(url),
-      state: "已完成",
-      assetsId: id,
-    });
-    await u.db("o_assets").where({ id }).update({ flowId, imageId });
-    res.status(200).send(success({ message: "更新提示词成功" }));
+    try {
+      const { id, url, flowId, projectId, scriptId } = req.body;
+      await requireProductionOwner(req, projectId, u.db);
+      await updateDerivedAssetImage(u.db, { id, url: u.replaceUrl(url), flowId, projectId, scriptId: Number(scriptId) });
+      res.status(200).send(success({ message: "更新提示词成功" }));
+    } catch (error) { sendProductionError(res, error); }
   },
 );

@@ -1,0 +1,211 @@
+TAP version 13
+# Subtest: production flow relational source of truth
+    # Subtest: returns existing storyboards when the planning cache is absent
+    ok 1 - returns existing storyboards when the planning cache is absent
+      ---
+      duration_ms: 27.924917
+      type: 'test'
+      ...
+    # Subtest: does not let damaged or forged cache replace core script, storyboard, or asset rows
+    ok 2 - does not let damaged or forged cache replace core script, storyboard, or asset rows
+      ---
+      duration_ms: 14.728666
+      type: 'test'
+      ...
+    # Subtest: rejects project and episode mismatches before reading or writing
+    ok 3 - rejects project and episode mismatches before reading or writing
+      ---
+      duration_ms: 10.825625
+      type: 'test'
+      ...
+    # Subtest: adds storyboards, asset links, and one track atomically
+    ok 4 - adds storyboards, asset links, and one track atomically
+      ---
+      duration_ms: 11.687125
+      type: 'test'
+      ...
+    # Subtest: rolls back all writes when any referenced asset belongs to another project
+    ok 5 - rolls back all writes when any referenced asset belongs to another project
+      ---
+      duration_ms: 10.395834
+      type: 'test'
+      ...
+    # Subtest: reuses a track without rewriting an existing locked storyboard
+    ok 6 - reuses a track without rewriting an existing locked storyboard
+      ---
+      duration_ms: 12.821542
+      type: 'test'
+      ...
+    # Subtest: rejects a stale planning version and preserves the newer planning document
+    ok 7 - rejects a stale planning version and preserves the newer planning document
+      ---
+      duration_ms: 10.667083
+      type: 'test'
+      ...
+    # Subtest: rejects cross-project storyboard sorting and rolls back the planning transaction
+    ok 8 - rejects cross-project storyboard sorting and rolls back the planning transaction
+      ---
+      duration_ms: 10.28125
+      type: 'test'
+      ...
+    # Subtest: saves planning without rewriting an unchanged locked legacy order
+    ok 9 - saves planning without rewriting an unchanged locked legacy order
+      ---
+      duration_ms: 16.107083
+      type: 'test'
+      ...
+    # Subtest: normalizes all sparse indexes when a reorder changes their relative order
+    ok 10 - normalizes all sparse indexes when a reorder changes their relative order
+      ---
+      duration_ms: 10.104834
+      type: 'test'
+      ...
+    1..10
+ok 1 - production flow relational source of truth
+  ---
+  duration_ms: 136.171459
+  type: 'suite'
+  ...
+# Subtest: HTTP owner authorization, project binding and body actor rejection
+ok 2 - HTTP owner authorization, project binding and body actor rejection
+  ---
+  duration_ms: 64.194417
+  type: 'test'
+  ...
+# Subtest: HTTP simultaneous edits reject stale version and only successful commit emits change
+ok 3 - HTTP simultaneous edits reject stale version and only successful commit emits change
+  ---
+  duration_ms: 27.915458
+  type: 'test'
+  ...
+# Subtest: HTTP lock protects edits, image replacement and atomic batch deletion
+ok 4 - HTTP lock protects edits, image replacement and atomic batch deletion
+  ---
+  duration_ms: 40.101333
+  type: 'test'
+  ...
+# Subtest: read returns default state without persisting it
+ok 5 - read returns default state without persisting it
+  ---
+  duration_ms: 23.401125
+  type: 'test'
+  ...
+# Subtest: content state persists across a real SQLite reopen
+ok 6 - content state persists across a real SQLite reopen
+  ---
+  duration_ms: 9.747584
+  type: 'test'
+  ...
+# Subtest: two independent SQLite clients with one version have one winner
+ok 7 - two independent SQLite clients with one version have one winner
+  ---
+  duration_ms: 14.975834
+  type: 'test'
+  ...
+# Subtest: locks reject service, raw storyboard, relationship, and delete writes
+ok 8 - locks reject service, raw storyboard, relationship, and delete writes
+  ---
+  duration_ms: 8.276875
+  type: 'test'
+  ...
+# Subtest: project binding and human-only mutations are enforced
+ok 9 - project binding and human-only mutations are enforced
+  ---
+  duration_ms: 6.86375
+  type: 'test'
+  ...
+# Subtest: review transitions version state and content changes approved to draft
+ok 10 - review transitions version state and content changes approved to draft
+  ---
+  duration_ms: 7.9965
+  type: 'test'
+  ...
+# Subtest: a failed legacy write rolls back its CAS reservation
+ok 11 - a failed legacy write rolls back its CAS reservation
+  ---
+  duration_ms: 7.456167
+  type: 'test'
+  ...
+# Subtest: legacy storyboard writes advance versions and reject stale expected versions
+ok 12 - legacy storyboard writes advance versions and reject stale expected versions
+  ---
+  duration_ms: 9.854625
+  type: 'test'
+  ...
+# Subtest: fresh relationship insert and delete create state and invalidate version zero
+ok 13 - fresh relationship insert and delete create state and invalidate version zero
+  ---
+  duration_ms: 13.591375
+  type: 'test'
+  ...
+# Subtest: relationship update invalidates old and new storyboard exactly once
+ok 14 - relationship update invalidates old and new storyboard exactly once
+  ---
+  duration_ms: 9.48375
+  type: 'test'
+  ...
+# Subtest: raw storyboard and relationship writes move approved work back to draft
+ok 15 - raw storyboard and relationship writes move approved work back to draft
+  ---
+  duration_ms: 7.698791
+  type: 'test'
+  ...
+# Subtest: runtime entity ids and content patch types are validated
+ok 16 - runtime entity ids and content patch types are validated
+  ---
+  duration_ms: 6.617833
+  type: 'test'
+  ...
+# Subtest: Seedance prompt media references
+    # Subtest: numbers image, video, and audio references independently
+    ok 1 - numbers image, video, and audio references independently
+      ---
+      duration_ms: 0.749542
+      type: 'test'
+      ...
+    1..1
+ok 17 - Seedance prompt media references
+  ---
+  duration_ms: 1.106042
+  type: 'suite'
+  ...
+# Subtest: Seedance provider local contract
+    # Subtest: keeps only image/video/audio reference kinds in the Seedance 2 model config
+    ok 1 - keeps only image/video/audio reference kinds in the Seedance 2 model config
+      ---
+      duration_ms: 0.601333
+      type: 'test'
+      ...
+    # Subtest: uses the expected create/query paths, Bearer header, and typed media references
+    ok 2 - uses the expected create/query paths, Bearer header, and typed media references
+      ---
+      duration_ms: 10.396666
+      type: 'test'
+      ...
+    # Subtest: surfaces task creation failures without polling
+    ok 3 - surfaces task creation failures without polling
+      ---
+      duration_ms: 0.904834
+      type: 'test'
+      ...
+    # Subtest: surfaces failed task results
+    ok 4 - surfaces failed task results
+      ---
+      duration_ms: 0.880458
+      type: 'test'
+      ...
+    1..4
+ok 18 - Seedance provider local contract
+  ---
+  duration_ms: 44.869375
+  type: 'suite'
+  ...
+1..18
+# tests 30
+# suites 3
+# pass 30
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 337.649208

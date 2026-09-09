@@ -2,6 +2,7 @@ import express from "express";
 import u from "@/utils";
 import { z } from "zod";
 import { success } from "@/lib/responseFormat";
+import { insertRowsReturningIds } from "@/lib/insertRows";
 import { validateFields } from "@/middleware/middleware";
 const router = express.Router();
 
@@ -24,8 +25,9 @@ export default router.post(
   async (req, res) => {
     const { projectType, name, intro, type, directorManual, artStyle, videoRatio, imageModel, videoModel, imageQuality, mode } = req.body;
 
-    await u.db("o_project").insert({
-      id: Date.now(),
+    const userId = Number((req as any).user?.id);
+    if (!Number.isSafeInteger(userId) || userId <= 0) return res.status(401).send({ message: "请先登录" });
+    await insertRowsReturningIds(u.db, "o_project", {
       projectType,
       name,
       intro,
@@ -33,7 +35,7 @@ export default router.post(
       artStyle,
       videoRatio,
       directorManual,
-      userId: 1,
+      userId,
       imageModel,
       videoModel,
       createTime: Date.now(),

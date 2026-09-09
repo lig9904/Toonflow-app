@@ -1,11 +1,8 @@
 import express from "express";
 import z from "zod";
+import { error } from "@/lib/responseFormat";
 import { validateFields } from "@/middleware/middleware";
-import u from "@/utils";
-import fs from "fs";
-import axios from "axios";
-import compressing from "compressing";
-import { success } from "@/lib/responseFormat";
+
 const router = express.Router();
 
 export default router.post(
@@ -15,20 +12,9 @@ export default router.post(
     reinstall: z.boolean(),
     version: z.string(),
   }),
-  async (req, res) => {
-    const { reinstall, url, version } = req.body;
-    if (reinstall) {
-      res.status(200).send(success("请在浏览器中手动下载并安装最新版本"));
-    } else {
-      const rootDir = u.getPath(["temp"]);
-      fs.mkdirSync(rootDir, { recursive: true });
-      const zip = await axios.get(url, { responseType: "arraybuffer" }).then((res) => res.data);
-      fs.writeFileSync(`${rootDir}/latest.zip`, zip);
-      await compressing.zip.uncompress(`${rootDir}/latest.zip`, rootDir);
-      const dataDir = u.getPath();
-      fs.cpSync(rootDir, dataDir, { recursive: true, force: true });
-      fs.rmSync(rootDir, { recursive: true, force: true });
-      res.status(200).send(success(`更新${version}成功，5秒后重启`));
-    }
+  async (_req, res) => {
+    // Managed deployments do not permit browser-triggered downloads, archive
+    // extraction, or replacement of the running installation.
+    res.status(409).send(error("定制版由管理员部署更新，禁止在线下载或重装"));
   },
 );

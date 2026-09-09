@@ -1,4 +1,5 @@
 import db from "@/utils/db";
+import { insertRowsReturningIds } from "@/lib/insertRows";
 
 const taskStateMap = {
   "0": "进行中",
@@ -38,7 +39,7 @@ export default async function taskRecord(
     }
   }
 
-  const [id] = await db("o_tasks").insert({
+  const [id] = await insertRowsReturningIds(db, "o_tasks", {
     projectId,
     taskClass,
     relatedObjects: opteorContent,

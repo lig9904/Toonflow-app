@@ -3,6 +3,7 @@ import u from "@/utils";
 import { z } from "zod";
 import { success } from "@/lib/responseFormat";
 import { validateFields } from "@/middleware/middleware";
+import { insertRowsReturningIds } from "@/lib/insertRows";
 const router = express.Router();
 
 export default router.post(
@@ -25,7 +26,7 @@ export default router.post(
         });
       }
     });
-    const [insertFlowId] = await u.db("o_imageFlow").insert({
+    const [insertFlowId] = await insertRowsReturningIds(u.db, "o_imageFlow", {
       flowData: JSON.stringify({ edges, nodes }),
     });
     return res.status(200).send(success({ id: insertFlowId }));

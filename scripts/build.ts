@@ -1,6 +1,7 @@
 import esbuild from "esbuild";
 import fs from "fs";
 import path from "path";
+import generateRouter from "../src/core";
 
 // 打包默认使用 prod 环境变量
 if (!process.env.NODE_ENV) {
@@ -47,6 +48,12 @@ const appBuildConfig: esbuild.BuildOptions = {
   },
 };
 
+// A standalone stdio MCP bundle can be launched from any client working directory.
+const mcpBuildConfig: esbuild.BuildOptions = {
+  entryPoints: ["scripts/toonflow-mcp.ts"], bundle: true, platform: "node", format: "cjs",
+  outfile: "build/toonflow-mcp.cjs", target: "node22", tsconfig: "./tsconfig.json",
+};
+
 // Electron 主进程打包配置
 const mainBuildConfig: esbuild.BuildOptions = {
   entryPoints: ["scripts/main.ts"],
@@ -72,11 +79,14 @@ const mainBuildConfig: esbuild.BuildOptions = {
   try {
     console.log("🔨 开始构建...\n");
 
+    await generateRouter();
     // 并行构建
-    await Promise.all([esbuild.build(appBuildConfig), esbuild.build(mainBuildConfig)]);
+    await Promise.all([esbuild.build(appBuildConfig), esbuild.build(mainBuildConfig), esbuild.build(mcpBuildConfig)]);
 
-    console.log("✅ 后端服务构建完成: build/app.js");
+    fs.copyFileSync("data/serve/app.js", "build/server.cjs");
+    console.log("✅ 后端服务构建完成: build/server.cjs");
     console.log("✅ Electron主进程构建完成: build/main.js");
+    console.log("✅ MCP stdio构建完成: build/toonflow-mcp.cjs");
     console.log("\n🎉 所有构建任务完成!\n");
   } catch (err) {
     console.error("❌ 构建失败:", err);

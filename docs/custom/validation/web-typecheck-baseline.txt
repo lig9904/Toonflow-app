@@ -1,0 +1,38 @@
+src/components/editMdPreivew.vue(16,8): error TS2322: Type '"auto" | "light" | "dark"' is not assignable to type 'Themes | undefined'.
+  Type '"auto"' is not assignable to type 'Themes | undefined'.
+src/components/setting/components/skillManagement.vue(24,21): error TS2322: Type '"auto" | "light" | "dark"' is not assignable to type 'Themes | undefined'.
+  Type '"auto"' is not assignable to type 'Themes | undefined'.
+src/components/setting/components/skillManagement.vue(39,18): error TS2322: Type '"auto" | "light" | "dark"' is not assignable to type 'Themes | undefined'.
+  Type '"auto"' is not assignable to type 'Themes | undefined'.
+src/components/setting/components/vendorConfig.vue(44,61): error TS2322: Type '"auto" | "light" | "dark"' is not assignable to type 'Themes | undefined'.
+  Type '"auto"' is not assignable to type 'Themes | undefined'.
+src/pages/error/404.vue(16,18): error TS2339: Property '$electron' does not exist on type 'Window & typeof globalThis'.
+src/utils/providersLogo.ts(2,33): error TS2339: Property 'glob' does not exist on type 'ImportMeta'.
+src/utils/providersLogo.ts(12,26): error TS2322: Type 'unknown' is not assignable to type 'string'.
+src/views/production/components/rightChatBox/index.vue(68,57): error TS2322: Type 'string' is not assignable to type '"default" | "primary" | "danger" | "warning" | "success" | undefined'.
+src/views/production/components/workbench/generate copy.vue(650,35): error TS7006: Parameter 'mode' implicitly has an 'any' type.
+src/views/production/components/workbench/generate copy.vue(954,131): error TS2322: Type 'number | null | undefined' is not assignable to type 'number | undefined'.
+  Type 'null' is not assignable to type 'number | undefined'.
+src/views/production/components/workbench/generate/components/modeMenu.vue(7,70): error TS2322: Type '(newVal: string) => void' is not assignable to type '(value: SelectValue<SelectOption>, context: { option?: SelectOption | undefined; selectedOptions: SelectOption[]; trigger: SelectValueChangeTrigger; e?: MouseEvent | ... 1 more ... | undefined; }) => void'.
+  Types of parameters 'newVal' and 'value' are incompatible.
+    Type 'SelectValue<SelectOption>' is not assignable to type 'string'.
+      Type 'number' is not assignable to type 'string'.
+src/views/production/index.vue(49,33): error TS2739: Type '{ videoList: { id: number; prompt: string; duration: number; storyboardId: number; trackId: number; }[]; }' is missing the following properties from type 'WorkbenchData': name, duration, resolution, fps
+src/views/production/node/script.vue(9,36): error TS2322: Type '"auto" | "light" | "dark"' is not assignable to type 'Themes | undefined'.
+  Type '"auto"' is not assignable to type 'Themes | undefined'.
+src/views/production/node/script.vue(28,8): error TS2322: Type '"auto" | "light" | "dark"' is not assignable to type 'Themes | undefined'.
+  Type '"auto"' is not assignable to type 'Themes | undefined'.
+src/views/production/node/scriptPlan.vue(11,47): error TS2322: Type '"auto" | "light" | "dark"' is not assignable to type 'Themes | undefined'.
+  Type '"auto"' is not assignable to type 'Themes | undefined'.
+src/views/production/node/scriptPlan.vue(29,8): error TS2322: Type '"auto" | "light" | "dark"' is not assignable to type 'Themes | undefined'.
+  Type '"auto"' is not assignable to type 'Themes | undefined'.
+src/views/production/node/storyboardTable.vue(11,52): error TS2322: Type '"auto" | "light" | "dark"' is not assignable to type 'Themes | undefined'.
+  Type '"auto"' is not assignable to type 'Themes | undefined'.
+src/views/production/node/storyboardTable.vue(29,8): error TS2322: Type '"auto" | "light" | "dark"' is not assignable to type 'Themes | undefined'.
+  Type '"auto"' is not assignable to type 'Themes | undefined'.
+src/views/project/components/projectDialog.vue(193,26): error TS2322: Type '"auto" | "light" | "dark"' is not assignable to type 'Themes | undefined'.
+  Type '"auto"' is not assignable to type 'Themes | undefined'.
+src/views/project/components/projectDialog.vue(264,26): error TS2322: Type '"auto" | "light" | "dark"' is not assignable to type 'Themes | undefined'.
+  Type '"auto"' is not assignable to type 'Themes | undefined'.
+src/views/scriptAgent/index copy.vue(436,115): error TS2322: Type '"audio" | "role" | "scene" | "clip" | "tool"' is not assignable to type '"role" | "scene" | "clip" | "tool"'.
+  Type '"audio"' is not assignable to type '"role" | "scene" | "clip" | "tool"'.

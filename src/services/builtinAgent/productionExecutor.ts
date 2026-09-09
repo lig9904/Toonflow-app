@@ -11,6 +11,7 @@ import type { StructuredModelRequest, StructuredScriptModel } from "./scriptExec
 import { createAssetExtractionHelper } from "./assetExtraction";
 import { getCreativeState } from "../creativeWorkspace";
 import pLimit from "p-limit";
+import { builtinThinkLevelFromIntent } from "./contracts";
 
 export interface ProductionMediaRequest {
   ctx: BuiltinExecutionContext;
@@ -73,6 +74,7 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
     const projectId = run.projectId;
     const scriptId = run.scriptId;
     const revision = run.inputRevision ?? 0;
+    const thinkLevel = builtinThinkLevelFromIntent(run.intent);
     const requestText = run.continuation ? `${run.prompt}\n\n人工补充与续作要求：\n${run.continuation}` : run.prompt;
     const project = await ctx.step(`production.input:r${revision}`, { projectId, scriptId, requestText }, async () => {
       const row = await deps.db("o_project").where({ id: projectId }).first();
@@ -89,7 +91,7 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
       await ctx.assertActive();
       const system = `${await skill(skillName)}\n\n执行协议：只返回 schema 定义的结构化数据，不输出 XML，不直接操作界面，不声称已保存。所有项目、剧集、素材、分镜 ID 必须来自输入。`;
       const result = await ctx.step(`production.${key}:r${revision}`, { input, role, systemHash: hash(system), budget }, async () => {
-        const generated = await deps.model.generate({ role, system, input, schema, maxOutputTokens: budget, signal: ctx.signal });
+        const generated = await deps.model.generate({ role, system, input, schema, maxOutputTokens: budget, signal: ctx.signal, thinkLevel });
         return { value: schema.parse(generated.value), outputTokens: generated.outputTokens };
       }, { modelCall: true });
       return result.value;

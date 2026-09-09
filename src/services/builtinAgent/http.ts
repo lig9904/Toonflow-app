@@ -16,6 +16,7 @@ const startSchema = z.object({
   prompt: z.string().trim().min(1).max(100000),
   idempotencyKey: z.string().min(8).max(150).regex(/^[\w:.-]+$/),
   limits: limitsSchema.optional(),
+  thinkLevel: z.number().int().min(0).max(3).optional(),
 }).strict();
 
 export interface BuiltinHttpDependencies {
@@ -54,7 +55,13 @@ export function createBuiltinAgentRouter(deps: BuiltinHttpDependencies): express
     const requestedBy = await deps.userId(req);
     await deps.authorize(requestedBy, input.projectId, "edit", input.scriptId);
     if (input.agentType === "productionAgent" && input.scriptId == null) throw new BuiltinRuntimeError("INVALID_INPUT", "制作任务需要指定剧集");
-    const result = await deps.runtime.create({ ...input, requestedBy, limits: { ...defaultBuiltinRunLimits, ...input.limits } });
+    const { thinkLevel, ...runInput } = input;
+    const result = await deps.runtime.create({
+      ...runInput,
+      requestedBy,
+      limits: { ...defaultBuiltinRunLimits, ...input.limits },
+      ...(thinkLevel === undefined ? {} : { intent: { thinkLevel } }),
+    });
     res.send({ code: 200, data: result });
   }));
   router.post("/list", handle(async (req, res) => {

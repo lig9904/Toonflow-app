@@ -31,8 +31,10 @@ async function setup() {
     team.createUser(1, { name: "viewer", password: "fixture-password-d", role: "viewer" }),
   ]);
   let modelCalls = 0;
+  const modelRequests: Array<{ role: string; thinkLevel: number }> = [];
   const model: StructuredScriptModel = { async generate(req) {
     modelCalls += 1;
+    modelRequests.push({ role: req.role, thinkLevel: req.thinkLevel });
     const value = req.role === "scriptAgent:decisionAgent"
       ? { actions: ["script"], chapterIds: [], targetScriptIds: [], question: null, summary: "准备剧本" }
       : { script: [{ id: null, name: "HTTP episode", content: "Created without a browser callback", assets: [] }], summary: "完成" };
@@ -75,7 +77,7 @@ async function setup() {
     assert(!JSON.stringify(result.body).includes(result.cookie.split("=")[1]));
     return result.cookie;
   }
-  return { ...f, projectId, users, runtime, post, login, get modelCalls() { return modelCalls; }, async close() {
+  return { ...f, projectId, users, runtime, post, login, modelRequests, get modelCalls() { return modelCalls; }, async close() {
     await runtime.stop();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await f.destroy();
@@ -89,14 +91,28 @@ test("five independent cookie sessions share a project with real read/edit roles
     assert.equal(new Set(cookies).size, 5);
     const reads = await Promise.all(cookies.map((cookie) => f.post("/api/scriptAgent/getPlanData", { projectId: f.projectId, agentType: "scriptAgent" }, cookie)));
     assert(reads.every((r) => r.status === 200), JSON.stringify(reads.map((r) => r.body)));
-    const create = await f.post("/api/builtinAgent/start", { projectId: f.projectId, agentType: "scriptAgent", prompt: "Write an episode", idempotencyKey: "http-run-creation" }, cookies[1]);
+    const createInput = { projectId: f.projectId, agentType: "scriptAgent", prompt: "Write an episode", idempotencyKey: "http-run-creation", thinkLevel: 2 };
+    const create = await f.post("/api/builtinAgent/start", createInput, cookies[1]);
     assert.equal(create.status, 200, JSON.stringify(create.body));
-    const duplicate = await f.post("/api/builtinAgent/start", { projectId: f.projectId, agentType: "scriptAgent", prompt: "Write an episode", idempotencyKey: "http-run-creation" }, cookies[1]);
+    assert.deepEqual(create.body.data.run.intent, { thinkLevel: 2 });
+    const persisted = await f.db("ext_builtin_runs").where({ id: create.body.data.run.id }).first("intent");
+    assert.deepEqual(persisted.intent, { thinkLevel: 2 });
+    const duplicate = await f.post("/api/builtinAgent/start", createInput, cookies[1]);
     assert.equal(duplicate.body.data.reused, true);
+    const conflictingLevel = await f.post("/api/builtinAgent/start", { ...createInput, thinkLevel: 3 }, cookies[1]);
+    assert.equal(conflictingLevel.status, 409);
+    assert.equal(conflictingLevel.body.code, "CONFLICT");
+    const invalidLevel = await f.post("/api/builtinAgent/start", { ...createInput, idempotencyKey: "http-run-invalid-level", thinkLevel: 4 }, cookies[1]);
+    assert.equal(invalidLevel.status, 400);
+    assert.equal(invalidLevel.body.code, "INVALID_INPUT");
     const denied = await f.post("/api/builtinAgent/start", { projectId: f.projectId, agentType: "scriptAgent", prompt: "Write", idempotencyKey: "viewer-run-creation" }, cookies[4]);
     assert.equal(denied.status, 403);
     await f.runtime.runOnce();
     assert.equal(f.modelCalls, 2);
+    assert.deepEqual(f.modelRequests, [
+      { role: "scriptAgent:decisionAgent", thinkLevel: 2 },
+      { role: "scriptAgent:scriptAgent", thinkLevel: 2 },
+    ]);
     const id = create.body.data.run.id;
     const visible = await f.post("/api/builtinAgent/get", { runId: id, afterSequence: 0 }, cookies[4]);
     assert.equal(visible.body.data.run.status, "succeeded", JSON.stringify(visible.body));
@@ -107,6 +123,12 @@ test("five independent cookie sessions share a project with real read/edit roles
     const pollAgain = await f.post("/api/builtinAgent/get", { runId: id, afterSequence: visible.body.data.nextSequence }, cookies[1]);
     assert.equal(pollAgain.body.data.events.length, 0);
     assert.equal(f.modelCalls, 2);
+    const legacyInput = { projectId: f.projectId, agentType: "scriptAgent", prompt: "Legacy start", idempotencyKey: "http-run-legacy-shape" };
+    const legacy = await f.post("/api/builtinAgent/start", legacyInput, cookies[1]);
+    assert.equal(legacy.status, 200);
+    assert.equal(legacy.body.data.run.intent, null);
+    const legacyDuplicate = await f.post("/api/builtinAgent/start", legacyInput, cookies[1]);
+    assert.equal(legacyDuplicate.body.data.reused, true);
   } finally { await f.close(); }
 });
 

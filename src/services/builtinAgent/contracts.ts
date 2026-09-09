@@ -3,6 +3,14 @@ export type BuiltinAgentType = typeof builtinAgentTypes[number];
 export const builtinRunStatuses = ["queued", "running", "waiting_human", "paused", "succeeded", "failed", "reconciliation_required", "cancelled"] as const;
 export type BuiltinRunStatus = typeof builtinRunStatuses[number];
 export type BuiltinControlAction = "pause" | "resume" | "cancel" | "takeover";
+export type BuiltinThinkLevel = 0 | 1 | 2 | 3;
+
+/** Public starts persist this server-owned preference in intent; older runs default to thinking off. */
+export function builtinThinkLevelFromIntent(intent: unknown): BuiltinThinkLevel {
+  if (!intent || typeof intent !== "object" || Array.isArray(intent)) return 0;
+  const value = (intent as { thinkLevel?: unknown }).thinkLevel;
+  return value === 1 || value === 2 || value === 3 ? value : 0;
+}
 
 export interface BuiltinRunLimits {
   maxModelCalls: number;

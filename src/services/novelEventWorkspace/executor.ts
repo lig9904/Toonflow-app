@@ -5,6 +5,7 @@ import type { BuiltinExecutionContext } from "../builtinAgentRuntime";
 import { BuiltinRuntimeError } from "../builtinAgentRuntime";
 import { lockProjectTransaction } from "../../lib/dbTransaction";
 import type { StructuredScriptModel } from "../builtinAgent/scriptExecutor";
+import { builtinThinkLevelFromIntent } from "../builtinAgent/contracts";
 import {
   getCreativeState,
   loadNovelEventPrompt,
@@ -125,6 +126,7 @@ export function createNovelEventExecutor(deps: NovelEventExecutorDependencies) {
               schema: extractedEventSchema,
               maxOutputTokens: context.maxOutputTokensPerChapter,
               signal: ctx.signal,
+              thinkLevel: builtinThinkLevelFromIntent(ctx.run.intent),
             });
             return { value: extractedEventSchema.parse(response.value), outputTokens: response.outputTokens };
           }, { modelCall: true });

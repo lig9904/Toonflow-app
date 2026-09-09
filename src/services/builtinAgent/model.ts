@@ -11,8 +11,8 @@ export const configuredScriptModel: StructuredScriptModel = {
     // Routing only selects IDs and actions. Reasoning-enabled providers can use
     // this short output budget before emitting any JSON, so keep decision calls
     // non-thinking while preserving the configured behavior of creative roles.
-    const thinking = request.role.endsWith(":decisionAgent") ? false : undefined;
-    const response = await u.Ai.Text(request.role, thinking).invoke({
+    const thinking = request.role.endsWith(":decisionAgent") ? false : request.thinkLevel > 0;
+    const response = await u.Ai.Text(request.role, thinking, request.thinkLevel).invoke({
       // Some configured OpenAI-compatible models offer JSON mode but omit native JSON Schema.
       // Keep the schema explicit in the prompt and still validate the response locally.
       system: request.system + "\n\nOUTPUT_JSON_SCHEMA\n" + JSON.stringify(z.toJSONSchema(request.schema)) + "\n仅返回符合该 schema 的 JSON 对象。",

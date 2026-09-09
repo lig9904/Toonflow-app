@@ -10,6 +10,7 @@ import {
   type AssetExtractionReceipt,
 } from "../assetExtractionWorkspace";
 import type { StructuredScriptModel } from "./scriptExecutor";
+import { builtinThinkLevelFromIntent } from "./contracts";
 
 export interface AssetExtractionHelperDependencies {
   db: Knex;
@@ -101,6 +102,7 @@ export function createAssetExtractionHelper(deps: AssetExtractionHelperDependenc
           schema: assetExtractionProposalSchema,
           maxOutputTokens: raw.maxOutputTokens,
           signal: ctx.signal,
+          thinkLevel: builtinThinkLevelFromIntent(ctx.run.intent),
         });
         return { value: assetExtractionProposalSchema.parse(response.value), outputTokens: response.outputTokens };
       },

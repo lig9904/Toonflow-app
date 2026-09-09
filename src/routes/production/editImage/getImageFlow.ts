@@ -1,38 +1,17 @@
 import express from "express";
 import u from "@/utils";
-import { z } from "zod";
 import { success } from "@/lib/responseFormat";
-import { validateFields } from "@/middleware/middleware";
-const router = express.Router();
+import { requireProjectAccess } from "@/services/team";
+import { presentImageFlow, readImageFlow } from "@/services/imageFlowWorkspace";
+import { imageFlowUserId, sendImageFlowError } from "@/services/imageFlowWorkspace/http";
 
-export default router.post(
-  "/",
-  validateFields({
-    id: z.number(),
-  }),
-  async (req, res) => {
-    const { id, type } = req.body;
-    const imageFlowData = await u.db("o_imageFlow").where("id", id).first();
-    if (imageFlowData?.flowData) {
-      const parseFlow = JSON.parse(imageFlowData.flowData);
-      await Promise.all(
-        parseFlow.nodes.map(async (node: any) => {
-          if (node.type === "upload") {
-            node.data.image = node.data.image ? await u.oss.getSmallImageUrl(node.data.image) : "";
-          } else if (node.type === "generated") {
-            node.data.generatedImage = node.data.generatedImage ? await u.oss.getSmallImageUrl(node.data.generatedImage) : "";
-
-            node.data.references = await Promise.all(node.data.references.map(async (item: { image: string }) => {
-              return {
-                image: await u.oss.getSmallImageUrl(item.image)
-              }
-            }));
-          }
-        }),
-      );
-      return res.status(200).send(success({ ...parseFlow, id: imageFlowData.id }));
-    }
-
-    return res.status(200).send(success(null));
-  },
-);
+export default express.Router().post("/", async (req, res) => {
+  try {
+    const projectId = Number(req.body?.projectId);
+    await requireProjectAccess(u.db, imageFlowUserId(req), projectId, "read");
+    const flow = await readImageFlow(u.db, req.body);
+    return res.status(200).send(success(await presentImageFlow(flow, (path) => u.oss.getSmallImageUrl(path))));
+  } catch (error) {
+    return sendImageFlowError(res, error);
+  }
+});

@@ -1,42 +1,13 @@
 import express from "express";
 import u from "@/utils";
-import { z } from "zod";
-import { success, error } from "@/lib/responseFormat";
-import { validateFields } from "@/middleware/middleware";
-import { insertRowsReturningIds } from "@/lib/insertRows";
-const router = express.Router();
+import { success } from "@/lib/responseFormat";
+import { createScript } from "@/services/projectContent";
+import { humanActor, requestUserId, sendProjectContentError } from "@/services/projectContent/http";
+import { requireProjectAccess } from "@/services/team";
 
-// 新增剧本
-export default router.post(
-  "/",
-  validateFields({
-    name: z.string(),
-    content: z.string(),
-    projectId: z.number(),
-    assets: z.array(z.number()),
-  }),
-  async (req, res) => {
-    const { name, content, projectId, assets } = req.body;
-    const [scriptId] = await insertRowsReturningIds(u.db, "o_script", {
-      name,
-      content,
-      projectId,
-      createTime: Date.now(),
-    });
-    if (assets.length) {
-      const assetsData = await u.db("o_assets").whereIn("id", assets).select();
-      if (assetsData.length) {
-        const assetsIds = assetsData.map((item) => item.id);
-        const insertData = assetsIds.map((i) => {
-          return {
-            scriptId,
-            assetId: i,
-          };
-        });
-        await u.db("o_scriptAssets").insert(insertData);
-      }
-    }
-
-    res.status(200).send(success({ message: "添加剧本成功" }));
-  },
-);
+export default express.Router().post("/", async (req, res) => {
+  try {
+    await requireProjectAccess(u.db, requestUserId(req), req.body?.projectId, "edit");
+    return res.send(success(await createScript(u.db, req.body, humanActor(req))));
+  } catch (error) { return sendProjectContentError(res, error); }
+});

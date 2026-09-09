@@ -4,14 +4,14 @@ import { createPostgresFixture, migratePostgresFixture } from "../src/lib/postgr
 import { insertRowsReturningIds } from "../src/lib/insertRows";
 import { addProductionStoryboards, readProductionFlow, saveProductionPlanning } from "../src/services/productionFlow";
 import { ensureProductionStateSchema, ProductionStateService } from "../src/services/productionState";
-import { createOrUpdateDerivedAsset, deleteDerivedAsset } from "../src/services/productionAssets";
+import { createOrUpdateDerivedAsset, deleteDerivedAsset, ensureProductionAssetSchema } from "../src/services/productionAssets";
 import { prepareStoryboardImages, type ProductionImageRuntime } from "../src/services/productionImages";
 import { ensureAgentGatewaySchema, createAgentGateway } from "../src/services/agentGateway";
 import express from "express";
 
 const options={skip:!process.env.TOONFLOW_TEST_DATABASE_URL};
 async function fixture(){
- const f=await createPostgresFixture();await migratePostgresFixture(f.db);await ensureProductionStateSchema(f.db);await ensureAgentGatewaySchema(f.db);
+ const f=await createPostgresFixture();await migratePostgresFixture(f.db);await ensureProductionStateSchema(f.db);await ensureProductionAssetSchema(f.db);await ensureAgentGatewaySchema(f.db);
  const [projectId]=await insertRowsReturningIds(f.db,"o_project",{name:"PG project",userId:1,imageModel:"mock:model",imageQuality:"1K",videoRatio:"16:9"});
  const [scriptId]=await insertRowsReturningIds(f.db,"o_script",{projectId,name:"Episode",content:"PG relational script"});
  const [parentId]=await insertRowsReturningIds(f.db,"o_assets",{projectId,name:"Parent",type:"role",describe:"Parent detail"});
@@ -27,7 +27,7 @@ test("PostgreSQL production flow keeps ordered references and numeric fractional
  assert.equal(Number((await f.db("o_videoTrack").first()).duration),2.5);
  const state=await new ProductionStateService(f.db).getStoryboardState(f.projectId,ids[0]);
  await new ProductionStateService(f.db).acquireLock({projectId:f.projectId,storyboardId:ids[0],expectedVersion:state.state.version,actor:{id:"human:1",kind:"human"}});
- await assert.rejects(deleteDerivedAsset(f.db,{projectId:f.projectId,scriptId:f.scriptId,parentAssetId:f.parentId,id:child.id}));
+ await assert.rejects(deleteDerivedAsset(f.db,{projectId:f.projectId,scriptId:f.scriptId,parentAssetId:f.parentId,id:child.id,expectedVersion:1}));
  assert(await f.db("o_assets").where({id:child.id}).first());
  }finally{await f.destroy();}
 });

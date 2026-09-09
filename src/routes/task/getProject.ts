@@ -1,10 +1,9 @@
 import express from "express";
 import u from "@/utils";
-import { success } from "@/lib/responseFormat";
-const router = express.Router();
+import { getTaskProjectOptions } from "@/services/taskOverview";
+import { sendCreativeWorkspaceError } from "@/services/creativeWorkspace/http";
 
-export default router.post("/", async (req, res) => {
-  const list = await u.db("o_project").select("id", "name").groupBy("name");
-  const data = list.filter((item) => item.name);
-  res.status(200).send(success(data));
+export default express.Router().post("/", async (req, res) => {
+  try { return res.send({ code: 200, data: await getTaskProjectOptions(u.db, Number((req as any).teamPrincipal?.id ?? (req as any).user?.id)) }); }
+  catch (error) { return sendCreativeWorkspaceError(res, error); }
 });

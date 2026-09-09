@@ -3,6 +3,7 @@ import u from "@/utils";
 import { z } from "zod";
 import { success } from "@/lib/responseFormat";
 import { validateFields } from "@/middleware/middleware";
+import { readRoleAudioBindings } from "@/services/roleAudioWorkspace";
 const router = express.Router();
 
 export default router.post(
@@ -33,19 +34,11 @@ export default router.post(
         if (type && type.length > 0) qb.whereIn("o_assets.type", type);
       })
       .orderByRaw(`CASE o_assets.type WHEN 'role' THEN 1 WHEN 'scene' THEN 2 WHEN 'tool' THEN 3 ELSE 4 END`);
-    const assets2AudioData = await u
-      .db("o_assetsRole2Audio")
-      .leftJoin("o_assets", "o_assets.id", "o_assetsRole2Audio.assetsAudioId")
-      .whereIn(
-        "o_assetsRole2Audio.assetsRoleId",
-        data.map((i: any) => i.id!),
-      )
-      .select("o_assets.id", "o_assets.name", "o_assetsRole2Audio.assetsRoleId");
-    const repleAssets: Record<number, { id: number; name: string }[]> = {};
-    assets2AudioData.forEach((item) => {
-      if (!repleAssets[item.assetsRoleId]) repleAssets[item.assetsRoleId] = [item];
-      else repleAssets[item.assetsRoleId].push(item);
-    });
+    const roleIds = data.filter((item: any) => item.type === "role").map((item: any) => Number(item.id));
+    const bindings = roleIds.length ? await readRoleAudioBindings(u.db, projectId, roleIds) : [];
+    const stateRows = data.length
+      ? await u.db("ext_creative_state").where({ entityType: "asset", projectId }).whereIn("entityId", data.map((item: any) => item.id))
+      : [];
     const result = await Promise.all(
       data.map(async (parent: any) => {
         const historyImages = await u.db("o_image").where("assetsId", parent.id).andWhere("state", "已完成").select("id", "filePath");
@@ -57,9 +50,10 @@ export default router.post(
         );
         return {
           ...parent,
+          version: Number(stateRows.find((state: any) => Number(state.entityId) === Number(parent.id))?.version ?? 0),
           filePath: parent.filePath && (await u.oss.getSmallImageUrl(parent.filePath!)),
           historyImages: historyImagesWithUrl,
-          relepedAudio: repleAssets[parent.id] ?? [],
+          relepedAudio: bindings.find((binding) => binding.roleAssetId === Number(parent.id))?.audioFamilies ?? [],
         };
       }),
     );

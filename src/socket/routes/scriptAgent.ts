@@ -1,94 +1,98 @@
-import jwt from "jsonwebtoken";
-import u from "@/utils";
 import { Namespace, Socket } from "socket.io";
-import * as agent from "@/agents/scriptAgent/index";
-import ResTool from "@/socket/resTool";
+import { defaultBuiltinRunLimits, type BuiltinRunLimits } from "@/services/builtinAgent/contracts";
+import {
+  authenticateBuiltinSocket,
+  authorizeSocketContext,
+  deriveIsolationKey,
+  disconnectSocket,
+  parsePositiveId,
+  refreshSocketPrincipal,
+  type BuiltinSocketDependencies,
+} from "@/socket/builtinSocketAuth";
 
-async function verifyToken(rawToken: string): Promise<Boolean> {
-  const setting = await u.db("o_setting").where("key", "tokenKey").select("value").first();
-  if (!setting) return false;
-  const { value: tokenKey } = setting;
-  if (!rawToken) return false;
-  const token = rawToken.replace("Bearer ", "");
-  try {
-    jwt.verify(token, tokenKey as string);
-    return true;
-  } catch (err) {
-    return false;
+interface ChatPayload { content?: unknown; prompt?: unknown; idempotencyKey?: unknown; limits?: unknown; }
+type Ack = (result: Record<string, unknown>) => void;
+
+function limits(value: unknown): BuiltinRunLimits {
+  if (value === undefined) return { ...defaultBuiltinRunLimits };
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("LIMITS_INVALID");
+  const source = value as Record<string, unknown>;
+  const result = { ...defaultBuiltinRunLimits };
+  for (const key of Object.keys(result) as Array<keyof BuiltinRunLimits>) {
+    if (source[key] === undefined) continue;
+    if (!Number.isSafeInteger(source[key]) || Number(source[key]) < 0) throw new Error("LIMITS_INVALID");
+    result[key] = Number(source[key]);
   }
+  return result;
+}
+
+function chatInput(data: ChatPayload): { prompt: string; idempotencyKey: string; limits: BuiltinRunLimits } {
+  const prompt = typeof data?.prompt === "string" ? data.prompt : data?.content;
+  if (typeof prompt !== "string" || !prompt.trim() || prompt.length > 100_000) throw new Error("PROMPT_INVALID");
+  if (typeof data.idempotencyKey !== "string" || !/^[\w:.-]{8,150}$/.test(data.idempotencyKey)) throw new Error("IDEMPOTENCY_REQUIRED");
+  return { prompt: prompt.trim(), idempotencyKey: data.idempotencyKey, limits: limits(data.limits) };
+}
+
+export interface ScriptAgentSocketOptions extends BuiltinSocketDependencies {}
+
+export function createScriptAgentSocketRoute(dependencies: ScriptAgentSocketOptions) {
+  return (nsp: Namespace) => {
+    nsp.on("connection", async (socket: Socket) => {
+      let principal;
+      let context: { projectId: number; scriptId: number | null; isolationKey: string };
+      try {
+        principal = await authenticateBuiltinSocket(socket, dependencies);
+        const projectId = parsePositiveId(socket.handshake.auth?.projectId, "PROJECT");
+        const rawScript = socket.handshake.auth?.scriptId;
+        const scriptId = rawScript == null || rawScript === "" ? null : parsePositiveId(rawScript, "SCRIPT");
+        context = { projectId, scriptId, isolationKey: deriveIsolationKey("scriptAgent", projectId, scriptId) };
+        await authorizeSocketContext(dependencies, principal, context, "read");
+      } catch {
+        disconnectSocket(socket);
+        return;
+      }
+
+      const currentPrincipal = async () => {
+        principal = await refreshSocketPrincipal(socket, dependencies);
+        await authorizeSocketContext(dependencies, principal, context, "read");
+        return principal;
+      };
+
+      socket.on("chat", async (data: ChatPayload, callback?: Ack) => {
+        try {
+          const actor = await currentPrincipal();
+          await authorizeSocketContext(dependencies, actor, context, "edit");
+          const input = chatInput(data);
+          const result = await dependencies.runtime.create({ agentType: "scriptAgent", projectId: context.projectId, scriptId: context.scriptId, requestedBy: actor.id, prompt: input.prompt, idempotencyKey: input.idempotencyKey, limits: input.limits });
+          socket.emit("builtinRunCreated", { runId: result.run.id, reused: result.reused, isolationKey: context.isolationKey });
+          callback?.({ success: true, runId: result.run.id, reused: result.reused });
+        } catch (error) { callback?.({ success: false, code: errorCode(error), message: "内置 Agent 任务未创建，请刷新后重试" }); if (shouldDisconnect(error)) disconnectSocket(socket); }
+      });
+
+      socket.on("updateThinkConfig", async (_data: unknown, callback?: Ack) => {
+        try { await currentPrincipal(); callback?.({ success: true }); }
+        catch (error) { callback?.({ success: false, code: errorCode(error) }); disconnectSocket(socket); }
+      });
+
+      // Disconnect only unsubscribes this socket. Persisted runs remain server-owned.
+      socket.on("disconnect", () => undefined);
+    });
+  };
+}
+
+function errorCode(error: unknown): string {
+  if (error && typeof error === "object" && "code" in error) return String((error as { code: unknown }).code);
+  return error instanceof Error ? error.message : "SOCKET_ACTION_FAILED";
+}
+
+function shouldDisconnect(error: unknown): boolean {
+  return Boolean(error && typeof error === "object" && "status" in error && Number((error as { status?: unknown }).status) === 401);
 }
 
 export default (nsp: Namespace) => {
-  nsp.on("connection", async (socket: Socket) => {
-    const token = socket.handshake.auth.token;
-    if (!token || !(await verifyToken(token))) {
-      console.log("[scriptAgent] 连接失败，token无效");
-      socket.disconnect();
-      return;
-    }
-    const isolationKey = socket.handshake.auth.isolationKey;
-    if (!isolationKey) {
-      console.log("[scriptAgent] 连接失败，缺少 isolationKey");
-      socket.disconnect();
-      return;
-    }
-
-    console.log("[scriptAgent] 已连接:", socket.id);
-
-    const resTool = new ResTool(socket, {
-      projectId: socket.handshake.auth.projectId,
-    });
-    let abortController: AbortController | null = null;
-
-    const thinkConfig: agent.AgentContext["thinkConfig"] = {
-      think: false,
-      thinlLevel: 0,
-    };
-
-    socket.on("chat", async (data: { content: string }) => {
-      const { content } = data;
-      abortController?.abort();
-      abortController = new AbortController();
-      const currentController = abortController;
-
-      const msg = resTool.newMessage("assistant", "统筹");
-      const ctx: agent.AgentContext = {
-        socket,
-        isolationKey,
-        text: content,
-        userMessageTime: new Date(msg.datetime).getTime() - 1,
-        abortSignal: currentController.signal,
-        resTool,
-        msg,
-        thinkConfig,
-      };
-
-      try {
-        await agent.runDecisionAI(ctx);
-      } catch (err: any) {
-        if (err.name !== "AbortError" && !currentController.signal.aborted) {
-          console.error("[scriptAgent] chat error:", u.error(err).message);
-          msg.error(u.error(err).message)
-        }
-      } finally {
-        if (abortController === currentController) {
-          abortController = null;
-        }
-      }
-    });
-
-    socket.on("updateThinkConfig", (data: { think: boolean; thinlLevel: 0 | 1 | 2 | 3 }) => {
-      thinkConfig.think = data.think;
-      thinkConfig.thinlLevel = data.thinlLevel;
-      console.log("[scriptAgent] 更新思考配置:", thinkConfig);
-    });
-
-    socket.on("stop", () => {
-      abortController?.abort();
-      abortController = null;
-    });
-  });
-  nsp.on("disconnect", (socket: Socket) => {
-    console.log("[scriptAgent] 已断开连接:", socket.id);
-  });
+  // Resolve the production singleton only when the application registers the route.
+  // Factory tests can inject an isolated DB/runtime without opening DATABASE_URL.
+  const utils = require("@/utils").default;
+  const { getBuiltinAgentRuntime } = require("@/services/builtinAgent/runtime") as typeof import("@/services/builtinAgent/runtime");
+  return createScriptAgentSocketRoute({ db: utils.db, runtime: getBuiltinAgentRuntime() })(nsp);
 };

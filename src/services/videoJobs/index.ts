@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { Knex } from "knex";
 import { lockProjectTransaction } from "@/lib/dbTransaction";
 import { insertRowsReturningIds } from "@/lib/insertRows";
@@ -46,6 +46,7 @@ export interface VideoJob {
   lastError: string | null;
   createdAt: number;
   updatedAt: number;
+  submissionLeaseUntil: number | null;
 }
 
 export interface VideoTaskProvider {
@@ -64,6 +65,9 @@ export interface VideoJobDependencies {
   maxDownloadFailures?: number;
   initialPollDelayMs?: number;
   schedule?: boolean;
+  /** Stable only for the lifetime of one process. It fences the sole submitter. */
+  workerId?: string;
+  submissionLeaseMs?: number;
 }
 
 export class VideoJobError extends Error {
@@ -94,6 +98,8 @@ interface JobRow {
   lastError: string | null;
   createdAt: number;
   updatedAt: number;
+  submissionOwner: string | null;
+  submissionLeaseUntil: number | null;
 }
 
 export async function ensureVideoJobsSchema(db: Knex): Promise<void> {
@@ -120,11 +126,16 @@ export async function ensureVideoJobsSchema(db: Knex): Promise<void> {
         "lastError" text,
         "createdAt" bigint NOT NULL,
         "updatedAt" bigint NOT NULL,
+        "submissionOwner" text,
+        "submissionLeaseUntil" bigint,
         UNIQUE ("projectId", "idempotencyKey")
       )
     `);
     await db.raw(`CREATE INDEX IF NOT EXISTS "ext_video_jobs_status_poll_idx" ON "ext_video_jobs" (status, "nextPollAt")`);
     await db.raw(`CREATE INDEX IF NOT EXISTS "ext_video_jobs_project_script_track_idx" ON "ext_video_jobs" ("projectId", "scriptId", "trackId")`);
+    await db.raw(`ALTER TABLE "ext_video_jobs" ADD COLUMN IF NOT EXISTS "submissionOwner" text`);
+    await db.raw(`ALTER TABLE "ext_video_jobs" ADD COLUMN IF NOT EXISTS "submissionLeaseUntil" bigint`);
+    await db.raw(`CREATE INDEX IF NOT EXISTS "ext_video_jobs_submission_lease_idx" ON "ext_video_jobs" (status, "submissionLeaseUntil")`);
     return;
   }
   if (!(await db.schema.hasTable("ext_video_jobs"))) {
@@ -149,11 +160,15 @@ export async function ensureVideoJobsSchema(db: Knex): Promise<void> {
       table.text("lastError");
       table.integer("createdAt").notNullable();
       table.integer("updatedAt").notNullable();
+      table.text("submissionOwner");
+      table.integer("submissionLeaseUntil");
       table.index(["status", "nextPollAt"]);
       table.index(["projectId", "scriptId", "trackId"]);
       table.unique(["projectId", "idempotencyKey"]);
     });
   }
+  if (!(await db.schema.hasColumn("ext_video_jobs", "submissionOwner"))) await db.schema.alterTable("ext_video_jobs", (table) => table.text("submissionOwner"));
+  if (!(await db.schema.hasColumn("ext_video_jobs", "submissionLeaseUntil"))) await db.schema.alterTable("ext_video_jobs", (table) => table.integer("submissionLeaseUntil"));
 }
 
 function isPostgres(db: Knex | Knex.Transaction): boolean {
@@ -171,6 +186,8 @@ export class VideoJobService {
   private readonly maxDownloadFailures: number;
   private readonly initialPollDelayMs: number;
   private readonly scheduleEnabled: boolean;
+  private readonly workerId: string;
+  private readonly submissionLeaseMs: number;
   private readonly active = new Map<number, Promise<VideoJob>>();
   private readonly timers = new Map<number, ReturnType<typeof setTimeout>>();
   private running = 0;
@@ -190,6 +207,11 @@ export class VideoJobService {
     this.maxDownloadFailures = dependencies.maxDownloadFailures ?? 5;
     this.initialPollDelayMs = dependencies.initialPollDelayMs ?? 5_000;
     this.scheduleEnabled = dependencies.schedule ?? true;
+    this.workerId = dependencies.workerId ?? randomUUID();
+    this.submissionLeaseMs = dependencies.submissionLeaseMs ?? 120_000;
+    if (!this.workerId || this.workerId.length > 250 || !Number.isSafeInteger(this.submissionLeaseMs) || this.submissionLeaseMs < 1_000 || this.submissionLeaseMs > 30 * 60_000) {
+      throw new VideoJobError("INVALID_INPUT", "视频提交租约配置无效");
+    }
   }
 
   async reserve(idempotencyKey: string, payload: VideoJobPayload, requestHash = hashPayload(payload)): Promise<{ job: VideoJob; created: boolean }> {
@@ -207,6 +229,7 @@ export class VideoJobService {
       }
       const existingVideo = await trx<JobRow>("ext_video_jobs").where({ videoId: payload.videoId }).first();
       if (existingVideo) throw new VideoJobError("CONFLICT", "该视频记录已有持久化任务");
+      await this.assertTrackUnlockedForReservation(trx, payload);
       const time = this.now();
       const [id] = await insertIds(trx, "ext_video_jobs", {
         idempotencyKey,
@@ -219,6 +242,8 @@ export class VideoJobService {
         outputPath: payload.outputPath,
         payload: JSON.stringify(payload),
         status: "SUBMITTING",
+        submissionOwner: this.workerId,
+        submissionLeaseUntil: time + this.submissionLeaseMs,
         createdAt: time,
         updatedAt: time,
       });
@@ -235,9 +260,12 @@ export class VideoJobService {
   }
 
   /** All request validation happens before either video rows or jobs are inserted. */
-  async reserveNewVideos(items: Array<{ idempotencyKey: string; request: VideoJobRequest; requestHash?: string }>): Promise<Array<{ job: VideoJob; created: boolean }>> {
+  async reserveNewVideos(
+    items: Array<{ idempotencyKey: string; request: VideoJobRequest; requestHash?: string }>,
+    transaction?: Knex.Transaction,
+  ): Promise<Array<{ job: VideoJob; created: boolean }>> {
     if (!items.length) throw new VideoJobError("INVALID_INPUT", "至少需要一个视频任务");
-    return this.db.transaction(async (trx) => {
+    const operation = async (trx: Knex.Transaction) => {
       const normalized = items.map((item) => ({ ...item, requestHash: item.requestHash ?? hashVideoJobRequest(item.request) }));
       const keys = new Set<string>();
       for (const item of normalized) {
@@ -245,16 +273,25 @@ export class VideoJobService {
         this.assertRequest(item.request);
         if (keys.has(`${item.request.projectId}:${item.idempotencyKey}`)) throw new VideoJobError("CONFLICT", "批量请求中的 idempotencyKey 重复");
         keys.add(`${item.request.projectId}:${item.idempotencyKey}`);
-        await this.assertScriptAndTrack(trx, item.request);
       }
       for (const projectId of [...new Set(normalized.map((item) => item.request.projectId))].sort((a, b) => a - b)) {
         await lockProjectTransaction(trx, projectId);
       }
-      const results: Array<{ job: VideoJob; created: boolean }> = [];
+      const existingRows: Array<JobRow | undefined> = [];
       for (const item of normalized) {
+        await this.assertScriptAndTrack(trx, item.request);
         const existing = (await trx<JobRow>("ext_video_jobs").where({ projectId: item.request.projectId, idempotencyKey: item.idempotencyKey }).first()) as JobRow | undefined;
+        if (existing && existing.payloadHash !== item.requestHash) throw new VideoJobError("CONFLICT", "idempotencyKey 已用于不同的视频任务参数");
+        existingRows.push(existing);
+      }
+      for (let index = 0; index < normalized.length; index += 1) {
+        if (!existingRows[index]) await this.assertTrackUnlockedForReservation(trx, normalized[index].request);
+      }
+      const results: Array<{ job: VideoJob; created: boolean }> = [];
+      for (let index = 0; index < normalized.length; index += 1) {
+        const item = normalized[index];
+        const existing = existingRows[index];
         if (existing) {
-          if (existing.payloadHash !== item.requestHash) throw new VideoJobError("CONFLICT", "idempotencyKey 已用于不同的视频任务参数");
           results.push({ job: this.toJob(existing), created: false });
           continue;
         }
@@ -265,14 +302,16 @@ export class VideoJobService {
         const [id] = await insertIds(trx, "ext_video_jobs", {
           idempotencyKey: item.idempotencyKey, payloadHash: item.requestHash, modelKey: payload.modelKey, projectId: payload.projectId,
           scriptId: payload.scriptId, trackId: payload.trackId, videoId, outputPath: payload.outputPath, payload: JSON.stringify(payload),
-          status: "SUBMITTING", createdAt: time, updatedAt: time,
+          status: "SUBMITTING", submissionOwner: this.workerId, submissionLeaseUntil: time + this.submissionLeaseMs,
+          createdAt: time, updatedAt: time,
         });
         const row = await trx<JobRow>("ext_video_jobs").where({ id }).first();
         if (!row) throw new VideoJobError("NOT_FOUND", "视频任务保留失败");
         results.push({ job: this.toJob(row), created: true });
       }
       return results;
-    });
+    };
+    return transaction ? operation(transaction) : this.db.transaction(operation);
   }
 
   /** Only call this from the request that created the reservation. */
@@ -280,13 +319,26 @@ export class VideoJobService {
     return this.runExclusive(jobId, () => this.runJob(jobId, true));
   }
 
-  /** Resume queries/downloads only. A reservation without an upstream id is never POSTed again. */
+  /** Manual recovery continuation. This path can only query/download an existing receipt and never submits. */
+  async continueKnown(jobId: number): Promise<VideoJob> {
+    this.assertPositiveInteger(jobId, "jobId");
+    return this.runExclusive(jobId, () => this.runJob(jobId, false));
+  }
+
+  /** Resume queries/downloads only. A live submission lease is left to its creating process. */
   async resumeDueJobs(): Promise<void> {
     if (this.stopped) return;
     const now = this.now();
     await this.db.transaction(async (trx) => {
-      const stranded = await trx<JobRow>("ext_video_jobs").where({ status: "SUBMITTING" }).whereNull("upstreamTaskId");
-      for (const row of stranded) await this.markReconciliation(trx, row, "提交前进程中断，未记录上游任务 ID");
+      const submitting = await trx<JobRow>("ext_video_jobs").where({ status: "SUBMITTING" });
+      for (const row of submitting) {
+        if (row.upstreamTaskId) {
+          await trx("ext_video_jobs").where({ id: row.id, status: "SUBMITTING" }).update({ status: "SUBMITTED", nextPollAt: now, updatedAt: now, lastError: null });
+          continue;
+        }
+        if (row.submissionLeaseUntil != null && Number(row.submissionLeaseUntil) > now) continue;
+        await this.markReconciliation(trx, row, "视频提交租约已到期且没有上游任务 ID，需要人工核对", true);
+      }
     });
     const active = await this.db<JobRow>("ext_video_jobs").whereIn("status", ["SUBMITTED", "POLLING", "DOWNLOADING"]);
     const due = active.filter((row) => row.nextPollAt == null || row.nextPollAt <= now);
@@ -321,10 +373,21 @@ export class VideoJobService {
     if (["SUCCEEDED", "FAILED", "RECONCILIATION_REQUIRED"].includes(job.status)) return job;
 
     if (!job.upstreamTaskId) {
-      if (!maySubmit) {
-        await this.db.transaction((trx) => this.markReconciliation(trx, row, "重启后没有可恢复的上游任务 ID"));
-        return this.get(jobId);
-      }
+      if (!maySubmit) return job;
+      const reserved = await this.db.transaction(async (trx) => {
+        const current = await trx<JobRow>("ext_video_jobs").where({ id: jobId }).forUpdate().first();
+        if (!current) throw new VideoJobError("NOT_FOUND", "视频任务不存在");
+        if (current.upstreamTaskId) return current;
+        if (current.status !== "SUBMITTING") return current;
+        if (current.submissionOwner !== this.workerId) throw new VideoJobError("CONFLICT", "只有创建该保留任务的进程可以提交视频");
+        if (current.submissionLeaseUntil == null || Number(current.submissionLeaseUntil) <= this.now()) {
+          throw new VideoJobError("CONFLICT", "视频提交租约已到期，需要人工核对");
+        }
+        return current;
+      });
+      job = this.toJob(reserved);
+      if (job.upstreamTaskId) return this.pollOrDownload(job);
+      if (job.status !== "SUBMITTING") return job;
       try {
         const provider = await this.providerFor(job.modelKey);
         if (provider.fingerprint !== job.payload.providerFingerprint) {
@@ -333,16 +396,28 @@ export class VideoJobService {
         }
         const submitted = await provider.submit(job.payload.config);
         if (!submitted?.taskId) throw new Error("上游未返回任务 ID");
-        await this.db("ext_video_jobs").where({ id: job.id, status: "SUBMITTING" }).update({
-          upstreamTaskId: submitted.taskId,
-          status: "SUBMITTED",
-          payload: JSON.stringify(compactVideoPayload(job.payload)),
-          nextPollAt: this.now(),
-          updatedAt: this.now(),
-          lastError: null,
+        await this.db.transaction(async (trx) => {
+          const updated = await trx("ext_video_jobs")
+            .where({ id: job.id, submissionOwner: this.workerId })
+            .whereNull("upstreamTaskId")
+            .update({
+              upstreamTaskId: submitted.taskId,
+              status: "SUBMITTED",
+              payload: JSON.stringify(compactVideoPayload(job.payload)),
+              nextPollAt: this.now(),
+              updatedAt: this.now(),
+              lastError: null,
+            });
+          if (updated) {
+            await trx("o_video").where({ id: job.videoId, projectId: job.projectId, scriptId: job.scriptId, videoTrackId: job.trackId }).update({ state: "生成中", errorReason: null });
+          }
         });
       } catch (error) {
-        await this.db.transaction((trx) => this.markReconciliation(trx, row, `提交结果不确定：${errorMessage(error)}`));
+        if (error instanceof VideoJobError && error.code === "CONFLICT") throw error;
+        await this.db.transaction(async (trx) => {
+          const current = await trx<JobRow>("ext_video_jobs").where({ id: job.id }).first();
+          if (current && !current.upstreamTaskId) await this.markReconciliation(trx, current, `提交结果不确定：${errorMessage(error)}`, true);
+        });
         return this.get(jobId);
       }
       job = await this.get(jobId);
@@ -449,11 +524,13 @@ export class VideoJobService {
     return this.get(job.id);
   }
 
-  private async markReconciliation(trx: Knex.Transaction, row: JobRow, message: string): Promise<void> {
-    await trx("ext_video_jobs").where({ id: row.id }).update({
+  private async markReconciliation(trx: Knex.Transaction, row: JobRow, message: string, onlyWithoutUpstream = false): Promise<void> {
+    let query = trx("ext_video_jobs").where({ id: row.id });
+    if (onlyWithoutUpstream) query = query.whereNull("upstreamTaskId");
+    const updated = await query.update({
       status: "RECONCILIATION_REQUIRED", payload: compactPayloadText(row.payload), nextPollAt: null, lastError: message, updatedAt: this.now(),
     });
-    await trx("o_video").where({ id: row.videoId, projectId: row.projectId, scriptId: row.scriptId, videoTrackId: row.trackId }).update({
+    if (updated) await trx("o_video").where({ id: row.videoId, projectId: row.projectId, scriptId: row.scriptId, videoTrackId: row.trackId }).update({
       state: "需人工核对", errorReason: message,
     });
   }
@@ -525,6 +602,7 @@ export class VideoJobService {
       nextPollAt: row.nextPollAt == null ? null : Number(row.nextPollAt),
       createdAt: Number(row.createdAt),
       updatedAt: Number(row.updatedAt),
+      submissionLeaseUntil: row.submissionLeaseUntil == null ? null : Number(row.submissionLeaseUntil),
       payload,
     };
   }
@@ -549,6 +627,22 @@ export class VideoJobService {
     if (!script) throw new VideoJobError("PROJECT_MISMATCH", "剧集不属于当前项目");
     const track = await trx("o_videoTrack").where({ id: payload.trackId, projectId: payload.projectId, scriptId: payload.scriptId }).first();
     if (!track) throw new VideoJobError("PROJECT_MISMATCH", "视频轨道不属于当前项目或剧集");
+  }
+
+  /** New reservations are blocked by a locked storyboard; accepted jobs keep their normal lifecycle. */
+  private async assertTrackUnlockedForReservation(trx: Knex.Transaction, payload: Pick<VideoJobPayload, "projectId" | "scriptId" | "trackId">): Promise<void> {
+    const locked = await trx("o_storyboard as storyboard")
+      .join("ext_entity_state as state", "state.entityId", "storyboard.id")
+      .where({
+        "storyboard.projectId": payload.projectId,
+        "storyboard.scriptId": payload.scriptId,
+        "storyboard.trackId": payload.trackId,
+        "state.entityType": "storyboard",
+        "state.projectId": payload.projectId,
+        "state.locked": 1,
+      })
+      .first("storyboard.id");
+    if (locked) throw new VideoJobError("CONFLICT", "轨道关联的分镜已锁定，不能新建视频任务");
   }
 
   private assertIdempotencyKey(value: string): void {
@@ -602,5 +696,5 @@ function errorMessage(error: unknown): string {
 }
 
 function rowFromJob(job: VideoJob): JobRow {
-  return { ...job, payload: JSON.stringify(job.payload) };
+  return { ...job, submissionOwner: null, payload: JSON.stringify(job.payload) };
 }

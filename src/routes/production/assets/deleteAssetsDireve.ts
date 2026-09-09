@@ -4,7 +4,7 @@ import { z } from "zod";
 import { success } from "@/lib/responseFormat";
 import { validateFields } from "@/middleware/middleware";
 import { requireProductionOwner, sendProductionError } from "@/services/productionHttp";
-import { deleteDerivedAsset } from "@/services/productionAssets";
+import { deleteDerivedAsset, ProductionAssetError } from "@/services/productionAssets";
 const router = express.Router();
 
 export default router.post(
@@ -13,15 +13,18 @@ export default router.post(
     id: z.number(),
     projectId: z.number(),
     scriptId: z.number(),
+    expectedVersion: z.number().int().nonnegative(),
+    idempotencyKey: z.string().min(8).max(180).optional(),
   }),
   async (req, res) => {
     try {
-      const { id, projectId, scriptId } = req.body;
-      await requireProductionOwner(req, projectId, u.db);
-      const child = await u.db("o_assets").where({ id, projectId }).first();
-      if (!child?.assetsId) return res.status(404).send({ error: "衍生资源未找到" });
-      await deleteDerivedAsset(u.db, { projectId, scriptId: Number(scriptId), parentAssetId: child.assetsId, id });
-      res.status(200).send(success({ message: "视频删除成功" }));
+      const { id, projectId, scriptId, expectedVersion } = req.body;
+      const actor = await requireProductionOwner(req, projectId, u.db);
+      const headerKey = req.get("Idempotency-Key");
+      const idempotencyKey = req.body.idempotencyKey ?? headerKey;
+      if (!idempotencyKey) throw new ProductionAssetError("删除衍生素材需要幂等操作编号", 400, "INVALID_INPUT");
+      const result = await deleteDerivedAsset(u.db, { projectId, scriptId: Number(scriptId), id, expectedVersion, idempotencyKey, actor });
+      res.status(200).send(success(result, "衍生素材已删除"));
     } catch (error) { sendProductionError(res, error); }
   },
 );

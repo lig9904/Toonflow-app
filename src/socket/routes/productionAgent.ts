@@ -1,130 +1,116 @@
-import jwt from "jsonwebtoken";
-import u from "@/utils";
 import { Namespace, Socket } from "socket.io";
-import * as agent from "@/agents/productionAgent/index";
-import ResTool from "@/socket/resTool";
+import { defaultBuiltinRunLimits, type BuiltinRunLimits } from "@/services/builtinAgent/contracts";
 import { productionEvents, type ProductionChange } from "@/services/productionEvents";
+import {
+  authenticateBuiltinSocket,
+  authorizeSocketContext,
+  deriveIsolationKey,
+  disconnectSocket,
+  parsePositiveId,
+  refreshSocketPrincipal,
+  type BuiltinSocketDependencies,
+} from "@/socket/builtinSocketAuth";
 
-async function verifyToken(rawToken: string): Promise<number | null> {
-  const setting = await u.db("o_setting").where("key", "tokenKey").select("value").first();
-  if (!setting) return null;
-  const { value: tokenKey } = setting;
-  if (!rawToken) return null;
-  const token = rawToken.replace("Bearer ", "");
-  try {
-    const decoded = jwt.verify(token, tokenKey as string) as jwt.JwtPayload;
-    return Number.isSafeInteger(decoded.id) && decoded.id > 0 ? decoded.id : null;
-  } catch (err) {
-    return null;
+interface ChatPayload { content?: unknown; prompt?: unknown; idempotencyKey?: unknown; limits?: unknown; }
+type Ack = (result: Record<string, unknown>) => void;
+
+function limits(value: unknown): BuiltinRunLimits {
+  if (value === undefined) return { ...defaultBuiltinRunLimits };
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("LIMITS_INVALID");
+  const source = value as Record<string, unknown>;
+  const result = { ...defaultBuiltinRunLimits };
+  for (const key of Object.keys(result) as Array<keyof BuiltinRunLimits>) {
+    if (source[key] === undefined) continue;
+    if (!Number.isSafeInteger(source[key]) || Number(source[key]) < 0) throw new Error("LIMITS_INVALID");
+    result[key] = Number(source[key]);
   }
+  return result;
+}
+
+function chatInput(data: ChatPayload): { prompt: string; idempotencyKey: string; limits: BuiltinRunLimits } {
+  const prompt = typeof data?.prompt === "string" ? data.prompt : data?.content;
+  if (typeof prompt !== "string" || !prompt.trim() || prompt.length > 100_000) throw new Error("PROMPT_INVALID");
+  if (typeof data.idempotencyKey !== "string" || !/^[\w:.-]{8,150}$/.test(data.idempotencyKey)) throw new Error("IDEMPOTENCY_REQUIRED");
+  return { prompt: prompt.trim(), idempotencyKey: data.idempotencyKey, limits: limits(data.limits) };
+}
+
+export interface ProductionAgentSocketOptions extends BuiltinSocketDependencies {}
+
+export function createProductionAgentSocketRoute(dependencies: ProductionAgentSocketOptions) {
+  return (nsp: Namespace) => {
+    nsp.on("connection", async (socket: Socket) => {
+      let principal;
+      let context: { projectId: number; scriptId: number; isolationKey: string };
+      try {
+        principal = await authenticateBuiltinSocket(socket, dependencies);
+        const projectId = parsePositiveId(socket.handshake.auth?.projectId, "PROJECT");
+        const scriptId = parsePositiveId(socket.handshake.auth?.scriptId, "SCRIPT");
+        context = { projectId, scriptId, isolationKey: deriveIsolationKey("productionAgent", projectId, scriptId) };
+        await authorizeSocketContext(dependencies, principal, context, "read");
+      } catch {
+        disconnectSocket(socket);
+        return;
+      }
+
+      const currentPrincipal = async () => {
+        principal = await refreshSocketPrincipal(socket, dependencies);
+        await authorizeSocketContext(dependencies, principal, context, "read");
+        return principal;
+      };
+
+      const onProductionChange = async (change: ProductionChange) => {
+        if (change.projectId !== context.projectId || change.scriptId !== context.scriptId) return;
+        try {
+          await currentPrincipal();
+          socket.emit("productionStateChanged", change);
+        } catch { disconnectSocket(socket); }
+      };
+      productionEvents.on("changed", onProductionChange);
+
+      socket.on("updateContext", async (data: { projectId?: unknown; scriptId?: unknown }, callback?: Ack) => {
+        try {
+          const actor = await currentPrincipal();
+          const projectId = parsePositiveId(data?.projectId, "PROJECT");
+          const scriptId = parsePositiveId(data?.scriptId, "SCRIPT");
+          const next = { projectId, scriptId, isolationKey: deriveIsolationKey("productionAgent", projectId, scriptId) };
+          await authorizeSocketContext(dependencies, actor, next, "read");
+          context = next;
+          callback?.({ success: true, isolationKey: next.isolationKey });
+        } catch (error) { callback?.({ success: false, code: errorCode(error), message: "无权访问该剧集" }); if (shouldDisconnect(error)) disconnectSocket(socket); }
+      });
+
+      socket.on("chat", async (data: ChatPayload, callback?: Ack) => {
+        try {
+          const actor = await currentPrincipal();
+          await authorizeSocketContext(dependencies, actor, context, "edit");
+          const input = chatInput(data);
+          const result = await dependencies.runtime.create({ agentType: "productionAgent", projectId: context.projectId, scriptId: context.scriptId, requestedBy: actor.id, prompt: input.prompt, idempotencyKey: input.idempotencyKey, limits: input.limits });
+          socket.emit("builtinRunCreated", { runId: result.run.id, reused: result.reused, isolationKey: context.isolationKey });
+          callback?.({ success: true, runId: result.run.id, reused: result.reused });
+        } catch (error) { callback?.({ success: false, code: errorCode(error), message: "内置 Agent 任务未创建，请刷新后重试" }); if (shouldDisconnect(error)) disconnectSocket(socket); }
+      });
+
+      socket.on("updateThinkConfig", async (_data: unknown, callback?: Ack) => {
+        try { await currentPrincipal(); callback?.({ success: true }); }
+        catch (error) { callback?.({ success: false, code: errorCode(error) }); disconnectSocket(socket); }
+      });
+
+      socket.on("disconnect", () => { productionEvents.off("changed", onProductionChange); });
+    });
+  };
+}
+
+function errorCode(error: unknown): string {
+  if (error && typeof error === "object" && "code" in error) return String((error as { code: unknown }).code);
+  return error instanceof Error ? error.message : "SOCKET_ACTION_FAILED";
+}
+
+function shouldDisconnect(error: unknown): boolean {
+  return Boolean(error && typeof error === "object" && "status" in error && Number((error as { status?: unknown }).status) === 401);
 }
 
 export default (nsp: Namespace) => {
-  nsp.on("connection", async (socket: Socket) => {
-    const token = socket.handshake.auth.token;
-    const userId = typeof token === "string" ? await verifyToken(token) : null;
-    if (!userId) {
-      console.log("[productionAgent] 连接失败，token无效");
-      socket.disconnect();
-      return;
-    }
-    const authorizeContext = async (projectId: number, scriptId: number) => {
-      if (!Number.isSafeInteger(projectId) || !Number.isSafeInteger(scriptId) || projectId <= 0 || scriptId <= 0) return false;
-      const user = await u.db("o_user").where({ id: userId }).first();
-      const project = await u.db("o_project").where({ id: projectId, userId }).first();
-      const script = await u.db("o_script").where({ id: scriptId, projectId }).first();
-      return Boolean(user && project && script);
-    };
-    const projectId = Number(socket.handshake.auth.projectId);
-    const scriptId = Number(socket.handshake.auth.scriptId);
-    if (!(await authorizeContext(projectId, scriptId))) { socket.disconnect(); return; }
-    let isolationKey = `${projectId}:productionAgent:${scriptId}`;
-    if (!isolationKey) {
-      console.log("[productionAgent] 连接失败，缺少 isolationKey");
-      socket.disconnect();
-      return;
-    }
-
-    console.log("[productionAgent] 已连接:", socket.id);
-
-    let resTool = new ResTool(socket, {
-      projectId,
-      scriptId,
-    });
-    let abortController: AbortController | null = null;
-
-    const thinkConfig: agent.AgentContext["thinkConfig"] = {
-      think: false,
-      thinlLevel: 0,
-    };
-
-    socket.on("updateContext", async (data: { isolationKey: string; projectId: number; scriptId: number }, callback) => {
-      const projectId = Number(data.projectId), scriptId = Number(data.scriptId);
-      if (!(await authorizeContext(projectId, scriptId))) return callback?.({ success: false, message: "无权访问该剧集" });
-      abortController?.abort();
-      isolationKey = `${projectId}:productionAgent:${scriptId}`;
-      resTool = new ResTool(socket, {
-        projectId,
-        scriptId,
-      });
-      console.log("[productionAgent] 上下文已更新:", isolationKey);
-      callback?.({ success: true });
-    });
-
-    const onProductionChange = (change: ProductionChange) => {
-      if (change.projectId === Number(resTool.data.projectId) && change.scriptId === Number(resTool.data.scriptId)) {
-        socket.emit("productionStateChanged", change);
-      }
-    };
-    productionEvents.on("changed", onProductionChange);
-    socket.on("disconnect", () => {
-      productionEvents.off("changed", onProductionChange);
-      abortController?.abort();
-    });
-
-    socket.on("chat", async (data: { content: string }) => {
-      const { content } = data;
-      abortController?.abort();
-      abortController = new AbortController();
-      const currentController = abortController;
-
-      const msg = resTool.newMessage("assistant", "视频策划");
-      const ctx: agent.AgentContext = {
-        socket,
-        isolationKey,
-        text: content,
-        userMessageTime: new Date(msg.datetime).getTime() - 1,
-        abortSignal: currentController.signal,
-        resTool,
-        msg,
-        thinkConfig,
-      };
-
-      try {
-        await agent.runDecisionAI(ctx);
-      } catch (err: any) {
-        if (err.name !== "AbortError" && !currentController.signal.aborted) {
-          console.error("[productionAgent] chat error:", u.error(err).message);
-        }
-      } finally {
-        if (abortController === currentController) {
-          abortController = null;
-        }
-      }
-    });
-
-    socket.on("updateThinkConfig", (data: { think: boolean; thinlLevel: 0 | 1 | 2 | 3 }) => {
-      thinkConfig.think = data.think;
-      thinkConfig.thinlLevel = data.thinlLevel;
-      console.log("[productionAgent] 更新思考配置:", thinkConfig);
-    });
-
-    socket.on("stop", () => {
-      abortController?.abort();
-      abortController = null;
-    });
-  });
-  nsp.on("disconnect", (socket: Socket) => {
-    console.log("[productionAgent] 已断开连接:", socket.id);
-  });
+  const utils = require("@/utils").default;
+  const { getBuiltinAgentRuntime } = require("@/services/builtinAgent/runtime") as typeof import("@/services/builtinAgent/runtime");
+  return createProductionAgentSocketRoute({ db: utils.db, runtime: getBuiltinAgentRuntime() })(nsp);
 };

@@ -1,48 +1,19 @@
 import express from "express";
 import u from "@/utils";
-import { z } from "zod";
 import { success } from "@/lib/responseFormat";
-import { insertRowsReturningIds } from "@/lib/insertRows";
-import { validateFields } from "@/middleware/middleware";
-const router = express.Router();
+import { createProject, listConfigurationDirectories, loadEnabledProjectModels } from "@/services/projectContent";
+import { humanActor, requestUserId, sendProjectContentError } from "@/services/projectContent/http";
+import { requireTeamRole } from "@/services/team";
 
-// 新增项目
-export default router.post(
-  "/",
-  validateFields({
-    projectType: z.string(),
-    name: z.string(),
-    intro: z.string(),
-    type: z.string(),
-    artStyle: z.string(),
-    directorManual: z.string(),
-    videoRatio: z.string(),
-    imageModel: z.string(),
-    videoModel: z.string(),
-    imageQuality: z.string(),
-    mode: z.string(),
-  }),
-  async (req, res) => {
-    const { projectType, name, intro, type, directorManual, artStyle, videoRatio, imageModel, videoModel, imageQuality, mode } = req.body;
-
-    const userId = Number((req as any).user?.id);
-    if (!Number.isSafeInteger(userId) || userId <= 0) return res.status(401).send({ message: "请先登录" });
-    await insertRowsReturningIds(u.db, "o_project", {
-      projectType,
-      name,
-      intro,
-      type,
-      artStyle,
-      videoRatio,
-      directorManual,
-      userId,
-      imageModel,
-      videoModel,
-      createTime: Date.now(),
-      imageQuality,
-      mode,
+export default express.Router().post("/", async (req, res) => {
+  try {
+    const userId = requestUserId(req);
+    await requireTeamRole(u.db, userId, ["admin", "editor"]);
+    const metadata = async () => ({
+      models: await loadEnabledProjectModels(u.db, (vendorId) => u.vendor.getModelList(vendorId)),
+      artStyles: listConfigurationDirectories(u.getPath(["skills", "art_skills"])),
+      directorManuals: listConfigurationDirectories(u.getPath(["skills", "story_skills"])),
     });
-
-    res.status(200).send(success({ message: "新增项目成功" }));
-  },
-);
+    return res.send(success(await createProject(u.db, req.body, userId, humanActor(req), metadata)));
+  } catch (error) { return sendProjectContentError(res, error); }
+});

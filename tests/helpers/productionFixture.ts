@@ -4,6 +4,7 @@ import path from "node:path";
 import knex, { type Knex } from "knex";
 import type { NewStoryboard } from "../../src/services/productionFlow";
 import { ensureProductionStateSchema } from "../../src/services/productionState";
+import { ensureProductionAssetSchema } from "../../src/services/productionAssets";
 
 export interface ProductionFixture {
   db: Knex;
@@ -31,6 +32,7 @@ export async function createProductionFixture(): Promise<ProductionFixture> {
   await db.schema.createTable("o_imageFlow", (table) => { table.integer("id").primary(); table.text("flowData").notNullable(); });
   await db.schema.createTable("o_assets2Storyboard", (table) => { table.integer("storyboardId").notNullable(); table.integer("assetId").notNullable(); table.primary(["storyboardId", "assetId"]); });
   await ensureProductionStateSchema(db);
+  await ensureProductionAssetSchema(db);
   await db("o_user").insert([{ id: 7, username: "owner" }, { id: 8, username: "other" }]);
   await db("o_project").insert([{ id: 100, userId: 7, videoRatio: "16:9", imageModel: "1:mock-image", imageQuality: "1K", artStyle: "测试风格" }, { id: 200, userId: 8, videoRatio: "16:9", imageModel: "1:mock-image", imageQuality: "1K", artStyle: "测试风格" }]);
   await db("o_script").insert([{ id: 10, projectId: 100, content: "database script" }, { id: 20, projectId: 200, content: "other project script" }]);

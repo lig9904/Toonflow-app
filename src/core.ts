@@ -17,7 +17,8 @@ type RouteModulePair = { routePath: string; varName: string; entry: string };
 
 export default async function generateRouter(): Promise<void> {
   // glob 得到 entries
-  let entries: string[] = await fg(["src/routes/**/*.ts"]);
+  // Injectable router factories are mounted by app.ts rather than passed as Express handlers.
+  let entries: string[] = await fg(["src/routes/**/*.ts"], { ignore: ["src/routes/team/index.ts"] });
   // 排序
   entries = entries.sort((a, b) => a.localeCompare(b));
 

@@ -9,16 +9,26 @@ import { VideoJobError } from "./videoJobs";
 import { ProductionAssetError } from "./productionAssets";
 import { ProductionImageError } from "./productionImages";
 import replaceUrl from "../utils/replaceUrl";
+import { requireProjectAccess, TeamSecurityError } from "./team";
+import { getRouteAuthorization } from "./team/authorization";
+import { resolveImageFlowOwner, ImageFlowWorkspaceError } from "./imageFlowWorkspace";
+import { assertImageMediaProject, MediaOwnershipError } from "../lib/mediaOwnership";
 
 export async function requireProductionOwner(req: Request, projectId: number, db: Knex): Promise<TrustedActor> {
   const userId = Number((req as Request & { user?: { id?: number } }).user?.id);
   if (!Number.isSafeInteger(userId) || userId <= 0) throw new ProductionFlowError("请先登录", 401);
-  const user = await db("o_user").where({ id: userId }).first();
-  const project = await db("o_project").where({ id: projectId, userId }).first();
-  if (!user || !project) throw new ProductionFlowError("无权访问该项目", 403);
+  const exactPath = (req.originalUrl || req.path || "").split("?")[0].replace(/\/$/, "");
+  const operation = getRouteAuthorization(req.method, exactPath);
+  // Retain this export for existing route handlers; authorization is now shared-team and operation-specific.
+  await requireProjectAccess(db, userId, projectId, operation?.action ?? "edit");
   return { id: `human:${userId}`, kind: "human" };
 }
 export function sendProductionError(res: Response, error: unknown) {
+  if (error instanceof ImageFlowWorkspaceError || error instanceof MediaOwnershipError) {
+    const status = error.code === "NOT_FOUND" ? 404 : error.code === "PROJECT_MISMATCH" ? 403 : error.code === "INVALID_INPUT" ? 400 : 409;
+    return res.status(status).json({ code: error.code, message: error.message });
+  }
+  if (error instanceof TeamSecurityError) return res.status(error.status).json({ code: error.code, message: error.message });
   if (error instanceof ProductionAssetError || error instanceof ProductionImageError) return res.status(error.status).json({ code:error.status, message:error.message });
   if (error instanceof ZodError) return res.status(400).json({ code: "INVALID_INPUT", message: "参数错误", errors: error.issues.map((i) => i.message) });
   if (error instanceof VideoJobError) {
@@ -48,6 +58,14 @@ const newStoryboard = z.object({
 });
 const add = z.object({ projectId, scriptId: z.number().int().positive(), data: z.array(newStoryboard).min(1).max(100) }).strict();
 
+async function removeUnusedFlow(trx: Knex.Transaction, projectId: number, flowIdValue: unknown) {
+  const flowId = Number(flowIdValue);
+  if (!Number.isSafeInteger(flowId) || flowId <= 0 || await trx("o_storyboard").where({ flowId }).first() || await trx("o_assets").where({ flowId }).first()) return;
+  await trx("o_imageFlow").where({ id: flowId }).delete();
+  if (await trx.schema.hasTable("ext_image_flow_owners")) await trx("ext_image_flow_owners").where({ flowId, projectId }).delete();
+  if (await trx.schema.hasTable("ext_creative_state")) await trx("ext_creative_state").where({ entityType: "imageFlow", entityId: flowId, projectId }).delete();
+}
+
 export function createProductionHandlers(db: Knex, getUrl: (path: string) => Promise<string>) {
   const service = new ProductionStateService(db);
   const wrap = (fn: (req: Request, res: Response) => Promise<unknown>) => async (req: Request, res: Response) => {
@@ -62,8 +80,12 @@ export function createProductionHandlers(db: Knex, getUrl: (path: string) => Pro
       const data = entity.extend({ expectedVersion, url: z.string(), flowId: id }).parse(req.body);
       const actor = await requireProductionOwner(req, data.projectId, db);
       await service.guardStoryboardMutations({ projectId: data.projectId, storyboardIds: [data.id],
-        expectedVersions: { [data.id]: data.expectedVersion }, actor, mutate: async (trx) => {
-          await trx("o_storyboard").where({ id: data.id }).update({ filePath: replaceUrl(data.url), flowId: data.flowId,
+        expectedVersions: { [data.id]: data.expectedVersion }, actor, mutate: async (trx, contexts) => {
+          const owner = await resolveImageFlowOwner(trx, data.flowId);
+          if (owner.projectId !== data.projectId || owner.scriptId !== Number(contexts[0].storyboard.scriptId)) throw new ProductionFlowError("图片工作流不属于当前项目和剧集", 403);
+          if (await trx("o_assets").where({ flowId: data.flowId }).first() || await trx("o_storyboard").where({ flowId: data.flowId }).whereNot({ id: data.id }).first()) throw new ProductionFlowError("图片工作流已绑定其他资源", 409);
+          const filePath = await assertImageMediaProject(trx, data.projectId, data.url);
+          await trx("o_storyboard").where({ id: data.id }).update({ filePath, flowId: data.flowId,
             state: "已完成", shouldGenerateImage: data.url ? 1 : 0 });
         },
       });
@@ -77,7 +99,7 @@ export function createProductionHandlers(db: Knex, getUrl: (path: string) => Pro
           const row = contexts[0].storyboard;
           await trx("o_assets2Storyboard").where({ storyboardId: data.id }).delete();
           await trx("o_storyboard").where({ id: data.id }).delete();
-          if (row.flowId && !(await trx("o_storyboard").where({ flowId: row.flowId }).first())) await trx("o_imageFlow").where({ id: row.flowId }).delete();
+          await removeUnusedFlow(trx, data.projectId, row.flowId);
           if (row.trackId && !(await trx("o_storyboard").where({ trackId: row.trackId }).first())) await trx("o_videoTrack").where({ id: row.trackId, projectId: data.projectId }).delete();
           return Number(row.scriptId);
         },
@@ -93,7 +115,7 @@ export function createProductionHandlers(db: Knex, getUrl: (path: string) => Pro
           await trx("o_assets2Storyboard").whereIn("storyboardId", data.ids).delete();
           await trx("o_storyboard").whereIn("id", data.ids).delete();
           for (const { storyboard: row } of contexts) {
-            if (row.flowId && !(await trx("o_storyboard").where({ flowId: row.flowId }).first())) await trx("o_imageFlow").where({ id: row.flowId }).delete();
+            await removeUnusedFlow(trx, data.projectId, row.flowId);
             if (row.trackId && !(await trx("o_storyboard").where({ trackId: row.trackId }).first())) await trx("o_videoTrack").where({ id: row.trackId, projectId: data.projectId }).delete();
           }
           return [...new Set(contexts.map((ctx) => Number(ctx.storyboard.scriptId)))];

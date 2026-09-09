@@ -1,10 +1,9 @@
 import express from "express";
 import u from "@/utils";
-import { success } from "@/lib/responseFormat";
-const router = express.Router();
+import { readTaskCategories } from "@/services/taskOverview";
+import { sendCreativeWorkspaceError } from "@/services/creativeWorkspace/http";
 
-export default router.post("/", async (req, res) => {
-  const list = await u.db("o_tasks").select("taskClass").groupBy("taskClass");
-  const data = list.filter((item) => item.taskClass);
-  res.status(200).send(success(data));
+export default express.Router().post("/", async (req, res) => {
+  try { return res.send({ code: 200, data: await readTaskCategories(u.db, Number((req as any).teamPrincipal?.id ?? (req as any).user?.id)) }); }
+  catch (error) { return sendCreativeWorkspaceError(res, error); }
 });

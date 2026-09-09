@@ -16,6 +16,8 @@ async function fixture(options: { provider?: Partial<VideoTaskProvider>; maxConc
   for (const [table, columns] of [["o_script", ["projectId"]], ["o_videoTrack", ["projectId", "scriptId"]], ["o_video", ["projectId", "scriptId", "videoTrackId", "filePath", "state", "errorReason", "time"]]] as const) {
     await db.schema.createTable(table, (builder) => { builder.integer("id").primary(); for (const column of columns) builder.text(column); });
   }
+  await db.schema.createTable("o_storyboard", (table) => { table.integer("id").primary(); table.integer("projectId"); table.integer("scriptId"); table.integer("trackId"); });
+  await db.schema.createTable("ext_entity_state", (table) => { table.text("entityType"); table.integer("entityId"); table.integer("projectId"); table.boolean("locked").notNullable().defaultTo(false); });
   await db("o_script").insert([{ id: 10, projectId: 1 }, { id: 20, projectId: 2 }]);
   await db("o_videoTrack").insert([{ id: 100, projectId: 1, scriptId: 10 }, { id: 200, projectId: 2, scriptId: 20 }]);
   await db("o_video").insert([{ id: 1000, projectId: 1, scriptId: 10, videoTrackId: 100, filePath: "/1/video/a.mp4", state: "生成中" }, { id: 1001, projectId: 1, scriptId: 10, videoTrackId: 100, filePath: "/1/video/c.mp4", state: "生成中" }, { id: 2000, projectId: 2, scriptId: 20, videoTrackId: 200, filePath: "/2/video/b.mp4", state: "生成中" }]);
@@ -91,6 +93,9 @@ test("restart only queries persisted upstream task and writes before success", a
 test("stranded reservation requires reconciliation and never posts again", async () => {
   const f = await fixture(); try {
     const p = payload(); const reserved = await f.service.reserve("request-0005", p, hashVideoJobRequest(p));
+    await f.service.resumeDueJobs();
+    assert.equal((await f.service.get(reserved.job.id)).status, "SUBMITTING", "a live creator lease must not be reconciled by startup scanning");
+    f.clock.now += 120_001;
     await f.service.resumeDueJobs();
     assert.equal(f.provider.submits, 0);
     assert.equal((await f.service.get(reserved.job.id)).status, "RECONCILIATION_REQUIRED");
@@ -268,6 +273,7 @@ test("startup reconciliation compacts a stranded submitting payload without retr
     const media = `data:video/mp4;base64,STRANDED_MEDIA_REFERENCE_SHOULD_NOT_PERSIST${"x".repeat(200_000)}`;
     const p = { ...payload(), config: { prompt: "scene", referenceList: [{ type: "video", base64: media }] } };
     const reserved = await f.service.reserve("request-0015", p, hashVideoJobRequest(p));
+    f.clock.now += 120_001;
     await f.service.resumeDueJobs();
     const stored = await f.db("ext_video_jobs").where({ id: reserved.job.id }).first();
     assert.equal((await f.service.get(reserved.job.id)).status, "RECONCILIATION_REQUIRED");

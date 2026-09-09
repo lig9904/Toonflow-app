@@ -11,16 +11,24 @@ import buildRoute from "@/core";
 import path from "path";
 import fs from "fs";
 import u from "@/utils";
-import jwt from "jsonwebtoken";
 import { agentGatewayConfigFromEnv, createAgentGateway } from "@/services/agentGateway";
 import { resumeVideoJobs, getRuntimeVideoJobService } from "@/services/videoJobs/runtime";
 import { dbReady } from "@/utils/db";
 import socketInit from "@/socket/index";
 import { isEletron } from "@/utils/getPath";
 import { ensureThumbnail, ThumbnailSize } from "@/utils/image";
+import { getBuiltinAgentRuntime, authorizeBuiltinProject } from "@/services/builtinAgent/runtime";
+import { createBuiltinAgentRouter } from "@/services/builtinAgent/http";
+import { createTeamRouter } from "@/routes/team";
+import { createApplicationSessionRouter, applicationAllowedOrigins } from "@/services/applicationSession";
+import { teamAuthMiddleware, type TeamPrincipal } from "@/services/team";
+import { authorizeRoute, resolveAuthorizedMedia } from "@/services/team/authorization";
+import { getProductionImageGenerationService } from "@/services/productionImageJobRuntime";
+import { configureMediaJobRecoveryExecutors } from "@/services/mediaJobControl";
 
 const app = express();
 const server = http.createServer(app);
+let ioServer: Server | undefined;
 
 async function checkPermissions() {
   if (!isEletron()) return true;
@@ -50,10 +58,13 @@ export default async function startServe(randomPort: Boolean = false) {
   await dbReady;
   await checkPermissions();
   await u.oss.ready();
+  configureMediaJobRecoveryExecutors({ image: getProductionImageGenerationService(), video: getRuntimeVideoJobService() });
+  getProductionImageGenerationService().start();
   void resumeVideoJobs().catch((error) => console.error("[videoJobs] recovery failed", error instanceof Error ? error.name : "UnknownError"));
 
   await u.writeVersion();
   const io = new Server(server, { cors: { origin: "*" } });
+  ioServer = io;
   socketInit(io);
 
   if (process.env.NODE_ENV == "dev") await buildRoute();
@@ -64,6 +75,14 @@ export default async function startServe(randomPort: Boolean = false) {
   app.use(cors({ origin: "*" }));
   app.use(express.json({ limit: "100mb" }));
   app.use(express.urlencoded({ extended: true, limit: "100mb" }));
+  const allowedOrigins = applicationAllowedOrigins();
+  const authenticate = teamAuthMiddleware(u.db, { allowedOrigins });
+  app.use("/api/session", createApplicationSessionRouter({
+    db: u.db,
+    secureCookies: process.env.NODE_ENV === "prod",
+    allowedOrigins,
+    legacySigningKey: async () => String((await u.db("o_setting").where({ key: "tokenKey" }).first())?.value ?? ""),
+  }));
 
   // oss 静态资源
   const ossDir = u.getPath("oss");
@@ -73,6 +92,17 @@ export default async function startServe(randomPort: Boolean = false) {
   console.log("文件目录:", ossDir);
   app.use(
     "/oss",
+    authenticate,
+    async (req, res, next) => {
+      try {
+        const filePath = decodeURIComponent(req.path);
+        if (filePath.includes("\\") || filePath.split("/").some((part) => part === ".." || part === ".") || filePath.includes("\0")) return res.status(403).end();
+        const principal = (req as any).teamPrincipal as TeamPrincipal;
+        await resolveAuthorizedMedia(u.db, principal.id, { filePath });
+        res.setHeader("Cache-Control", "private, no-store");
+        next();
+      } catch { return res.status(403).send({ code: "MEDIA_FORBIDDEN", message: "无权访问此媒体" }); }
+    },
     (req, res, next) => {
       // 如果传参 type=small，则返回小图
       if (req.query.size) {
@@ -111,7 +141,10 @@ export default async function startServe(randomPort: Boolean = false) {
 
         ensureThumbnail(originalPath, smallImagePath, sizeOpts).then((thumbnailPath) => {
           if (thumbnailPath) {
-            res.sendFile(thumbnailPath);
+            // A configured media root may itself be inside a dot-directory.
+            // Resolve relative to that trusted root so Express does not reject
+            // the root's name as an untrusted dotfile request.
+            res.sendFile(path.relative(ossDir, thumbnailPath), { root: ossDir });
           } else {
             // 缩略图生成失败，降级返回原图
             express.static(ossDir, { acceptRanges: false })(req, res, next);
@@ -121,7 +154,7 @@ export default async function startServe(randomPort: Boolean = false) {
       }
       next();
     },
-    express.static(ossDir, { acceptRanges: false }),
+    express.static(ossDir, { acceptRanges: true }),
   );
   // skills 静态资源
   const skillsDir = u.getPath("skills");
@@ -157,30 +190,34 @@ export default async function startServe(randomPort: Boolean = false) {
 
   app.use("/api/agent", createAgentGateway(u.db, agentGatewayConfigFromEnv(process.env), (path) => u.oss.getSmallImageUrl(path)));
 
-  app.use(async (req, res, next) => {
-    const setting = await u.db("o_setting").where("key", "tokenKey").select("value").first();
-    if (!setting) return res.status(444).send({ message: "服务器秘钥未配置，请联系管理员" });
-    const { value: tokenKey } = setting;
-    // 从 header 或 query 参数获取 token
-    const rawToken = req.headers.authorization || (req.query.token as string) || "";
-    const token = rawToken.replace("Bearer ", "");
-    // 白名单路径
-    if (req.path === "/api/login/login") return next();
-
-    if (!token) return res.status(401).send({ message: "未提供token" });
-    try {
-      const decoded = jwt.verify(token, tokenKey as string);
-      (req as any).user = decoded;
-      const userId = typeof decoded === "object" ? Number(decoded.id) : NaN;
-      const ownAccountRoutes = ["/api/setting/loginConfig/getUser", "/api/setting/loginConfig/updateUserPwd"];
-      if (req.path.startsWith("/api/setting/") && !ownAccountRoutes.includes(req.path) && userId !== Number(process.env.TOONFLOW_ADMIN_USER_ID || 1)) {
-        return res.status(403).send({ message: "此设置仅限管理员访问" });
+  app.use("/api", (req, res, next) => {
+    if (req.path === "/login/login") return next();
+    return authenticate(req, res, async () => {
+      try {
+        const principal = (req as any).teamPrincipal as TeamPrincipal;
+        (req as any).user = principal;
+        const exactPath = req.originalUrl.split("?")[0].replace(/\/$/, "");
+        await authorizeRoute({ db: u.db, getMedia: (request) => {
+          const raw = String(request.body?.url ?? request.body?.path ?? "");
+          const url = new URL(raw, "http://local.invalid");
+          if (!url.pathname.startsWith("/oss/")) throw new Error("Invalid media reference");
+          return { filePath: decodeURIComponent(url.pathname.slice(4)) };
+        } }, req.method, exactPath, principal, req);
+        next();
+      } catch (error) {
+        const value = error as { status?: number; code?: string; message?: string };
+        res.status(value.status ?? 403).send({ code: value.code ?? "FORBIDDEN", message: value.message ?? "操作未获授权" });
       }
-      next();
-    } catch (err) {
-      return res.status(401).send({ message: "无效的token" });
-    }
+    });
   });
+
+  app.use("/api/team", createTeamRouter({ db: u.db, authenticate: async (req) => (req as any).teamPrincipal }));
+  app.use("/api/builtinAgent", createBuiltinAgentRouter({
+    runtime: getBuiltinAgentRuntime(),
+    userId: async (req) => Number((req as any).user?.id),
+    authorize: authorizeBuiltinProject,
+  }));
+  getBuiltinAgentRuntime().start();
 
   const router = await import("@/router");
   await router.default(app);
@@ -210,8 +247,11 @@ export default async function startServe(randomPort: Boolean = false) {
 }
 
 // 支持await关闭
-export function closeServe(): Promise<void> {
+export async function closeServe(): Promise<void> {
+  getProductionImageGenerationService().stop();
   getRuntimeVideoJobService().stop();
+  await getBuiltinAgentRuntime().stop();
+  ioServer?.disconnectSockets(true);
   return new Promise((resolve, reject) => {
     if (server) {
       server.close((err?: Error) => {

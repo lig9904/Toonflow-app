@@ -1,29 +1,13 @@
 import express from "express";
 import u from "@/utils";
-import { z } from "zod";
-import { success } from "@/lib/responseFormat";
-import { validateFields } from "@/middleware/middleware";
-import { hashPassword } from "@/lib/password";
-const router = express.Router();
+import { updateAccountPassword } from "@/services/applicationSession";
+import { getTeamUser } from "@/services/team";
+import { sendCreativeWorkspaceError } from "@/services/creativeWorkspace/http";
 
-export default router.post(
-  "/",
-  validateFields({
-    name: z.string().min(1).max(128),
-    password: z.string().min(8).max(1024),
-    id: z.number().int().positive(),
-  }),
-  async (req, res) => {
-    const { name, password, id } = req.body;
-    const callerId = Number((req as any).user?.id);
-    const adminId = Number(process.env.TOONFLOW_ADMIN_USER_ID || 1);
-    if (!Number.isSafeInteger(callerId) || (callerId !== id && callerId !== adminId)) {
-      return res.status(403).send({ message: "无权修改该账号" });
-    }
-    await u.db("o_user").where("id", id).update({
-      name,
-      password: hashPassword(password),
-    });
-    res.status(200).send(success("保存设置成功"));
-  },
-);
+export default express.Router().post("/", async (req, res) => {
+  try {
+    const principal = await getTeamUser(u.db, Number((req as any).user?.id));
+    await updateAccountPassword(u.db, principal, req.body);
+    return res.send({ code: 200, data: { reauthenticate: true }, message: "密码已更新，请重新登录" });
+  } catch (error) { return sendCreativeWorkspaceError(res, error); }
+});

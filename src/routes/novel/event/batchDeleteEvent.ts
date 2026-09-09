@@ -1,21 +1,13 @@
 import express from "express";
 import u from "@/utils";
-import { z } from "zod";
 import { success } from "@/lib/responseFormat";
-import { validateFields } from "@/middleware/middleware";
-const router = express.Router();
+import { deleteNovelEvents } from "@/services/novelEventWorkspace";
+import { novelEventActor, novelEventUserId, sendNovelEventError } from "@/services/novelEventWorkspace/http";
+import { requireProjectAccess } from "@/services/team";
 
-export default router.post(
-  "/",
-  validateFields({
-    ids: z.array(z.number()),
-  }),
-  async (req, res) => {
-    const { ids } = req.body;
-
-    await u.db("o_event").whereIn("id", ids).del();
-    await u.db("o_eventChapter").whereIn("eventId", ids).del();
-
-    res.status(200).send(success({ message: "删除事件成功" }));
-  },
-);
+export default express.Router().post("/", async (req, res) => {
+  try {
+    await requireProjectAccess(u.db, novelEventUserId(req), req.body?.projectId, "edit");
+    return res.send(success(await deleteNovelEvents(u.db, req.body, novelEventActor(req))));
+  } catch (error) { return sendNovelEventError(res, error); }
+});

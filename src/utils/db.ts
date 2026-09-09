@@ -8,6 +8,19 @@ import { configurePostgresTypeParsers, requirePostgresDatabaseUrl, requirePostgr
 import { ensureVideoJobsSchema } from "@/services/videoJobs";
 import { ensureAgentGatewaySchema } from "@/services/agentGateway";
 import { ensureProductionStateSchema } from "@/services/productionState";
+import { ensureCreativeWorkspaceSchema } from "@/services/creativeWorkspace";
+import { ensureBuiltinAgentRuntimeSchema } from "@/services/builtinAgentRuntime";
+import { ensureTeamSchema } from "@/services/team";
+import { ensureProjectContentSchema } from "@/services/projectContent";
+import { ensureProductionImageJobSchema } from "@/services/imageJobs/runtime";
+import { ensureAssetWorkspaceSchema } from "@/services/assetWorkspace";
+import { ensureTrackWorkspaceSchema } from "@/services/trackWorkspace";
+import { ensureAssetExtractionWorkspaceSchema } from "@/services/assetExtractionWorkspace";
+import { ensureProductionAssetSchema } from "@/services/productionAssets";
+import { ensureRoleAudioWorkspaceSchema } from "@/services/roleAudioWorkspace";
+import { ensureNovelEventWorkspaceSchema } from "@/services/novelEventWorkspace";
+import { ensureMediaJobControlSchema } from "@/services/mediaJobControl";
+import { ensureImageFlowWorkspaceSchema } from "@/services/imageFlowWorkspace";
 
 type TableName = keyof DB & string;
 type RowType<TName extends TableName> = DB[TName];
@@ -29,6 +42,19 @@ export const dbReady = (async () => {
   await ensureProductionStateSchema(db);
   await ensureVideoJobsSchema(db);
   await fixDB(db);
+  await ensureTeamSchema(db, { bootstrapAdminUserId: Number(process.env.TOONFLOW_ADMIN_USER_ID || 1) });
+  await ensureCreativeWorkspaceSchema(db);
+  await ensureBuiltinAgentRuntimeSchema(db);
+  await ensureProjectContentSchema(db);
+  await ensureProductionImageJobSchema(db);
+  await ensureAssetWorkspaceSchema(db);
+  await ensureTrackWorkspaceSchema(db);
+  await ensureAssetExtractionWorkspaceSchema(db);
+  await ensureProductionAssetSchema(db);
+  await ensureRoleAudioWorkspaceSchema(db);
+  await ensureNovelEventWorkspaceSchema(db);
+  await ensureMediaJobControlSchema(db);
+  await ensureImageFlowWorkspaceSchema(db);
   if (process.env.NODE_ENV == "dev") await initKnexType(db);
 })();
 

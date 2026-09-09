@@ -22,7 +22,11 @@ describe("Zhenzhen provider public contract", () => {
     if (!fixture) return;
     assert.equal(fixture.provider.vendor.id, "zhenzhenRelay");
     assert.equal(fixture.provider.persistentVideoTaskVersion, 1);
-    for (const name of ["textRequest", "imageRequest", "videoRequest", "submitVideoTask", "queryVideoTask", "ttsRequest"]) {
+    assert.equal(fixture.provider.persistentImageTaskVersion, 1);
+    assert.equal(fixture.provider.vendor.models.filter((item: any) => item.type === "text").length, 8);
+    assert.equal(fixture.provider.vendor.models.filter((item: any) => item.type === "image").length, 4);
+    assert.equal(fixture.provider.vendor.models.filter((item: any) => item.type === "video").length, 24);
+    for (const name of ["textRequest", "imageRequest", "submitImageTask", "queryImageTask", "videoRequest", "submitVideoTask", "queryVideoTask", "ttsRequest"]) {
       assert.equal(typeof fixture.provider[name], "function", `${name} must be exported`);
     }
     assert.ok(fixture.provider.vendor.models?.length);
@@ -90,6 +94,29 @@ describe("Zhenzhen provider public contract", () => {
     assert.equal(fixture.calls.length, 0);
   });
 
+  it("keeps image submission and query separate, with one create and exact status URL", async (t) => {
+    const fixture = await fixtureOrSkip(t);
+    if (!fixture) return;
+    const model = modelOf(fixture, "image");
+    let creates = 0;
+    fixture.setHandler((call) => {
+      if (call.method === "POST") { creates += 1; return new Response(JSON.stringify({ task_id: "image-submit" }), { status: 200 }); }
+      return new Response(JSON.stringify({ data: { status: "SUCCESS", result_url: "https://local.invalid/image-result.png" } }), { status: 200 });
+    });
+    assert.deepEqual(await fixture.provider.submitImageTask({ prompt: "submit image", referenceList: [], size: "1K", aspectRatio: "1:1" }, model), { taskId: "image-submit" });
+    assert.deepEqual(await fixture.provider.queryImageTask({ taskId: "image-submit" }), { status: "succeeded", outputUrl: "https://local.invalid/image-result.png" });
+    assert.equal(creates, 1);
+    assert.equal(fixture.calls.filter((call) => call.method === "GET")[0].url, "https://api.seedance.nz/v1/image/generations/image-submit");
+
+    fixture.resetCalls();
+    fixture.setHandler((call) => call.method === "POST" ? new Response(JSON.stringify({}), { status: 200 }) : new Response(JSON.stringify({ data: {} }), { status: 200 }));
+    await assert.rejects(fixture.provider.submitImageTask({ prompt: "missing id", referenceList: [], size: "1K", aspectRatio: "1:1" }, model), /任务 ID/);
+    assert.equal(fixture.calls.filter((call) => call.method === "POST").length, 1);
+    fixture.resetCalls();
+    await assert.rejects(fixture.provider.queryImageTask({ taskId: "missing" }), /未知|URL|结果/);
+    assert.equal(fixture.calls.filter((call) => call.method === "POST").length, 0);
+  });
+
   it("maps text-to-video duration as a string and returns the completed URL", async (t) => {
     const fixture = await fixtureOrSkip(t);
     if (!fixture) return;
@@ -108,6 +135,111 @@ describe("Zhenzhen provider public contract", () => {
     assert.ok(create);
     assert.equal((create.body as any).seconds, "8");
     assert.equal((create.body as any).metadata.ratio, "16:9");
+  });
+
+  it("exposes only the six documented Seedance 2.5 Standard models and their exact capabilities", async (t) => {
+    const fixture = await fixtureOrSkip(t);
+    const models = fixture.provider.vendor.models.filter((item: any) => item.type === "video" && item.modelName.startsWith("seedance-2.5-"));
+    assert.deepEqual(models.map((item: any) => item.modelName), [
+      "seedance-2.5-standard-t2v",
+      "seedance-2.5-standard-i2v",
+      "seedance-2.5-standard-multi",
+      "seedance-2.5-global-standard-t2v",
+      "seedance-2.5-global-standard-i2v",
+      "seedance-2.5-global-standard-multi",
+    ]);
+    assert.equal(models.some((item: any) => /-(fast|mini)-/.test(item.modelName)), false);
+    for (const model of models) {
+      assert.deepEqual(model.durationResolutionMap[0].duration, Array.from({ length: 27 }, (_value, index) => index + 4));
+      assert.deepEqual(model.durationResolutionMap[0].resolution, ["480p", "720p", "1080p", "2k", "4k", "native1080p"]);
+      assert.equal(model.audio, "optional");
+    }
+    assert.deepEqual(models.find((item: any) => item.modelName === "seedance-2.5-standard-t2v")?.mode, ["text"]);
+    assert.deepEqual(models.find((item: any) => item.modelName === "seedance-2.5-standard-i2v")?.mode, ["endFrameOptional"]);
+    assert.deepEqual(models.find((item: any) => item.modelName === "seedance-2.5-standard-multi")?.mode, [["imageReference:30", "videoReference:10", "audioReference:10"]]);
+  });
+
+  it("submits Seedance 2.5 through the shared v1 video task protocol with 30-second and native resolution support", async (t) => {
+    const fixture = await fixtureOrSkip(t);
+    const model = fixture.provider.vendor.models.find((item: any) => item.modelName === "seedance-2.5-global-standard-t2v");
+    assert.ok(model);
+    fixture.setHandler((call) => call.method === "POST"
+      ? new Response(JSON.stringify({ id: "seedance25-task", status: "queued" }), { status: 200 })
+      : new Response(JSON.stringify({ status: "completed", metadata: { url: "https://local.invalid/seedance25.mp4" } }), { status: 200 }));
+    assert.deepEqual(await fixture.provider.submitVideoTask(
+      { prompt: "Seedance 2.5 contract", duration: 30, resolution: "native1080p", aspectRatio: "21:9", audio: false, mode: "text", referenceList: [] },
+      model,
+    ), { taskId: "seedance25-task" });
+    const create = fixture.calls[0];
+    assert.equal(create.url, "https://api.seedance.nz/v1/videos");
+    assert.equal((create.body as any).model, "seedance-2.5-global-standard-t2v");
+    assert.equal((create.body as any).seconds, "30");
+    assert.deepEqual((create.body as any).metadata, { resolution: "native1080p", ratio: "21:9", generate_audio: false });
+    assert.deepEqual(await fixture.provider.queryVideoTask("seedance25-task"), { status: "succeeded", outputUrl: "https://local.invalid/seedance25.mp4" });
+    assert.equal(fixture.calls[1].url, "https://api.seedance.nz/v1/videos/seedance25-task");
+  });
+
+  it("keeps Seedance 2.0 limits while applying the larger 2.5 multi-reference boundary in input order", async (t) => {
+    const fixture = await fixtureOrSkip(t);
+    const oldT2v = fixture.provider.vendor.models.find((item: any) => item.modelName === "seedance-2.0-standard-t2v");
+    const model = fixture.provider.vendor.models.find((item: any) => item.modelName === "seedance-2.5-standard-multi");
+    assert.ok(oldT2v && model);
+    const base = { prompt: "boundary", resolution: "720p", aspectRatio: "16:9", audio: true, mode: "text", referenceList: [] };
+    await assert.rejects(fixture.provider.submitVideoTask({ ...base, duration: 16 }, oldT2v), /2\.0.*15/);
+    await assert.rejects(fixture.provider.submitVideoTask({ ...base, duration: 5, resolution: "2k" }, oldT2v), /2\.0.*分辨率/);
+    await assert.rejects(fixture.provider.submitVideoTask({ ...base, duration: 31 }, { ...model, modelName: "seedance-2.5-standard-t2v" }), /2\.5.*30/);
+    await assert.rejects(fixture.provider.submitVideoTask({ ...base, duration: 5 }, { ...model, modelName: "seedance-2.5-fast-t2v" }), /未适配/);
+    assert.equal(fixture.calls.length, 0);
+
+    fixture.setHandler((call) => call.url.endsWith("/v1/files/upload")
+      ? new Response(JSON.stringify({ url: `https://local.invalid/reference-${fixture.calls.length}` }), { status: 200 })
+      : new Response(JSON.stringify({ id: "multi-25" }), { status: 200 }));
+    const refs = [videoRef(), imageRef(), audioRef(), imageRef("data:image/png;base64,RUZU")];
+    await fixture.provider.submitVideoTask({
+      prompt: "@视频1 @图片1 @音频1 @图片2",
+      duration: 30,
+      resolution: "4k",
+      aspectRatio: "adaptive",
+      audio: true,
+      mode: model.mode,
+      referenceList: refs,
+    }, model);
+    const create = fixture.calls.find((call) => call.url.endsWith("/v1/videos"));
+    assert.deepEqual((create?.body as any).metadata.content.map((item: any) => item.type), ["video_url", "image_url", "audio_url", "image_url"]);
+    assert.equal((create?.body as any).prompt, "@Video 1 @Image 1 @Audio 1 @Image 2");
+
+    fixture.resetCalls();
+    const exactMaximum = [
+      ...Array.from({ length: 30 }, () => imageRef()),
+      ...Array.from({ length: 10 }, () => videoRef()),
+      ...Array.from({ length: 10 }, () => audioRef()),
+    ];
+    await fixture.provider.submitVideoTask({
+      prompt: "exact documented maximum",
+      duration: 4,
+      resolution: "480p",
+      aspectRatio: "16:9",
+      mode: model.mode,
+      referenceList: exactMaximum,
+    }, model);
+    const maximumCreate = fixture.calls.find((call) => call.url.endsWith("/v1/videos"));
+    assert.equal((maximumCreate?.body as any).metadata.content.length, 50);
+    assert.deepEqual(
+      (maximumCreate?.body as any).metadata.content.reduce((counts: Record<string, number>, item: any) => ({ ...counts, [item.type]: (counts[item.type] || 0) + 1 }), {}),
+      { image_url: 30, video_url: 10, audio_url: 10 },
+    );
+
+    const tooMany = Array.from({ length: 31 }, (_value, index) => imageRef(`data:image/png;base64,${Buffer.from(`image-${index}`).toString("base64")}`));
+    fixture.resetCalls();
+    await assert.rejects(fixture.provider.submitVideoTask({
+      prompt: "too many references",
+      duration: 4,
+      resolution: "480p",
+      aspectRatio: "16:9",
+      mode: model.mode,
+      referenceList: tooMany,
+    }, model), /数量超限|模式数量/);
+    assert.equal(fixture.calls.length, 0);
   });
 
   it("keeps submit and query as separate public task contracts", async (t) => {

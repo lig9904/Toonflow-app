@@ -1,25 +1,16 @@
 import express from "express";
 import u from "@/utils";
-import { z } from "zod";
 import { success } from "@/lib/responseFormat";
-import { validateFields } from "@/middleware/middleware";
-const router = express.Router();
+import { deleteNovel, deleteNovels } from "@/services/projectContent";
+import { humanActor, requestUserId, sendProjectContentError } from "@/services/projectContent/http";
+import { requireProjectAccess } from "@/services/team";
 
-// 删除原文
-export default router.post(
-  "/",
-  validateFields({
-    id: z.number(),
-  }),
-  async (req, res) => {
-    const { id } = req.body;
-
-    const chapterData = await u.db("o_eventChapter").where("novelId", id);
-    await u.db("o_eventChapter").where("novelId", id).delete();
-    const eventIds = chapterData.map((i) => i.id);
-    if (eventIds.length) await u.db("o_event").whereIn("id", eventIds).delete();
-    await u.db("o_novel").where("id", id).del();
-
-    res.status(200).send(success({ message: "删除原文成功" }));
-  },
-);
+export default express.Router().post("/", async (req, res) => {
+  try {
+    await requireProjectAccess(u.db, requestUserId(req), req.body?.projectId, "delete");
+    const result = Array.isArray(req.body?.items)
+      ? await deleteNovels(u.db, req.body, humanActor(req))
+      : await deleteNovel(u.db, req.body, humanActor(req));
+    return res.send(success(result));
+  } catch (error) { return sendProjectContentError(res, error); }
+});

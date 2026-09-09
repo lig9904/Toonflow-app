@@ -4,12 +4,14 @@ import { z } from "zod";
 import { success } from "@/lib/responseFormat";
 import { validateFields } from "@/middleware/middleware";
 import { resolveVideoReferenceMediaType } from "@/lib/videoPromptReferences";
+import { getCreativeState } from "@/services/creativeWorkspace";
+import { readBoundAudioReferences } from "@/services/roleAudioWorkspace";
 const router = express.Router();
 
 interface VideoItem {
   id: number;
   src: string;
-  state: "未生成" | "生成中" | "已完成" | "生成失败";
+  state: "未生成" | "生成中" | "已完成" | "生成失败" | "需人工核对";
 }
 
 interface TrackMedia {
@@ -21,6 +23,7 @@ interface TrackMedia {
 
 interface TrackItem {
   id?: number;
+  version: number;
   prompt: string;
   state: "未生成" | "生成中" | "已完成" | "生成失败";
   reason?: string;
@@ -101,34 +104,22 @@ export default router.post(
         .whereIn("o_assets2Storyboard.storyboardId", storyIds as number[])
         .select("o_assets.*", "o_image.filePath", "o_image.type as storedFileType", "o_assets2Storyboard.storyboardId");
 
-      const queryAudioIds = [...assetDatas.map((i) => i.id!), ...assetDatas.map((i) => i.assetsId!)].filter(Boolean);
-      const assets2AudioData = await u
-        .db("o_assetsRole2Audio")
-        .leftJoin("o_assets", "o_assets.assetsId", "o_assetsRole2Audio.assetsAudioId")
-        .leftJoin("o_image", "o_image.id", "o_assets.imageId")
-        .whereIn("o_assetsRole2Audio.assetsRoleId", queryAudioIds)
-        .select(
-          "o_assets.id",
-          "o_assets.name",
-          "o_assetsRole2Audio.assetsRoleId",
-          "o_assets.describe",
-          "o_assets.type",
-          "o_assets.prompt",
-          "o_image.filePath",
-        );
+      const queryAudioIds = [...new Set([...assetDatas.filter((item) => item.type === "role").map((item) => Number(item.id)), ...assetDatas.filter((item) => item.type === "role" && item.assetsId).map((item) => Number(item.assetsId))])];
+      const ownedRoles = queryAudioIds.length ? await u.db("o_assets").where({ projectId, type: "role" }).whereIn("id", queryAudioIds).select("id") : [];
+      const assets2AudioData = ownedRoles.length ? await readBoundAudioReferences(u.db, projectId, ownedRoles.map((item) => Number(item.id))) : [];
       const audioRecord: Record<string, any> = {};
       await Promise.all(
         assets2AudioData.map(async (i) => {
-          if (!audioRecord[i.assetsRoleId]) audioRecord[i.assetsRoleId] = [];
-          audioRecord[i.assetsRoleId].push({
+          if (!audioRecord[i.roleAssetId]) audioRecord[i.roleAssetId] = [];
+          audioRecord[i.roleAssetId].push({
             id: i.id,
             name: i.name,
             describe: i.describe,
-            type: i.type,
+            type: "audio",
             fileType: "audio" as const,
             sources: "assets",
             prompt: i.prompt,
-            src: i.filePath ? await u.oss.getFileUrl(i.filePath) : "",
+            src: await u.oss.getFileUrl(i.filePath),
           });
         }),
       );
@@ -164,6 +155,7 @@ export default router.post(
       const item = trackData.find((t) => t.id === trackId);
       trackList.push({
         id: trackId,
+        version: (await getCreativeState(u.db, "track", trackId, projectId)).version,
         duration: item?.duration ?? 0,
         prompt: item?.prompt || "",
         state: (item?.state as "未生成" | "生成中" | "已完成" | "生成失败") ?? "未生成",
@@ -183,7 +175,8 @@ export default router.post(
           // 有 audioReference 时，按数量截取 audio 类型资产
           const audioCountMap: Record<string, number> = {};
           const filteredAssets = uniqueAssets.filter((a) => {
-            if (a.fileType !== "audio" || audioReferenceCount === 0) return true;
+            if (a.fileType !== "audio") return true;
+            if (audioReferenceCount === 0) return false;
             const key = String(a.id);
             audioCountMap[key] = (audioCountMap[key] ?? 0) + 1;
             // 统计当前 track 内 audio 总数，超过上限则过滤
@@ -202,7 +195,7 @@ export default router.post(
             .map(async (v) => ({
               id: v.id!,
               src: v.filePath ? await u.oss.getFileUrl(v.filePath) : "",
-              state: v.state === "已完成" ? "已完成" : v.state === "生成中" ? "生成中" : v.state === "生成失败" ? "生成失败" : "未生成",
+              state: v.state === "已完成" || v.state === "生成成功" ? "已完成" : v.state === "生成中" ? "生成中" : v.state === "需人工核对" ? "需人工核对" : v.state === "生成失败" ? "生成失败" : "未生成",
               errorReason: v?.errorReason ?? "",
             })),
         ),

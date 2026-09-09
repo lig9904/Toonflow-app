@@ -26,8 +26,11 @@ export async function loadOwnedVideoReferences(
       return { type: "image" as const, base64: await toBase64(row.filePath) };
     }
     const row = await db("o_assets")
+      .join("o_scriptAssets as scriptAsset", "scriptAsset.assetId", "o_assets.id")
+      .join("o_script as script", "script.id", "scriptAsset.scriptId")
       .leftJoin("o_image", "o_assets.imageId", "o_image.id")
       .where("o_assets.id", item.id).where("o_assets.projectId", projectId)
+      .where("script.id", scriptId).where("script.projectId", projectId)
       .select("o_image.filePath", "o_image.type").first();
     if (!row?.filePath) throw new VideoJobError("PROJECT_MISMATCH", "资产引用不属于当前项目或没有媒体文件");
     return {

@@ -27,14 +27,16 @@ export async function readProductionFlow(db: Knex, projectId: number, scriptId: 
     const links = await trx("o_assets2Storyboard").whereIn("storyboardId", storyboards.map((row) => row.id)).orderBy(isPostgres(trx) ? "id" : "rowid");
     const states = await trx("ext_entity_state").where({ projectId, entityType: "storyboard" })
       .whereIn("entityId", storyboards.map((row) => row.id));
-    return { script, saved, assets, storyboards, links, states };
+    const assetStates = await trx.schema.hasTable("ext_creative_state") ? await trx("ext_creative_state").where({ projectId, entityType: "asset" }).whereIn("entityId", assets.map((row) => row.id)) : [];
+    return { script, saved, assets, storyboards, links, states, assetStates };
   });
   let cached: Record<string, any> = {};
   try { cached = JSON.parse(rows.saved?.data || "{}"); } catch { /* damaged planning must not hide existing entities */ }
   if (!cached || typeof cached !== "object" || Array.isArray(cached)) cached = {};
   const url = async (file: string | null) => { try { return file ? await getUrl(file) : ""; } catch { return ""; } };
   const shapeAsset = async (row: any) => ({
-    id: row.id, assetsId: row.assetsId, name: row.name ?? "", type: row.type ?? "", prompt: row.prompt ?? "",
+    id: row.id, assetsId: row.assetsId, imageId: row.imageId, name: row.name ?? "", type: row.type ?? "", prompt: row.prompt ?? "",
+    version: Number(rows.assetStates.find((state) => Number(state.entityId) === Number(row.id))?.version ?? 0),
     desc: row.describe ?? "", src: await url(row.filePath), flowId: row.flowId,
     state: row.state ?? "未生成", errorReason: row.errorReason ?? "",
   });

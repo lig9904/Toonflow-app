@@ -17,7 +17,8 @@ export default router.post(
     const videoList = await u
       .db("o_video")
       .whereIn("id", videoIds)
-      .whereIn("state", ["生成成功", "生成失败"])
+      .where({ projectId, scriptId })
+      .whereIn("state", ["生成成功", "已完成", "生成失败", "需人工核对"])
       .select("id", "state", "errorReason", "filePath");
     res.status(200).send(
       success(

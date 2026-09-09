@@ -4,8 +4,11 @@ import axios from "axios";
 import { transform } from "sucrase";
 import u from "@/utils";
 import { createPersistentVideoTaskProvider, type PersistentVideoTaskProvider } from "@/lib/persistentVideoAdapter";
+import { textExecutionOptions } from "@/lib/textExecutionOptions";
+import { createPersistentImageTaskProvider, type PersistentImageTaskProvider } from "@/lib/persistentImageAdapter";
+import { resolveRegisteredImageModel, type ResolvedImageModel } from "@/lib/imageModelSelection";
 
-type AiType =
+export type AiType =
   | "scriptAgent"
   | "productionAgent"
   | "universalAi"
@@ -162,6 +165,7 @@ export type { PersistentVideoTaskProvider } from "@/lib/persistentVideoAdapter";
 export async function getPersistentVideoTaskProvider(key: `${string}:${string}`): Promise<PersistentVideoTaskProvider> {
   const modelName = await resolveModelName(key);
   const { id, selectedModel, running, enabled } = await loadVendorRuntime(modelName);
+  if (selectedModel.type !== "video") throw new Error("所选模型不是视频模型");
   return createPersistentVideoTaskProvider({
     vendorId: id,
     modelName: selectedModel.modelName,
@@ -172,6 +176,42 @@ export async function getPersistentVideoTaskProvider(key: `${string}:${string}`)
     runtime: running,
     submitVideoTask: running.submitVideoTask,
     queryVideoTask: running.queryVideoTask,
+  });
+}
+
+/** Non-secret capabilities for the same configured model used by the Web. */
+export async function getConfiguredMediaModel(key: string, type: "image" | "video"): Promise<Record<string, any>> {
+  const resolved = await resolveModelName(key as `${string}:${string}`);
+  const { selectedModel, enabled } = await loadVendorRuntime(resolved);
+  if (!enabled || selectedModel.type !== type) throw new Error("模型未启用或媒体类型不匹配");
+  return { modelName: selectedModel.modelName, type: selectedModel.type, mode: selectedModel.mode,
+    audio: selectedModel.audio, durationResolutionMap: selectedModel.durationResolutionMap };
+}
+
+/** Resolve a configured image model from the enabled vendor's registered metadata. */
+export async function resolveConfiguredImageModel(key: string, referenceCount: number): Promise<ResolvedImageModel> {
+  const requestedKey = await resolveModelName(key as `${string}:${string}`);
+  const [id] = requestedKey.split(/:(.+)/);
+  const vendorConfigData = await u.db("o_vendorConfig").where("id", id).first();
+  if (!vendorConfigData) throw new Error(`未找到供应商配置 id=${id}`);
+  const models = await u.vendor.getModelList(id);
+  return resolveRegisteredImageModel({ requestedKey, providerEnabled: vendorConfigData.enable === 1, models, referenceCount });
+}
+
+export async function getPersistentImageTaskProvider(key: `${string}:${string}`): Promise<PersistentImageTaskProvider> {
+  const modelName = await resolveModelName(key);
+  const { id, selectedModel, running, enabled } = await loadVendorRuntime(modelName);
+  if (selectedModel.type !== "image") throw new Error("所选模型不是图片模型");
+  return createPersistentImageTaskProvider({
+    vendorId: id,
+    modelName: selectedModel.modelName,
+    endpoint: String(running.vendor?.inputValues?.baseUrl ?? running.vendor?.inputValues?.endpoint ?? ""),
+    model: selectedModel,
+    enabled,
+    persistentImageTaskVersion: running.persistentImageTaskVersion,
+    runtime: running,
+    submitImageTask: running.submitImageTask,
+    queryImageTask: running.queryImageTask,
   });
 }
 
@@ -234,22 +274,20 @@ class AiText {
     const config = await getModelConfig(this.AiType);
 
     return generateText({
-      ...(input.tools && { stopWhen: stepCountIs(Object.keys(input.tools).length * 50) }),
+      ...(input.tools && { stopWhen: stepCountIs(12) }),
       ...input,
       model: await this.resolveModel(),
-      ...(config?.temperature && { temperature: config.temperature }),
-      ...(config?.maxOutputTokens && { maxOutputTokens: config.maxOutputTokens }),
+      ...textExecutionOptions(input, config),
     } as Parameters<typeof generateText>[0]);
   }
   async stream(input: Omit<Parameters<typeof streamText>[0], "model">) {
     const config = await getModelConfig(this.AiType);
 
     return streamText({
-      ...(input.tools && { stopWhen: stepCountIs(Object.keys(input.tools).length * 50) }),
+      ...(input.tools && { stopWhen: stepCountIs(12) }),
       ...input,
       model: await this.resolveModel(extractReasoningMiddleware({ tagName: "reasoning_content", separator: "\n" })),
-      ...(config?.temperature && { temperature: config.temperature }),
-      ...(config?.maxOutputTokens && { maxOutputTokens: config.maxOutputTokens }),
+      ...textExecutionOptions(input, config),
     } as Parameters<typeof streamText>[0]);
   }
 }

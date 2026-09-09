@@ -1,43 +1,11 @@
 import express from "express";
-import { success } from "@/lib/responseFormat";
 import u from "@/utils";
-import { z } from "zod";
-import { validateFields } from "@/middleware/middleware";
-import { insertRowsReturningIds } from "@/lib/insertRows";
-const router = express.Router();
+import { createScriptWorkspaceHandlers } from "@/services/creativeWorkspace/http";
+import { requireProjectAccess } from "@/services/team";
 
-export default router.post(
-  "/",
-  validateFields({
-    projectId: z.number(),
-    agentType: z.enum(["scriptAgent"]),
-  }),
-  async (req, res) => {
-    const { projectId, agentType } = req.body;
-    const row = await u.db("o_agentWorkData").where({ projectId: projectId, key: agentType }).first();
-
-    if (!row) {
-      const [id] = await insertRowsReturningIds(u.db, "o_agentWorkData", {
-        projectId: projectId,
-        key: agentType,
-        data: JSON.stringify({
-          storySkeleton: "",
-          adaptationStrategy: "",
-        }),
-      });
-      return res.status(200).send(
-        success({
-          data: {
-            storySkeleton: "",
-            adaptationStrategy: "",
-          },
-          id
-        }),
-      );
-    }
-    const data = JSON.parse(row.data ?? "{}");
-    data.script = await u.db("o_script").where({ projectId }).select("id", "name", "content");
-
-    res.status(200).send(success({ data, id: row.id }));
-  },
-);
+const handlers = createScriptWorkspaceHandlers(u.db, async (req, projectId, action) => {
+  const userId = Number((req as any).user?.id);
+  await requireProjectAccess(u.db, userId, projectId, action);
+  return { id: `human:${userId}`, kind: "human" };
+});
+export default express.Router().post("/", handlers.get);

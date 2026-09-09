@@ -17,6 +17,8 @@ interface VideoConfig { duration: number; resolution: string; aspectRatio: `${nu
 interface PollResult { completed: boolean; data?: string; error?: string; }
 interface VideoSubmitResult { taskId: string; }
 interface VideoQueryResult { status: "pending" | "succeeded" | "failed"; outputUrl?: string; error?: string; }
+interface ImageSubmitResult { taskId: string; }
+interface ImageQueryResult { status: "pending" | "succeeded" | "failed"; outputUrl?: string; error?: string; }
 
 declare const axios: any;
 declare const createOpenAICompatible: any;
@@ -33,13 +35,14 @@ declare const clearTimeout: (id: any) => void;
 declare const exports: any;
 
 const persistentVideoTaskVersion = 1;
+const persistentImageTaskVersion = 1;
 
 const vendor: Vendor = {
   id: "zhenzhenRelay",
-  version: "2.0",
+  version: "2.1",
   name: "贞贞模型中转（Seedance NZ）",
   author: "lig9904",
-  description: "贞贞模型中转，预置 8 个文本、4 个 Seedream/Dola 图片和 18 个 Seedance 2.0 视频模型。文本可手动添加本站其他 Chat 模型；其他图片、视频模型需要对应适配。1080p 视频属于该站超分计费档。",
+  description: "贞贞模型中转，预置 8 个文本、4 个 Seedream/Dola 图片、18 个 Seedance 2.0 和 6 个 Seedance 2.5 Standard 视频模型。文本可手动添加本站其他 Chat 模型；其他图片、视频模型需要对应适配。1080p/2k/4k 视频属于该站超分计费档。",
   inputs: [
     { key: "apiKey", label: "API密钥", type: "password", required: true, placeholder: "Seedance NZ API Key" },
     { key: "baseUrl", label: "请求地址", type: "url", required: true, placeholder: "https://api.seedance.nz" },
@@ -64,12 +67,17 @@ const vendor: Vendor = {
 
 function videoModels(): VideoModel[] {
   const result: VideoModel[] = [];
+  const seedance20Durations = Array.from({ length: 12 }, (_value, index) => index + 4);
+  const seedance25Durations = Array.from({ length: 27 }, (_value, index) => index + 4);
   for (const globalPrefix of ["", "global-"]) {
     for (const tier of ["standard", "fast", "mini"]) {
-      result.push({ name: `Seedance 2.0 ${globalPrefix ? "Global " : ""}${tier} T2V`, modelName: `seedance-2.0-${globalPrefix}${tier}-t2v`, type: "video", mode: ["text"], audio: "optional", durationResolutionMap: [{ duration: [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], resolution: ["480p", "720p", "1080p"] }] });
-      result.push({ name: `Seedance 2.0 ${globalPrefix ? "Global " : ""}${tier} I2V`, modelName: `seedance-2.0-${globalPrefix}${tier}-i2v`, type: "video", mode: ["endFrameOptional"], audio: "optional", durationResolutionMap: [{ duration: [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], resolution: ["480p", "720p", "1080p"] }] });
-      result.push({ name: `Seedance 2.0 ${globalPrefix ? "Global " : ""}${tier} Multi`, modelName: `seedance-2.0-${globalPrefix}${tier}-multi`, type: "video", mode: [["imageReference:9", "videoReference:3", "audioReference:3"]], audio: "optional", durationResolutionMap: [{ duration: [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], resolution: ["480p", "720p", "1080p"] }] });
+      result.push({ name: `Seedance 2.0 ${globalPrefix ? "Global " : ""}${tier} T2V`, modelName: `seedance-2.0-${globalPrefix}${tier}-t2v`, type: "video", mode: ["text"], audio: "optional", durationResolutionMap: [{ duration: seedance20Durations, resolution: ["480p", "720p", "1080p"] }] });
+      result.push({ name: `Seedance 2.0 ${globalPrefix ? "Global " : ""}${tier} I2V`, modelName: `seedance-2.0-${globalPrefix}${tier}-i2v`, type: "video", mode: ["endFrameOptional"], audio: "optional", durationResolutionMap: [{ duration: seedance20Durations, resolution: ["480p", "720p", "1080p"] }] });
+      result.push({ name: `Seedance 2.0 ${globalPrefix ? "Global " : ""}${tier} Multi`, modelName: `seedance-2.0-${globalPrefix}${tier}-multi`, type: "video", mode: [["imageReference:9", "videoReference:3", "audioReference:3"]], audio: "optional", durationResolutionMap: [{ duration: seedance20Durations, resolution: ["480p", "720p", "1080p"] }] });
     }
+    result.push({ name: `Seedance 2.5 ${globalPrefix ? "Global " : ""}Standard T2V`, modelName: `seedance-2.5-${globalPrefix}standard-t2v`, type: "video", mode: ["text"], audio: "optional", durationResolutionMap: [{ duration: seedance25Durations, resolution: ["480p", "720p", "1080p", "2k", "4k", "native1080p"] }] });
+    result.push({ name: `Seedance 2.5 ${globalPrefix ? "Global " : ""}Standard I2V`, modelName: `seedance-2.5-${globalPrefix}standard-i2v`, type: "video", mode: ["endFrameOptional"], audio: "optional", durationResolutionMap: [{ duration: seedance25Durations, resolution: ["480p", "720p", "1080p", "2k", "4k", "native1080p"] }] });
+    result.push({ name: `Seedance 2.5 ${globalPrefix ? "Global " : ""}Standard Multi`, modelName: `seedance-2.5-${globalPrefix}standard-multi`, type: "video", mode: [["imageReference:30", "videoReference:10", "audioReference:10"]], audio: "optional", durationResolutionMap: [{ duration: seedance25Durations, resolution: ["480p", "720p", "1080p", "2k", "4k", "native1080p"] }] });
   }
   return result;
 }
@@ -133,13 +141,15 @@ async function jsonRequest(url: string, init: RequestInit, timeoutMs = 55_000): 
   return data;
 }
 function modelKind(modelName: string): "t2v" | "i2v" | "multi" {
-  const match = modelName.match(/^seedance-2\.0-(?:global-)?(?:standard|fast|mini)-(t2v|i2v|multi)$/);
+  const match = modelName.match(/^seedance-(?:2\.0-(?:global-)?(?:standard|fast|mini)|2\.5-(?:global-)?standard)-(t2v|i2v|multi)$/);
   if (match) return match[1] as "t2v" | "i2v" | "multi";
   throw new Error(`未适配的 Seedance 视频模型: ${modelName}`);
 }
+function isSeedance25(modelName: string): boolean { return /^seedance-2\.5-(?:global-)?standard-(?:t2v|i2v|multi)$/.test(modelName); }
 function validRatio(value: string): boolean { return ["16:9", "4:3", "1:1", "3:4", "9:16", "21:9", "adaptive"].includes(value); }
-function seconds(value: number): string {
-  if (!Number.isInteger(value) || value < 4 || value > 15) throw new Error("Seedance 2.0 时长仅支持 4~15 秒整数");
+function seconds(value: number, modelName: string): string {
+  const max = isSeedance25(modelName) ? 30 : 15;
+  if (!Number.isInteger(value) || value < 4 || value > max) throw new Error(`Seedance ${isSeedance25(modelName) ? "2.5" : "2.0"} 时长仅支持 4~${max} 秒整数`);
   return String(value);
 }
 function dataUrl(value: string): { mime: string; bytes: any } {
@@ -203,10 +213,11 @@ function validateReferenceSet(refs: Reference[], kind: "image" | "i2v" | "multi"
   }
   if (refs.length < 1) throw new Error("Seedance Multi 至少需要一个参考素材");
   const counts = { image: 0, video: 0, audio: 0 };
+  const maxima = isSeedance25(modelName) ? { image: 30, video: 10, audio: 10 } : { image: 9, video: 3, audio: 3 };
   const domesticFast = modelName === "seedance-2.0-fast-multi";
   refs.forEach((ref, index) => {
     counts[ref.type] += 1;
-    if (counts.image > 9 || counts.video > 3 || counts.audio > 3) throw new Error("Seedance Multi 参考素材数量超限");
+    if (counts.image > maxima.image || counts.video > maxima.video || counts.audio > maxima.audio) throw new Error("Seedance Multi 参考素材数量超限");
     const info = dataUrl(ref.base64);
     if (ref.type === "image") { if (!/^image\/(jpeg|jpg|png|webp)$/.test(info.mime)) throw new Error(`多模态图片参考${index + 1} MIME 不支持`); if (info.bytes.length > 30 * 1024 * 1024) throw new Error(`多模态图片参考${index + 1}超过30MB限制`); }
     if (ref.type === "video") { if (info.mime !== "video/mp4") throw new Error("Seedance Multi 只支持 MP4 参考视频"); if (info.bytes.length > 50 * 1024 * 1024) throw new Error(`多模态视频参考${index + 1}超过50MB限制`); }
@@ -224,7 +235,7 @@ function imageDimensions(size: "1K" | "2K", ratio: string): [number, number] {
   const scale = size === "2K" ? 2 : 1;
   return [base[0] * scale, base[1] * scale];
 }
-const imageRequest = async (config: ImageConfig, model: ImageModel): Promise<string> => {
+const submitImageTask = async (config: ImageConfig, model: ImageModel): Promise<ImageSubmitResult> => {
   if (!imageModels.has(model.modelName)) throw new Error(`未适配的 Seedream 图片模型: ${model.modelName}`);
   const isI2I = /-i2i$/.test(model.modelName);
   const refs = config.referenceList || [];
@@ -242,14 +253,26 @@ const imageRequest = async (config: ImageConfig, model: ImageModel): Promise<str
   const body: any = { model: model.modelName, prompt: config.prompt, metadata: { width, height, output_format: "jpeg" } };
   if (images.length) body.images = images;
   const created = await jsonRequest(`${baseUrl()}/v1/image/generations`, { method: "POST", headers: headers(), body: JSON.stringify(body) }, remaining(deadline));
-  const taskId = taskIdentifier(created.task_id || created.id);
+  return { taskId: taskIdentifier(created.task_id || created.id) };
+};
+
+const queryImageTask = async (input: { taskId: string }): Promise<ImageQueryResult> => {
+  const taskId = taskIdentifier(input?.taskId);
+  const data = await jsonRequest(`${baseUrl()}/v1/image/generations/${encodeURIComponent(taskId)}`, { method: "GET", headers: headers(false) }, 15_000);
+  const task = data.data || data;
+  if (["NOT_START", "SUBMITTED", "IN_PROGRESS"].includes(task.status)) return { status: "pending" };
+  if (task.status === "SUCCESS") return { status: "succeeded", outputUrl: mediaUrl(task.result_url || task.data?.content?.image_url, "图片结果") };
+  if (task.status === "FAILURE") return { status: "failed", error: safeError(task.fail_reason || "图片生成失败") };
+  throw new Error("图片任务返回了未知状态");
+};
+
+const imageRequest = async (config: ImageConfig, model: ImageModel): Promise<string> => {
+  const submitted = await submitImageTask(config, model);
   const result = await pollTask(async () => {
-    const data = await jsonRequest(`${baseUrl()}/v1/image/generations/${encodeURIComponent(taskId)}`, { method: "GET", headers: headers(false) }, 15_000);
-    const task = data.data || data;
-    if (["NOT_START", "SUBMITTED", "IN_PROGRESS"].includes(task.status)) return { completed: false };
-    if (task.status === "SUCCESS") return { completed: true, data: mediaUrl(task.result_url || task.data?.content?.image_url, "图片结果") };
-    if (task.status === "FAILURE") return { completed: true, error: safeError(task.fail_reason || "图片生成失败") };
-    throw new Error("图片任务返回了未知状态");
+    const queried = await queryImageTask({ taskId: submitted.taskId });
+    if (queried.status === "pending") return { completed: false };
+    if (queried.status === "succeeded") return { completed: true, data: queried.outputUrl };
+    return { completed: true, error: queried.error || "图片生成失败" };
   }, 3_000, 30 * 60_000);
   if (result.error || !result.data) throw new Error(result.error || "图片任务成功但未返回 URL");
   return result.data;
@@ -269,8 +292,9 @@ const submitVideoTask = async (config: VideoConfig, model: VideoModel): Promise<
   if (prompt.length > 20_480) throw new Error("Seedance prompt 最长 20480 字符");
   const refs = config.referenceList || [];
   if (!Array.isArray(refs)) throw new Error("参考素材必须是数组");
-  const body: any = { model: model.modelName, prompt, seconds: seconds(config.duration), metadata: { resolution: config.resolution, ratio: config.aspectRatio, generate_audio: config.audio !== false } };
-  if (!["480p", "720p", "1080p"].includes(config.resolution)) throw new Error("本适配器仅支持 480p/720p/1080p");
+  const body: any = { model: model.modelName, prompt, seconds: seconds(config.duration, model.modelName), metadata: { resolution: config.resolution, ratio: config.aspectRatio, generate_audio: config.audio !== false } };
+  const resolutions = isSeedance25(model.modelName) ? ["480p", "720p", "1080p", "2k", "4k", "native1080p"] : ["480p", "720p", "1080p"];
+  if (!resolutions.includes(config.resolution)) throw new Error(`Seedance ${isSeedance25(model.modelName) ? "2.5" : "2.0"} 分辨率不受支持`);
   if (kind === "t2v") {
     if (refs.length) throw new Error("Seedance T2V 不接受参考素材");
   } else if (kind === "i2v") {
@@ -281,10 +305,11 @@ const submitVideoTask = async (config: VideoConfig, model: VideoModel): Promise<
     for (let index = 0; index < refs.length; index++) body.images.push(await uploadReference(refs[index], index + 1, deadline, 30 * 1024 * 1024));
   } else {
     validateReferenceSet(refs, "multi", model.modelName);
+    const maxima = isSeedance25(model.modelName) ? { image: 30, video: 10, audio: 10 } : { image: 9, video: 3, audio: 3 };
     const limits: Record<string, number> = {};
     for (const item of modeItems) {
       const [type, limit] = item.split("Reference:");
-      const maximum = type === "image" ? 9 : 3;
+      const maximum = maxima[type as keyof typeof maxima];
       if (limits[type] !== undefined || Number(limit) > maximum) throw new Error("多参考模式数量配置无效");
       limits[type] = Number(limit);
     }
@@ -330,10 +355,13 @@ const ttsRequest = async (_config: any, _model: any): Promise<string> => { throw
 exports.vendor = vendor;
 exports.textRequest = textRequest;
 exports.imageRequest = imageRequest;
+exports.submitImageTask = submitImageTask;
+exports.queryImageTask = queryImageTask;
 exports.videoRequest = videoRequest;
 exports.submitVideoTask = submitVideoTask;
 exports.queryVideoTask = queryVideoTask;
 exports.ttsRequest = ttsRequest;
 exports.persistentVideoTaskVersion = persistentVideoTaskVersion;
+exports.persistentImageTaskVersion = persistentImageTaskVersion;
 
 export {};

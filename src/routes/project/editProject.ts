@@ -1,44 +1,18 @@
 import express from "express";
 import u from "@/utils";
-import { z } from "zod";
 import { success } from "@/lib/responseFormat";
-import { validateFields } from "@/middleware/middleware";
-const router = express.Router();
+import { listConfigurationDirectories, loadEnabledProjectModels, updateProject } from "@/services/projectContent";
+import { humanActor, requestUserId, sendProjectContentError } from "@/services/projectContent/http";
+import { requireProjectAccess } from "@/services/team";
 
-// 新增项目
-export default router.post(
-  "/",
-  validateFields({
-    id: z.number(),
-    name: z.string(),
-    intro: z.string(),
-    type: z.string(),
-    artStyle: z.string(),
-    directorManual: z.string(),
-    videoRatio: z.string(),
-    imageModel: z.string(),
-    videoModel: z.string(),
-    projectType: z.string(),
-    imageQuality: z.string(),
-    mode: z.string(),
-  }),
-  async (req, res) => {
-    const { id, name, intro, type, artStyle, videoRatio, directorManual, imageModel, videoModel, imageQuality, projectType, mode } = req.body;
-
-    await u.db("o_project").where("id", id).update({
-      name,
-      intro,
-      type,
-      artStyle,
-      videoRatio,
-      directorManual,
-      imageModel,
-      videoModel,
-      imageQuality,
-      projectType,
-      mode,
+export default express.Router().post("/", async (req, res) => {
+  try {
+    await requireProjectAccess(u.db, requestUserId(req), req.body?.id, "edit");
+    const metadata = async () => ({
+      models: await loadEnabledProjectModels(u.db, (vendorId) => u.vendor.getModelList(vendorId)),
+      artStyles: listConfigurationDirectories(u.getPath(["skills", "art_skills"])),
+      directorManuals: listConfigurationDirectories(u.getPath(["skills", "story_skills"])),
     });
-
-    res.status(200).send(success({ message: "编辑项目成功" }));
-  },
-);
+    return res.send(success(await updateProject(u.db, req.body, humanActor(req), metadata)));
+  } catch (error) { return sendProjectContentError(res, error); }
+});

@@ -3,6 +3,7 @@ import { success, error } from "@/lib/responseFormat";
 import { validateFields } from "@/middleware/middleware";
 import u from "@/utils";
 import { z } from "zod";
+import { upsertVendorModel } from "@/lib/vendorModelConfig";
 const router = express.Router();
 
 export default router.post(
@@ -47,19 +48,16 @@ export default router.post(
     const { id, modelName, model } = req.body;
 
     const models = await u.db("o_vendorConfig").where("id", id).first("models");
-    if (models?.models) {
-      const existingModels = JSON.parse(models.models);
-      const modelIndex = existingModels.findIndex((m: any) => m.modelName !== modelName);
-      if (modelIndex === -1) {
-        existingModels.push(model);
-      }
-      existingModels[modelIndex] = model;
+    if (!models) return res.status(404).send(error("供应商不存在"));
+    try {
       await u
         .db("o_vendorConfig")
         .where("id", id)
         .update({
-          models: JSON.stringify(existingModels),
+          models: upsertVendorModel(models.models, modelName, model),
         });
+    } catch (updateError) {
+      return res.status(400).send(error(updateError instanceof Error ? updateError.message : "模型配置无效"));
     }
     res.status(200).send(success("更新成功"));
   },

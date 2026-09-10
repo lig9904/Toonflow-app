@@ -332,3 +332,24 @@ test("maxConcurrentRuns bounds local polling claims", options, async () => {
     await Promise.all([first, second]);
   } finally { await f.destroy(); }
 });
+
+test("failed structured output records provider usage and diagnostics without committing an artifact", options, async () => {
+  const { StructuredModelOutputError } = await import("../src/lib/structuredModelOutput");
+  const f = await fixture();
+  try {
+    let saved = false;
+    const runtime = new BuiltinAgentRuntime({ db: f.db, authorize: async () => undefined, execute: async (ctx) => {
+      await ctx.step("director", {}, async () => { throw new StructuredModelOutputError("MODEL_OUTPUT_LIMIT", { role: "productionAgent:directorPlanAgent", finishReason: "length", maxOutputTokens: 5100, outputTokens: 5100, reasoningTokens: 3000, textCharacters: 900 }); }, { modelCall: true });
+      saved = true;
+    } });
+    const created = await runtime.create({ agentType: "productionAgent", projectId: 1, requestedBy: 1, prompt: "fixture", idempotencyKey: "output-failure-usage", limits: { maxModelCalls: 2, maxToolSteps: 4, maxOutputTokens: 12000, maxImageGenerations: 0, maxVideoGenerations: 0 } });
+    await runtime.runOnce();
+    const run = await runtime.get(created.run.id);
+    assert.equal(run.status, "failed"); assert.equal(run.errorCode, "MODEL_OUTPUT_LIMIT"); assert.equal(run.outputTokens, 5100);
+    assert.equal(saved, false); assert.equal(run.modelCalls, 1);
+    const events = await runtime.events(run.id);
+    assert(events.some(e => e.type === "model.output.failed" && (e.data as any).finishReason === "length"));
+    const step = await f.db("ext_builtin_run_steps").where({ runId: run.id, stepKey: "director" }).first();
+    assert.equal(step.outputTokens, 5100); assert.equal(step.status, "started");
+  } finally { await f.destroy(); }
+});

@@ -8,6 +8,7 @@ import { createProductionAgentExecutor, type ProductionMediaCapability } from ".
 import type { StructuredScriptModel } from "../src/services/builtinAgent/scriptExecutor";
 import { defaultBuiltinRunLimits } from "../src/services/builtinAgent/contracts";
 import { ensureCreativeWorkspaceSchema } from "../src/services/creativeWorkspace";
+import { saveProductionPlanning } from "../src/services/productionFlow";
 
 const options = { skip: !process.env.TOONFLOW_TEST_DATABASE_URL };
 
@@ -90,13 +91,14 @@ test("director planning is server-owned and unrequested media is never called", 
   const f = await fixture();
   try {
     const mediaCalls: string[] = [];
+    await saveProductionPlanning(f.db, f.projectId, f.scriptId, 0, { scriptPlan: "previous plan", storyboardTable: "human table" });
     const media: ProductionMediaCapability = { generateImage: async () => { mediaCalls.push("image"); return { status: "succeeded", jobId: 1 }; }, generateVideo: async () => { mediaCalls.push("video"); return { status: "succeeded", jobId: 2 }; } };
-    const model = modelFor((request) => request.role === "productionAgent:decisionAgent" ? { actions: ["planning"], assetIds: [], storyboardIds: [], question: null, summary: "plan" } : { scriptPlan: "server plan", storyboardTable: "server table" }, []);
+    const model = modelFor((request) => request.role === "productionAgent:decisionAgent" ? { actions: ["planning"], assetIds: [], storyboardIds: [], question: null, summary: "plan" } : { scriptPlan: "server plan" }, []);
     const result = await runOnce(f, model, media);
     assert.equal(result.run.status, "succeeded");
     assert.deepEqual(mediaCalls, []);
     const saved = await f.db("o_agentWorkData").where({ projectId: f.projectId, episodesId: f.scriptId, key: "productionAgent" }).first();
-    assert.deepEqual(JSON.parse(saved.data), { scriptPlan: "server plan", storyboardTable: "server table", planningVersion: 1 });
+    assert.deepEqual(JSON.parse(saved.data), { scriptPlan: "server plan", storyboardTable: "human table", planningVersion: 2 });
   } finally { await f.destroy(); }
 });
 
@@ -218,5 +220,54 @@ test("human question pauses and continuation resumes under a new revision", opti
     await agent.runOnce();
     const finished = await agent.get(created.run.id);
     assert.equal(finished.status, "succeeded", finished.errorMessage ?? "");
+  } finally { await f.destroy(); }
+});
+
+test("legacy aliases execute once, 18 shots save atomically with a table, and unused tokens reach the long shot step", options, async () => {
+  const f = await fixture();
+  try {
+    const calls: string[] = [];
+    const model: StructuredScriptModel = { async generate(request) {
+      calls.push(request.role);
+      if (request.role === "productionAgent:decisionAgent") {
+        assert(!request.system.includes("run_sub_agent"));
+        return { value: request.schema.parse({ actions: ["planning", "directorPlan", "storyboardTable", "storyboard"], assetIds: [], storyboardIds: [], question: null, summary: "CLAIM_ALREADY_SAVED" }), outputTokens: 100 };
+      }
+      if (request.role === "productionAgent:directorPlanAgent") return { value: request.schema.parse({ scriptPlan: "Compact director plan" }), outputTokens: 1000 };
+      assert.equal(request.role, "productionAgent:storyboardTableAgent");
+      assert.equal(request.maxOutputTokens, 10900, "Use actual remaining tokens instead of a fixed half-budget");
+      return { value: request.schema.parse({ items: Array.from({ length: 18 }, (_, index) => ({ id: null, expectedVersion: null, prompt: `Shot ${index + 1}`, videoDesc: `Action ${index + 1}`, duration: index < 6 ? 4 : 3, track: `shot-${index}`, shouldGenerateImage: 0, associateAssetsIds: [f.assetId] })), summary: "shots" }), outputTokens: 6000 };
+    } };
+    const result = await runOnce(f, model);
+    assert.equal(result.run.status, "succeeded", result.run.errorMessage ?? "");
+    assert.equal(calls.length, 3);
+    assert.equal(result.run.outputTokens, 7100);
+    const shots = await f.db("o_storyboard").where({ projectId: f.projectId, scriptId: f.scriptId });
+    assert.equal(shots.length, 18);
+    assert.equal(shots.reduce((sum, row) => sum + Number(row.duration), 0), 60);
+    const planning = JSON.parse((await f.db("o_agentWorkData").where({ projectId: f.projectId, episodesId: f.scriptId, key: "productionAgent" }).first()).data);
+    assert.equal(planning.scriptPlan, "Compact director plan");
+    assert.match(planning.storyboardTable, /Shot 18/);
+    const events = await result.agent.events(result.run.id);
+    assert(!JSON.stringify(events).includes("CLAIM_ALREADY_SAVED"));
+    assert.equal(result.run.imageGenerations, 0); assert.equal(result.run.videoGenerations, 0);
+  } finally { await f.destroy(); }
+});
+
+test("upgrading the old varchar workspace preserves data and accepts long serialized plans", options, async () => {
+  const { ensureBaseSchema } = await import("../src/lib/initDB");
+  const f = await fixture();
+  try {
+    const oldData = JSON.stringify({ scriptPlan: "existing", storyboardTable: "old", planningVersion: 1 });
+    await f.db("o_agentWorkData").insert({ projectId: f.projectId, episodesId: f.scriptId, key: "productionAgent", data: oldData });
+    await f.db.raw('ALTER TABLE "o_agentWorkData" ALTER COLUMN "data" TYPE varchar(255)');
+    await ensureBaseSchema(f.db);
+    assert.equal((await f.db("o_agentWorkData").columnInfo("data")).type, "text");
+    assert.equal((await f.db("o_agentWorkData").where({ projectId: f.projectId, key: "productionAgent" }).first()).data, oldData);
+    const longPlan = "Detailed director planning. ".repeat(1000);
+    await saveProductionPlanning(f.db, f.projectId, f.scriptId, 1, { scriptPlan: longPlan, storyboardTable: "old" });
+    assert.equal(JSON.parse((await f.db("o_agentWorkData").where({ projectId: f.projectId, key: "productionAgent" }).first()).data).scriptPlan, longPlan);
+    await ensureBaseSchema(f.db);
+    assert.equal((await f.db("o_user").where({ id: 1 }).first()).name, "admin");
   } finally { await f.destroy(); }
 });

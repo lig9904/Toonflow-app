@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import type { Knex } from "knex";
 import { lockProjectTransaction } from "../../lib/dbTransaction";
+import { StructuredModelOutputError } from "../../lib/structuredModelOutput";
 import {
   defaultBuiltinRunLimits,
   type BuiltinAgentType,
@@ -52,6 +53,7 @@ export interface BuiltinExecutionContext {
   readonly signal: AbortSignal;
   emit(type: string, data: unknown): Promise<BuiltinRunEvent>;
   assertActive(): Promise<void>;
+  remainingOutputTokens?(): Promise<number>;
   waitForHuman(question: string, data?: unknown): Promise<void>;
   step<T>(
     key: string,
@@ -617,6 +619,12 @@ export class BuiltinAgentRuntime {
     return {
       run,
       signal: controller.signal,
+      remainingOutputTokens: async () => {
+        await this.assertForMutation(run.id, epoch, controller);
+        const row = await this.db<RunRow>(RUNS).where({ id: run.id }).first();
+        if (!row) throw new BuiltinRuntimeError("NOT_FOUND", "Builtin run not found");
+        return Math.max(0, limitsOf(row.limits).maxOutputTokens - int(row.outputTokens));
+      },
       assertActive: async () => {
         if (controller.signal.aborted) throw new BuiltinRuntimeError("LEASE_LOST", "Run executor was invalidated");
         const row = await this.db<RunRow>(RUNS).where({ id: run.id }).first();
@@ -694,6 +702,7 @@ export class BuiltinAgentRuntime {
     try {
       result = await perform();
     } catch (error) {
+      if (options.modelCall && error instanceof StructuredModelOutputError) await this.recordModelOutputFailure(run.id, epoch, key, error);
       if (options.sideEffect) await this.markUncertain(run.id, epoch, key, error);
       throw error;
     }
@@ -786,6 +795,22 @@ export class BuiltinAgentRuntime {
     });
   }
 
+  private async recordModelOutputFailure(runId: string, epoch: number, key: string, error: StructuredModelOutputError): Promise<void> {
+    try {
+      await this.db.transaction(async (trx) => {
+        const row = await this.lockActiveRun(trx, runId, epoch);
+        const step = await trx<StepRow>(STEPS).where({ runId, stepKey: key }).forUpdate().first();
+        if (!step || step.status !== "started" || int(step.startedEpoch) !== epoch || step.startedOwner !== this.workerId || step.result != null) return;
+        const tokens = error.diagnostics.outputTokens ?? 0;
+        await trx(STEPS).where({ runId, stepKey: key }).update({ result: jsonValue({ modelOutputFailure: error.diagnostics }), outputTokens: tokens, updatedAt: this.now() });
+        // This is usage already reported by the provider, even if JSON validation
+        // failed. Preserve the actual count instead of treating failure as free.
+        if (tokens > 0) await trx(RUNS).where({ id: runId }).increment("outputTokens", tokens);
+        await this.insertEvent(trx, runId, int(row.lastSequence) + 1, "model.output.failed", { key, code: error.code, ...error.diagnostics }, this.now(), int(row.version));
+      });
+    } catch { /* A later owner/control state must not be changed by this result. */ }
+  }
+
   private async markUncertain(runId: string, epoch: number, key: string, error: unknown): Promise<void> {
     try {
       await this.db.transaction(async (trx) => {
@@ -806,9 +831,10 @@ export class BuiltinAgentRuntime {
         const version = int(row.version) + 1;
         const revoked = ["FORBIDDEN", "USER_DISABLED", "ROLE_FORBIDDEN", "PROJECT_ACTION_FORBIDDEN"].includes((error as { code?: string })?.code ?? "");
         const status = revoked ? "paused" : "failed";
-        await trx(RUNS).where({ id: runId }).update({ status, version, leaseOwner: null, leaseUntil: null, errorCode: revoked ? "AUTHORITY_REVOKED" : error instanceof BuiltinRuntimeError ? error.code : "EXECUTION_FAILED", errorMessage: errorMessage(error), updatedAt: this.now() });
+        const failureCode = error instanceof BuiltinRuntimeError || error instanceof StructuredModelOutputError ? error.code : "EXECUTION_FAILED";
+        await trx(RUNS).where({ id: runId }).update({ status, version, leaseOwner: null, leaseUntil: null, errorCode: revoked ? "AUTHORITY_REVOKED" : failureCode, errorMessage: errorMessage(error), updatedAt: this.now() });
         await this.insertEvent(trx, runId, int(row.lastSequence) + 1, "run.status", { status, reason: revoked ? "authority_revoked" : undefined }, this.now(), version);
-        await this.insertEvent(trx, runId, int(row.lastSequence) + 2, "run.error", { code: error instanceof BuiltinRuntimeError ? error.code : "EXECUTION_FAILED", message: errorMessage(error) }, this.now(), version);
+        await this.insertEvent(trx, runId, int(row.lastSequence) + 2, "run.error", { code: failureCode, message: errorMessage(error) }, this.now(), version);
       });
     } catch { /* lease was lost or control already changed the run */ }
   }

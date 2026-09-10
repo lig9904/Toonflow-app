@@ -12,6 +12,7 @@ import { createAssetExtractionHelper } from "./assetExtraction";
 import { getCreativeState } from "../creativeWorkspace";
 import pLimit from "p-limit";
 import { builtinThinkLevelFromIntent } from "./contracts";
+import { productionActionLabels, productionDecisionPrompt, productionStageContract } from "./productionPrompts";
 
 export interface ProductionMediaRequest {
   ctx: BuiltinExecutionContext;
@@ -47,7 +48,7 @@ const planSchema = z.object({
   summary: z.string().max(4000),
   videoSettings: z.object({ resolution: z.string().max(50).nullable().default(null), audio: z.boolean().nullable().default(null) }).strict().nullable().default(null),
 }).strict();
-const planningSchema = z.object({ scriptPlan: z.string().max(200_000), storyboardTable: z.string().max(200_000) }).strict();
+const planningSchema = z.object({ scriptPlan: z.string().min(1).max(200_000) }).strict();
 const deriveSchema = z.object({ assets: z.array(z.object({ id: z.number().int().positive().nullable().default(null), expectedVersion: z.number().int().nonnegative().nullable().default(null), parentAssetId: z.number().int().positive(), name: z.string().trim().min(1).max(500), description: z.string().max(20_000) }).strict()).max(500) }).strict();
 const storyboardSchema = z.object({
   items: z.array(z.object({
@@ -55,7 +56,7 @@ const storyboardSchema = z.object({
     prompt: z.string().max(20_000), duration: z.number().positive().max(300), track: z.string().trim().min(1).max(100),
     videoDesc: z.string().max(20_000), shouldGenerateImage: z.number().int().min(0).max(1),
     associateAssetsIds: z.array(z.number().int().positive()).max(100), expectedVersion: z.number().int().nonnegative().nullable().default(null),
-  }).strict()).max(500),
+  }).strict()).min(1).max(500),
   summary: z.string().max(4000),
 }).strict();
 const reviewSchema = z.object({ findings: z.array(z.string().max(4000)).max(100), summary: z.string().max(4000) }).strict();
@@ -86,30 +87,37 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
     let flow = await ctx.step(`production.flow:r${revision}`, { projectId, scriptId }, () => readProductionFlow(deps.db, projectId, scriptId, async (path) => path));
     const skillCache = new Map<string, string>();
     const skill = async (name: string) => { if (!skillCache.has(name)) skillCache.set(name, await deps.loadSkill(name)); return skillCache.get(name)!; };
-    const model = async <T>(key: string, role: StructuredModelRequest<T>["role"], skillName: string, schema: z.ZodType<T>, input: unknown, budget: number): Promise<T> => {
+    const model = async <T>(key: string, role: StructuredModelRequest<T>["role"], skillName: string, schema: z.ZodType<T>, input: unknown, budget: number, reserveTokens = 0): Promise<T> => {
       if (budget < 128) throw new BuiltinRuntimeError("BUDGET_EXCEEDED", "输出额度不足以执行制作阶段");
       await ctx.assertActive();
-      const system = `${await skill(skillName)}\n\n执行协议：只返回 schema 定义的结构化数据，不输出 XML，不直接操作界面，不声称已保存。所有项目、剧集、素材、分镜 ID 必须来自输入。`;
-      const result = await ctx.step(`production.${key}:r${revision}`, { input, role, systemHash: hash(system), budget }, async () => {
-        const generated = await deps.model.generate({ role, system, input, schema, maxOutputTokens: budget, signal: ctx.signal, thinkLevel });
+      const system = role === "productionAgent:decisionAgent" ? productionDecisionPrompt
+        : `${await skill(skillName)}\n\n当前服务器执行契约（取代上述旧工具、XML和前端保存流程）：${productionStageContract(role)} 所有项目、剧集、素材、分镜 ID 必须来自输入。`;
+      const result = await ctx.step(`production.${key}:r${revision}`, { input, role, systemHash: hash(system), budget, reserveTokens }, async () => {
+        const remaining = ctx.remainingOutputTokens ? await ctx.remainingOutputTokens() : run.limits.maxOutputTokens;
+        const effectiveBudget = Math.min(budget, remaining - reserveTokens);
+        if (effectiveBudget < 128) throw new BuiltinRuntimeError("BUDGET_EXCEEDED", "本次运行的剩余文本输出额度不足，请缩小下一步范围；已保存结果保留");
+        const generated = await deps.model.generate({ role, system, input, schema, maxOutputTokens: effectiveBudget, signal: ctx.signal, thinkLevel });
         return { value: schema.parse(generated.value), outputTokens: generated.outputTokens };
       }, { modelCall: true });
       return result.value;
     };
     const planBudget = Math.min(1800, Math.floor(run.limits.maxOutputTokens / 3));
-    const plan = await model("plan", "productionAgent:decisionAgent", "production_agent_decision.md", planSchema, { request: requestText, project, flow, rules: "只选择用户明确要求的阶段；程序按固定顺序执行。generation 阶段必须列出真实 storyboardIds。review 只读。" }, planBudget);
-    const actions: CanonicalPhase[] = plan.actions.map(canonical);
-    if (new Set(actions).size !== actions.length) throw new BuiltinRuntimeError("INVALID_INPUT", "制作规划包含重复阶段");
+    const plan = await model("plan", "productionAgent:decisionAgent", "production_agent_decision.md", planSchema, { request: requestText, project, flow,
+      authorization: { maxImageGenerations: run.limits.maxImageGenerations, maxVideoGenerations: run.limits.maxVideoGenerations } }, planBudget);
+    // Compatibility names describe the same operation, so canonicalize once.
+    const requestedActions = new Set(plan.actions.map(canonical));
+    const actions: CanonicalPhase[] = ORDER.filter((action) => requestedActions.has(action));
     let knownTopAssets = new Set(flow.assets.map((asset: any) => Number(asset.id)));
     let knownAssets = new Set(flow.assets.flatMap((asset: any) => [Number(asset.id), ...asset.derive.map((child: any) => Number(child.id))]));
     let knownStoryboards = new Map(flow.storyboard.map((storyboard: any) => [Number(storyboard.id), storyboard]));
     if (plan.assetIds.some((id) => !knownAssets.has(id)) || plan.storyboardIds.some((id) => !knownStoryboards.has(id))) throw new BuiltinRuntimeError("INVALID_INPUT", "制作规划引用了项目外实体");
     if (plan.question) { await ctx.emit("message.completed", { text: plan.question }); await ctx.waitForHuman(plan.question, { projectId, scriptId }); }
-    await ctx.emit("message.completed", { text: plan.summary });
+    await ctx.emit("message.completed", { text: actions.length ? `准备执行：${actions.map((action) => productionActionLabels[action]).join("、")}。保存完成后会显示实际产物。` : "本轮未执行制作步骤，也未写入数据。" });
     const selected = new Set(actions);
     const remainingBudget = run.limits.maxOutputTokens - planBudget;
     if (remainingBudget < actions.length * 128) throw new BuiltinRuntimeError("BUDGET_EXCEEDED", "输出额度不足以执行所选制作阶段");
-    const budget = Math.floor(remainingBudget / Math.max(1, actions.length));
+    const textActionCount = actions.filter((action) => action !== "generateImages" && action !== "generateVideos").length;
+    const budget = Math.floor(remainingBudget / Math.max(1, textActionCount));
     const output: Record<string, unknown> = { projectId, scriptId, revision, actions };
     let targetAssetIds = [...new Set(plan.assetIds)];
     let targetStoryboardIds = [...new Set(plan.storyboardIds)];
@@ -124,13 +132,13 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
         knownTopAssets = new Set(flow.assets.map((asset: any) => Number(asset.id)));
         knownAssets = new Set(flow.assets.flatMap((asset: any) => [Number(asset.id), ...asset.derive.map((child: any) => Number(child.id))]));
       } else if (action === "planning") {
-        const planResult = await model("directorPlan", "productionAgent:directorPlanAgent", "production_execution_director_plan.md", planningSchema, { request: requestText, project, flow }, budget);
-        const saved = await ctx.commit(`production.planning:r${revision}`, { projectId, scriptId, expected: flow.planningVersion, planResult }, (trx) => saveProductionPlanning(trx as unknown as Knex, projectId, scriptId, flow.planningVersion, planResult));
+        const planResult = await model("directorPlan", "productionAgent:directorPlanAgent", "production_execution_director_plan.md", planningSchema, { request: requestText, project, flow }, textActionCount > 1 ? Math.min(4096, budget) : budget);
+        const saved = await ctx.commit(`production.planning:r${revision}`, { projectId, scriptId, expected: flow.planningVersion, planResult }, (trx) => saveProductionPlanning(trx as unknown as Knex, projectId, scriptId, flow.planningVersion, { scriptPlan: planResult.scriptPlan, storyboardTable: flow.storyboardTable }));
         output.planning = saved;
         flow = await readProductionFlow(deps.db, projectId, scriptId, async (path) => path);
         await ctx.emit("artifact.saved", { kind: "productionPlanning", ids: [projectId, scriptId], version: saved.planningVersion });
       } else if (action === "deriveAssets") {
-        if (!targetAssetIds.length) await ctx.waitForHuman("请指定需要创建衍生版本的顶层素材", { projectId, scriptId });
+        if (!targetAssetIds.length) await ctx.waitForHuman(`请指定需要分析衍生版本的素材名称或 ID，或回复“全部当前剧集素材”。可选素材示例：${flow.assets.slice(0, 20).map((asset: any) => `${String(asset.name ?? "未命名").slice(0, 80)}（ID ${asset.id}）`).join("、") || "当前剧集尚未关联基础素材"}`, { projectId, scriptId });
         const derived = await model("deriveAssets", "productionAgent:deriveAssetsAgent", "production_execution_derive_assets.md", deriveSchema, { request: requestText, project, flow, parentAssetIds: targetAssetIds }, budget);
         const created = await ctx.commit(`production.assets:r${revision}`, { projectId, scriptId, derived }, async (trx) => {
           const ids: unknown[] = [];
@@ -148,8 +156,11 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
         flow = await readProductionFlow(deps.db, projectId, scriptId, async (path) => path);
         knownTopAssets = new Set(flow.assets.map((asset: any) => Number(asset.id)));
         knownAssets = new Set(flow.assets.flatMap((asset: any) => [Number(asset.id), ...asset.derive.map((child: any) => Number(child.id))]));
+        if (targetAssetIds.length) await ctx.emit("artifact.saved", { kind: "assets", ids: targetAssetIds });
+        else await ctx.emit("message.completed", { text: "衍生素材分析完成，本次没有新增或更新衍生版本。" });
       } else if (action === "storyboard") {
-        const storyboard = await model("storyboard", "productionAgent:storyboardTableAgent", "production_execution_storyboard_table.md", storyboardSchema, { request: requestText, project, flow, selectedStoryboardIds: plan.storyboardIds }, budget);
+        // Long shot lists can use tokens left over from the compact director plan.
+        const storyboard = await model("storyboard", "productionAgent:storyboardTableAgent", "production_execution_storyboard_table.md", storyboardSchema, { request: requestText, project, flow, selectedStoryboardIds: plan.storyboardIds }, run.limits.maxOutputTokens, selected.has("review") ? 1024 : 0);
         const created = await ctx.commit(`production.storyboard.commit:r${revision}`, { projectId, scriptId, storyboard }, async (trx) => {
           const additions: NewStoryboard[] = [];
           const existingIds: number[] = [];
@@ -180,6 +191,10 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
             }});
           }
           const newIds = additions.length ? await addProductionStoryboards(trx as unknown as Knex, projectId, scriptId, additions) : [];
+          const rows = await trx("o_storyboard").where({ projectId, scriptId }).orderBy("index").orderBy("id").select("id", "prompt", "videoDesc", "duration");
+          const cell = (value: unknown) => String(value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\|/g, "\\|").replace(/\r?\n/g, "<br>");
+          const table = ["| 镜头 | ID | 时长（秒） | 画面 | 视频描述 |", "|---|---|---|---|---|", ...rows.map((row, index) => `| ${index + 1} | ${row.id} | ${cell(row.duration)} | ${cell(row.prompt)} | ${cell(row.videoDesc)} |`)].join("\n");
+          await saveProductionPlanning(trx as unknown as Knex, projectId, scriptId, flow.planningVersion, { scriptPlan: flow.scriptPlan, storyboardTable: table });
           return [...existingIds, ...newIds];
         });
         output.storyboardIds = created;

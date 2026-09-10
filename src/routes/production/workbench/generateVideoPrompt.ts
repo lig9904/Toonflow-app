@@ -1,212 +1,67 @@
 import express from "express";
+import { videoPromptSystem } from "@/lib/videoPromptContract";
 import u from "@/utils";
 import { z } from "zod";
 import { success, error } from "@/lib/responseFormat";
 import { validateFields } from "@/middleware/middleware";
 import fs from "fs/promises";
 import path from "path";
-import {
-  buildSeedance2AssetReferenceContext,
-  formatLegacyVideoPromptAssetList,
-  isSeedance2Model,
-  type VideoPromptAssetReference,
-} from "@/lib/videoPromptReferences";
+import { isSeedance2Model } from "@/lib/videoPromptReferences";
+import { executeVideoPromptJob, markVideoPromptPreparationFailed, prepareVideoPromptJob } from "@/services/videoPromptJobs";
+
 const router = express.Router();
+const infoSchema = z.object({ id: z.number().int().positive(), sources: z.enum(["storyboard", "assets"]), fileType: z.enum(["image", "video", "audio"]).optional() });
+
+async function promptSystem(model: string, mode: string): Promise<string | undefined> {
+  const [vendorId, modelName] = model.split(/:(.+)/);
+  const bound = await u.db("o_modelPrompt").where("vendorId", vendorId).where("model", modelName).first();
+  let system: string | undefined;
+  if (bound) {
+    try { system = await fs.readFile(path.join(u.getPath(["modelPrompt"]), String(bound.path)), "utf-8"); } catch {}
+  }
+  if (!system) {
+    const lower = (modelName ?? "").toLowerCase();
+    const fileName = lower.includes("wan") && lower.includes("2.6")
+      ? "wan2.6Single-imageFirstFrameMode.md"
+      : isSeedance2Model(lower)
+        ? "seedance2Multi-parameterMode.md"
+        : mode === "startEndRequired" || mode === "endFrameOptional" || mode === "startFrameOptional"
+          ? "universalFirstAndLastFrameMode.md"
+          : typeof mode === "string" && mode.startsWith("[\"") && mode.endsWith("\"]")
+            ? "universalMulti-parameterMode.md"
+            : null;
+    if (fileName) {
+      try { system = await fs.readFile(path.join(u.getPath(["modelPrompt"]), "video", fileName), "utf-8"); } catch {}
+    }
+  }
+  if (system) return system;
+  const fallback = await u.db("o_prompt").where("type", "videoPromptGeneration").first();
+  return fallback?.useData || fallback?.data || undefined;
+}
 
 export default router.post(
   "/",
   validateFields({
-    trackId: z.number(),
-    projectId: z.number(),
-    info: z.array(
-      z.object({
-        id: z.number(),
-        sources: z.string(),
-        fileType: z.enum(["image", "video", "audio"]).optional(),
-      }),
-    ),
-    model: z.string(),
-    mode: z.string(),
+    projectId: z.number(), scriptId: z.number(), trackId: z.number(), info: z.array(infoSchema), model: z.string(), mode: z.string(), idempotencyKey: z.string().min(8).max(150),
   }),
   async (req, res) => {
-    const { trackId, projectId, info, model, mode } = req.body;
-    await u.db("o_videoTrack").where({ id: trackId }).update({
-      state: "生成中",
-    });
-    //查询参数
-    const images = await Promise.all(
-      info.map(async (item: { id: number; sources: string; fileType?: "image" | "video" | "audio" }) => {
-        if (item.sources === "storyboard") {
-          // 查询分镜主信息
-          const storyboard = await u
-            .db("o_storyboard")
-            .where("o_storyboard.id", item.id)
-            .select("videoDesc", "prompt", "track", "duration", "shouldGenerateImage")
-            .first();
-          // 查询分镜关联的资产ID
-          const assetRows = await u.db("o_assets2Storyboard").where("storyboardId", item.id).orderBy("id").select("assetId");
-          const associateAssetsIds = assetRows.map((row: any) => row.assetId);
-          return {
-            ...storyboard,
-            associateAssetsIds,
-            _type: "storyboard", // 标记类型，便于后续区分
-          };
-        }
-        if (item.sources === "assets") {
-          // 查询素材
-          const assetsData = await u
-            .db("o_assets")
-            .leftJoin("o_image", "o_image.id", "o_assets.imageId")
-            .where("o_assets.id", item.id)
-            .select("o_assets.id", "o_assets.type", "o_assets.name", "o_image.filePath", "o_image.type as storedFileType")
-            .first();
-          return {
-            ...assetsData,
-            mediaType: item.fileType ?? assetsData?.storedFileType,
-            _type: "assets", // 标记类型
-          };
-        }
-      }),
-    );
-
-    // 拆分 assets 和 storyboard
-    const assets: VideoPromptAssetReference[] = [];
-    const storyboard: any[] = [];
-    for (const item of images) {
-      if (!item) continue; // 忽略空
-      if (item._type === "assets")
-        assets.push({
-          id: item.id,
-          type: item.type,
-          name: item.name,
-          filePath: item.filePath,
-          mediaType: item.mediaType,
-        });
-      if (item._type === "storyboard")
-        storyboard.push({
-          videoDesc: item.videoDesc,
-          prompt: item.prompt,
-          track: item.track,
-          duration: item.duration,
-          associateAssetsIds: item.associateAssetsIds,
-          shouldGenerateImage: item.shouldGenerateImage,
-        });
-    }
-    const assetsNotAudioIds = assets.filter((i) => i.type == "audio").map((i) => i.id);
-
-    const assets2Audio = await u
-      .db("o_assets")
-      .whereIn("o_assets.id", assetsNotAudioIds)
-      .join("o_assetsRole2Audio", "o_assetsRole2Audio.assetsAudioId", "o_assets.assetsId")
-      .select("o_assets.assetsId", "o_assets.id", "o_assetsRole2Audio.assetsAudioId", "o_assetsRole2Audio.assetsRoleId");
-
-    const assetsAudioRecord: Record<number, number> = {};
-    assets2Audio.forEach((i) => {
-      assetsAudioRecord[i.assetsRoleId!] = i.id!;
-    });
-
-    const [id, modelData] = model.split(/:(.+)/);
-    const projectData = await u.db("o_project").select("*").where({ id: projectId }).first();
-    const videoPrompt = await u.db("o_prompt").where("type", "videoPromptGeneration").first();
-    let videoPromptGeneration = "" as string | undefined;
-
-    const modelPromptData = await u.db("o_modelPrompt").where("vendorId", id).where("model", modelData).first();
-    //查询到 有绑定对应视频提示词
-    if (modelPromptData) {
-      const modelPromptRoot = u.getPath(["modelPrompt"]);
-      try {
-        const fullPath = path.join(modelPromptRoot, modelPromptData?.path!);
-        const content = await fs.readFile(fullPath, "utf-8");
-        videoPromptGeneration = content ?? "";
-      } catch {}
-    }
-
-    // 未查询到绑定，根据模型名称 + mode 自动匹配 modelPrompt/video/ 下的文件
-    if (!videoPromptGeneration) {
-      const modelPromptRoot = u.getPath(["modelPrompt"]);
-      const videoPromptDir = path.join(modelPromptRoot, "video");
-      const modelLower = (modelData ?? "").toLowerCase();
-
-      let fileName: string | null = null;
-
-      if (modelLower.includes("wan") && modelLower.includes("2.6")) {
-        // wan2.6 系列 => 单图首尾帧模式
-        fileName = "wan2.6Single-imageFirstFrameMode.md";
-      } else if (isSeedance2Model(modelData)) {
-        // seedance 2.0 / 2-0 系列
-        fileName = "seedance2Multi-parameterMode.md";
-      } else if (mode === "startEndRequired" || mode === "endFrameOptional" || mode === "startFrameOptional") {
-        // body.mode 为首尾帧相关 => 通用首尾帧模式
-        fileName = "universalFirstAndLastFrameMode.md";
-      } else if (typeof mode === "string" && mode.startsWith('["') && mode.endsWith('"]')) {
-        // 其他 => 通用多参模式
-        fileName = "universalMulti-parameterMode.md";
-      }
-      if (fileName) {
-        try {
-          const fullPath = path.join(videoPromptDir, fileName);
-          videoPromptGeneration = await fs.readFile(fullPath, "utf-8");
-        } catch {
-          // 文件不存在则忽略，继续用备选
-        }
-      }
-    }
-
-    //备选
-    if (!videoPromptGeneration) {
-      if (videoPrompt && videoPrompt.useData) {
-        videoPromptGeneration = videoPrompt.useData;
-      } else {
-        videoPromptGeneration = videoPrompt?.data ?? undefined;
-      }
-    }
-
-    const artStyle = projectData?.artStyle || "无";
-
-    const visualManual = u.getArtPrompt(artStyle, "art_skills", "art_storyboard_video");
-    const assetContext = isSeedance2Model(modelData)
-      ? buildSeedance2AssetReferenceContext(assets, assetsAudioRecord)
-      : `**资产信息**（角色、场景、道具、音频）:${formatLegacyVideoPromptAssetList(assets, assetsAudioRecord)}`;
-    const content = `
-          **模型名称**：${modelData},
-
-          ${assetContext},
-          **分镜信息**：${storyboard.map(
-            (i) => `<storyboardItem
-  videoDesc='${i.videoDesc}'
-  duration='${i.duration}'
-></storyboardItem>`,
-          )},
-          `;
-
+    const { trackId, projectId, scriptId, info, model, mode, idempotencyKey } = req.body;
     try {
-      const { text } = await u.Ai.Text("universalAi").invoke({
-        system: videoPromptGeneration,
-        messages: [
-          {
-            role: "assistant",
-            content: `${visualManual}`,
-          },
-          {
-            role: "user",
-            content: content,
-          },
-        ],
+      const project = await u.db("o_project").where({ id: projectId }).select("id", "artStyle").first();
+      if (!project) return res.status(400).send(error("项目不存在"));
+      const system = await promptSystem(model, mode);
+      const visualManual = u.getArtPrompt(project.artStyle || "无", "art_skills", "art_storyboard_video");
+      const prepared = await prepareVideoPromptJob(u.db, { projectId, scriptId, trackId, model, mode, info, idempotencyKey });
+      const result = await executeVideoPromptJob(u.db, prepared.job.id, async (job) => {
+        const response = await u.Ai.Text("universalAi").invoke({ system: videoPromptSystem(system), messages: [{ role: "assistant", content: visualManual }, { role: "user", content: `模型：${model}\n${job.promptInput}` }] });
+        return response.text;
       });
-      await u.db("o_videoTrack").where({ id: trackId }).update({
-        state: "已完成",
-        prompt: text,
-      });
-      res.status(200).send(success(text));
+      if (result.state === "running" || result.state === "queued") return res.status(202).send(success({ state: result.state, jobId: result.id }));
+      if (result.state === "failed") return res.status(400).send(error(result.reason ?? "提示词生成失败"));
+      return res.status(200).send(success(result.resultPrompt ?? ""));
     } catch (e) {
-      await u
-        .db("o_videoTrack")
-        .where({ id: trackId })
-        .update({
-          state: "生成失败",
-          reason: u.error(e).message,
-        });
-      res.status(400).send(error(u.error(e).message));
+      await markVideoPromptPreparationFailed(u.db, { projectId, scriptId, trackId }, u.error(e).message).catch(() => undefined);
+      return res.status(400).send(error(u.error(e).message));
     }
   },
 );

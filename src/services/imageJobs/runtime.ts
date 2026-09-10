@@ -6,6 +6,7 @@ import type { PersistentImageTaskProvider } from "../../lib/persistentImageAdapt
 import { ensureImageJobsSchema, ImageJobError, ImageJobService, type ImageJob } from ".";
 import { resolveImageFlowOwner, ImageFlowWorkspaceError } from "../imageFlowWorkspace";
 import { assertImageMediaProject, resolveImageMediaOwnership, MediaOwnershipError } from "../../lib/mediaOwnership";
+import { imageReferencesMatch, type ImageReferenceSnapshot } from "./referenceSnapshot";
 
 const BINDINGS = "ext_image_job_bindings";
 
@@ -26,6 +27,7 @@ export interface PrepareImageGenerationInput {
   };
   target: ImageGenerationTarget;
   builtinRun?: { id: string; inputRevision: number };
+  referenceAssets?: ImageReferenceSnapshot[];
   outputPath?: string;
 }
 
@@ -66,6 +68,7 @@ interface BindingContext {
   previousFilePath?: string | null;
   previousState?: string | null;
   builtinRun?: { id: string; inputRevision: number };
+  referenceAssets?: ImageReferenceSnapshot[];
 }
 
 interface BindingRow {
@@ -205,6 +208,7 @@ export class ImageGenerationService {
     const context = existing ? this.contextForExisting(existing, input) : {
       ...(await this.readBindingContext(input)), requestedModelKey: input.modelKey,
       ...(input.builtinRun ? { builtinRun: normalizeBuiltinRun(input.builtinRun) } : {}),
+      ...(input.referenceAssets ? { referenceAssets: input.referenceAssets } : {}),
     };
     const effectiveModelKey = existing?.modelKey ?? await this.resolveEffectiveModel(input.modelKey, input.config.referenceList?.length ?? 0);
     if (!existing && this.options.validateConfig) {
@@ -323,6 +327,7 @@ export class ImageGenerationService {
     if (stableJson(expectedTarget) !== stableJson(saved.target)) throw new ImageGenerationError("CONFLICT", "generationKey 已绑定不同的图片目标或版本", 409);
     if (input.modelKey !== (saved.requestedModelKey ?? job.modelKey)) throw new ImageGenerationError("CONFLICT", "generationKey 已绑定不同的请求图片模型", 409);
     if (stableJson(input.builtinRun ? normalizeBuiltinRun(input.builtinRun) : null) !== stableJson(saved.builtinRun ?? null)) throw new ImageGenerationError("CONFLICT", "generationKey 已绑定不同的内置运行版本", 409);
+    if (stableJson(input.referenceAssets ?? null) !== stableJson(saved.referenceAssets ?? null)) throw new ImageGenerationError("CONFLICT", "generationKey 已绑定不同的素材参考版本", 409);
     return saved as BindingContext;
   }
 
@@ -377,6 +382,7 @@ export class ImageGenerationService {
     await this.db.transaction(async (trx) => {
       await lockProjectTransaction(trx, job.projectId);
       if (await trx<BindingRow>(BINDINGS).where({ jobId: job.id }).first()) return;
+      if (!(await imageReferencesMatch(trx, job.projectId, context.referenceAssets))) throw new ImageGenerationError("VERSION_CONFLICT", "素材身份或参考图片已被修改，本次旧请求未提交", 409);
       const target = context.target;
       const now = this.now();
       const base = {
@@ -455,6 +461,7 @@ export class ImageGenerationService {
     binding = await trx<BindingRow>(BINDINGS).where({ jobId: job.id, projectId: job.projectId }).first();
     if (!binding) throw new ImageGenerationError("NOT_FOUND", "图片任务缺少目标绑定", 409);
     let selected = false;
+    const referencesCurrent = await imageReferencesMatch(trx, job.projectId, (job.payload.context as BindingContext | undefined)?.referenceAssets);
     if (binding.targetKind === "asset") {
       const candidateImageId = Number(binding.candidateImageId);
       await trx("o_image").where({ id: candidateImageId, assetsId: Number(binding.targetId) }).update({ filePath: job.outputPath, state: "已完成", errorReason: null });
@@ -469,7 +476,7 @@ export class ImageGenerationService {
       const id = Number(binding.targetId);
       const row = await trx("o_storyboard").where({ id, projectId: job.projectId, scriptId: binding.scriptId }).first();
       const state = await trx("ext_entity_state").where({ entityType: "storyboard", entityId: id, projectId: job.projectId }).first();
-      selected = Boolean(runMaySelect && row && state && !state.locked && Number(state.version) === Number(binding.claimVersion) && state.internalMutation === binding.claimToken && storyboardSignature({ ...row, state: binding.previousState, filePath: binding.previousFilePath }) === binding.targetSignature);
+      selected = Boolean(runMaySelect && referencesCurrent && row && state && !state.locked && Number(state.version) === Number(binding.claimVersion) && state.internalMutation === binding.claimToken && storyboardSignature({ ...row, state: binding.previousState, filePath: binding.previousFilePath }) === binding.targetSignature);
       if (selected) {
         await trx("o_storyboard").where({ id, projectId: job.projectId, scriptId: binding.scriptId }).update({ filePath: job.outputPath, state: "已完成", reason: null });
         await trx("ext_entity_state").where({ entityType: "storyboard", entityId: id, projectId: job.projectId, version: binding.claimVersion, internalMutation: binding.claimToken }).update({ version: Number(binding.claimVersion) + 1, internalMutation: null, updatedAt: this.now() });

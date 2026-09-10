@@ -187,6 +187,7 @@ export async function getPersistentVideoTaskProvider(key: `${string}:${string}`)
     enabled,
     persistentVideoTaskVersion: running.persistentVideoTaskVersion,
     runtime: running,
+    referenceTransport: running.vendor?.referenceTransport ?? selectedModel.referenceTransport,
     submitVideoTask: running.submitVideoTask,
     queryVideoTask: running.queryVideoTask,
   });
@@ -195,10 +196,11 @@ export async function getPersistentVideoTaskProvider(key: `${string}:${string}`)
 /** Non-secret capabilities for the same configured model used by the Web. */
 export async function getConfiguredMediaModel(key: string, type: "image" | "video"): Promise<Record<string, any>> {
   const resolved = await resolveModelName(key as `${string}:${string}`);
-  const { selectedModel, enabled } = await loadVendorRuntime(resolved);
+  const { selectedModel, running, enabled } = await loadVendorRuntime(resolved);
   if (!enabled || selectedModel.type !== type) throw new Error("模型未启用或媒体类型不匹配");
   return { modelName: selectedModel.modelName, type: selectedModel.type, mode: selectedModel.mode,
-    audio: selectedModel.audio, durationResolutionMap: selectedModel.durationResolutionMap, resolutions: selectedModel.resolutions };
+    audio: selectedModel.audio, durationResolutionMap: selectedModel.durationResolutionMap, resolutions: selectedModel.resolutions,
+    referenceRatio: selectedModel.referenceRatio, referenceTransport: running.vendor?.referenceTransport ?? selectedModel.referenceTransport };
 }
 
 /** Resolve a configured image model from the enabled vendor's registered metadata. */

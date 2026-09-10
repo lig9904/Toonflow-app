@@ -121,6 +121,10 @@ add("POST", ["/api/builtinAgent/control"], resource("edit", "ext_builtin_runs", 
 // intentionally kept beside the registry rather than inferred from route names.
 add("POST", ["/api/assets/getMaterialData", "/api/production/getStoryboardData", "/api/production/workbench/getGenerateData", "/api/production/workbench/getVideoList"], project("read", "projectId", [{ table: "o_script", field: "scriptId" }]));
 add("POST", ["/api/production/getFlowData"], project("read", "projectId", [{ table: "o_script", field: "episodesId" }]));
+add("POST", ["/api/production/workbench/getEditTimeline"], project("read", "projectId", [{ table: "o_script", field: "scriptId" }]));
+add("POST", ["/api/production/workbench/saveEditTimeline"], project("edit", "projectId", [{ table: "o_script", field: "scriptId" }]));
+add("POST", ["/api/production/workbench/generateVideoPrompt"], project("edit", "projectId", [{ table: "o_script", field: "scriptId" }, { table: "o_videoTrack", field: "trackId" }]));
+add("POST", ["/api/production/workbench/batchGeneratePrompt"], project("edit", "projectId", [{ table: "o_script", field: "scriptId" }, { table: "o_videoTrack", field: "trackData", many: true, nestedIdField: "trackId" }]));
 add("POST", ["/api/production/saveFlowData"], project("edit", "projectId", [{ table: "o_script", field: "episodesId" }]));
 add("POST", ["/api/production/editImage/uploadImage", "/api/production/workbench/addTrack", "/api/production/workbench/batchGenerateVideo", "/api/production/workbench/generateVideo"], project("edit", "projectId", [{ table: "o_script", field: "scriptId" }]));
 add("POST", ["/api/production/storyboard/addStoryboard", "/api/production/storyboard/batchAddStoryboardInfo"], project("edit", "projectId", [{ table: "o_script", field: "scriptId" }, { table: "o_assets", field: "data", many: true, nestedIdField: "associateAssetsIds", nestedMany: true, optional: true }]));

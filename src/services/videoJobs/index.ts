@@ -2,6 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import type { Knex } from "knex";
 import { lockProjectTransaction } from "@/lib/dbTransaction";
 import { insertRowsReturningIds } from "@/lib/insertRows";
+import { renewVideoReferenceConfigLeases } from "@/services/videoReferenceBridge";
+import getPath from "@/utils/getPath";
 
 export type VideoJobStatus =
   | "SUBMITTING"
@@ -52,6 +54,8 @@ export interface VideoJob {
 export interface VideoTaskProvider {
   /** Non-secret fingerprint of the endpoint and selected model binding. */
   fingerprint: string;
+  /** URL-capable providers receive signed project-scoped references. */
+  referenceTransport?: "base64" | "url";
   submit(config: unknown): Promise<{ taskId: string }>;
   query(taskId: string): Promise<{ status: "pending" | "succeeded" | "failed"; outputUrl?: string; error?: string }>;
 }
@@ -394,7 +398,16 @@ export class VideoJobService {
           await this.db.transaction((trx) => this.markReconciliation(trx, rowFromJob(job), "当前供应商端点或模型绑定已变化，不能提交旧保留任务"));
           return this.get(jobId);
         }
-        const submitted = await provider.submit(job.payload.config);
+        let submitConfig = job.payload.config;
+        if (provider.referenceTransport === "url") {
+          submitConfig = await renewVideoReferenceConfigLeases(this.db, submitConfig, {
+            rootDir: getPath("oss"),
+            publicOrigin: String(process.env.TOONFLOW_MEDIA_PUBLIC_ORIGIN || ""),
+            secret: String(process.env.TOONFLOW_MEDIA_BRIDGE_SECRET || ""),
+          });
+          job = { ...job, payload: { ...job.payload, config: submitConfig } };
+        }
+        const submitted = await provider.submit(submitConfig);
         if (!submitted?.taskId) throw new Error("上游未返回任务 ID");
         await this.db.transaction(async (trx) => {
           const updated = await trx("ext_video_jobs")
@@ -655,7 +668,23 @@ export class VideoJobService {
 }
 
 export function hashVideoJobRequest(payload: Pick<VideoJobPayload, "modelKey" | "projectId" | "scriptId" | "trackId" | "providerFingerprint" | "config">): string {
-  return createHash("sha256").update(stableJson(payload)).digest("hex");
+  return createHash("sha256").update(stableJson(normalizeVideoJobHashPayload(payload))).digest("hex");
+}
+
+/** Signed bridge URLs and their rotating expiries are delivery credentials,
+ * not business identity. Legacy base64 references remain byte-for-byte hashed. */
+function normalizeVideoJobHashPayload(payload: Pick<VideoJobPayload, "modelKey" | "projectId" | "scriptId" | "trackId" | "providerFingerprint" | "config">): typeof payload {
+  if (!payload.config || typeof payload.config !== "object" || Array.isArray(payload.config)) return payload;
+  const config = payload.config as Record<string, unknown>;
+  if (!Array.isArray(config.referenceList)) return payload;
+  const referenceList = config.referenceList.map((value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+    const reference = value as Record<string, unknown>;
+    if (typeof reference.url !== "string" || !/\/media-bridge\//.test(reference.url)) return value;
+    const { url: _url, leaseId: _leaseId, expiresAt: _expiresAt, ...stableReference } = reference;
+    return stableReference;
+  });
+  return { ...payload, config: { ...config, referenceList } };
 }
 
 function hashPayload(payload: VideoJobPayload): string {

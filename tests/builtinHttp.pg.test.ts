@@ -24,10 +24,10 @@ test("new production starts use independent model calls while explicit legacy to
     const input = { agentType: "productionAgent", projectId: f.projectId, scriptId, prompt: "全部生成", idempotencyKey: "production-independent-http", thinkLevel: 0, limits: { maxImageGenerations: 0, maxVideoGenerations: 0 } };
     const created = await f.post("/api/builtinAgent/start", input, cookie);
     assert.equal(created.status, 200, JSON.stringify(created.body));
-    assert.deepEqual(created.body.data.run.intent, { thinkLevel: 0, outputBudgetMode: "model_per_call" });
+    assert.deepEqual(created.body.data.run.intent, { mediaBudgetMode: "zero_unlimited", thinkLevel: 0, outputBudgetMode: "model_per_call" });
     assert.equal((await f.post("/api/builtinAgent/start", input, cookie)).body.data.reused, true);
     const legacy = await f.post("/api/builtinAgent/start", { ...input, idempotencyKey: "production-explicit-total-http", limits: { maxOutputTokens: 6000 } }, cookie);
-    assert.equal(legacy.status, 200); assert.deepEqual(legacy.body.data.run.intent, { thinkLevel: 0 });
+    assert.equal(legacy.status, 200); assert.deepEqual(legacy.body.data.run.intent, { mediaBudgetMode: "zero_unlimited", thinkLevel: 0 });
     assert.equal(legacy.body.data.run.limits.maxOutputTokens, 6000);
     assert.equal(created.body.data.run.limits.maxImageGenerations, 0); assert.equal(created.body.data.run.limits.maxVideoGenerations, 0);
     const forged = await f.post("/api/builtinAgent/start", { ...input, intent: { outputBudgetMode: "model_per_call" } }, cookie);
@@ -114,9 +114,9 @@ test("five independent cookie sessions share a project with real read/edit roles
     const createInput = { projectId: f.projectId, agentType: "scriptAgent", prompt: "Write an episode", idempotencyKey: "http-run-creation", thinkLevel: 2 };
     const create = await f.post("/api/builtinAgent/start", createInput, cookies[1]);
     assert.equal(create.status, 200, JSON.stringify(create.body));
-    assert.deepEqual(create.body.data.run.intent, { thinkLevel: 2 });
+    assert.deepEqual(create.body.data.run.intent, { mediaBudgetMode: "zero_unlimited", thinkLevel: 2 });
     const persisted = await f.db("ext_builtin_runs").where({ id: create.body.data.run.id }).first("intent");
-    assert.deepEqual(persisted.intent, { thinkLevel: 2 });
+    assert.deepEqual(persisted.intent, { mediaBudgetMode: "zero_unlimited", thinkLevel: 2 });
     const duplicate = await f.post("/api/builtinAgent/start", createInput, cookies[1]);
     assert.equal(duplicate.body.data.reused, true);
     const conflictingLevel = await f.post("/api/builtinAgent/start", { ...createInput, thinkLevel: 3 }, cookies[1]);
@@ -146,7 +146,7 @@ test("five independent cookie sessions share a project with real read/edit roles
     const legacyInput = { projectId: f.projectId, agentType: "scriptAgent", prompt: "Legacy start", idempotencyKey: "http-run-legacy-shape" };
     const legacy = await f.post("/api/builtinAgent/start", legacyInput, cookies[1]);
     assert.equal(legacy.status, 200);
-    assert.equal(legacy.body.data.run.intent, null);
+    assert.deepEqual(legacy.body.data.run.intent, { mediaBudgetMode: "zero_unlimited" });
     const legacyDuplicate = await f.post("/api/builtinAgent/start", legacyInput, cookies[1]);
     assert.equal(legacyDuplicate.body.data.reused, true);
   } finally { await f.close(); }

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 export interface PersistentVideoTaskProvider {
   fingerprint: string;
+  referenceTransport?: "base64" | "url";
   submit(config: unknown): Promise<{ taskId: string }>;
   query(taskId: string): Promise<{ status: "pending" | "succeeded" | "failed"; outputUrl?: string; error?: string }>;
 }
@@ -17,6 +18,7 @@ export interface PersistentVideoAdapterInput {
   queryVideoTask?: unknown;
   runtime?: unknown;
   timeoutMs?: number;
+  referenceTransport?: "base64" | "url";
 }
 
 export class PersistentVideoAdapterError extends Error {
@@ -43,11 +45,16 @@ export function createPersistentVideoTaskProvider(input: PersistentVideoAdapterI
   const queryFn = input.queryVideoTask as (taskId: string) => Promise<unknown>;
   const timeoutMs = input.timeoutMs ?? 60_000;
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1) throw new PersistentVideoAdapterError("持久化视频任务超时时间不合法");
+  const fingerprintInput: Record<string, unknown> = { vendorId: input.vendorId, endpoint: input.endpoint.replace(/\/+$/, ""), modelName: input.modelName };
+  // Preserve every legacy provider fingerprint byte-for-byte. Only a URL
+  // transport provider needs a distinct binding identity.
+  if (input.referenceTransport === "url") fingerprintInput.referenceTransport = "url";
   const fingerprint = createHash("sha256")
-    .update(JSON.stringify({ vendorId: input.vendorId, endpoint: input.endpoint.replace(/\/+$/, ""), modelName: input.modelName }))
+    .update(JSON.stringify(fingerprintInput))
     .digest("hex");
   return {
     fingerprint,
+    referenceTransport: input.referenceTransport ?? "base64",
     submit: async (config) => validateSubmit(await withTimeout(() => submitFn.call(input.runtime, config, input.model), timeoutMs)),
     query: async (taskId) => validateQuery(await withTimeout(() => queryFn.call(input.runtime, taskId), timeoutMs)),
   };

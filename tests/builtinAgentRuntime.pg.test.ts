@@ -9,6 +9,22 @@ import {
 
 const options = { skip: !process.env.TOONFLOW_TEST_DATABASE_URL };
 
+test("unlimited media is not secretly capped by the orchestration step allowance", options, async () => {
+  const f = await fixture();
+  const runtime = new BuiltinAgentRuntime({ db: f.db, authorize: async () => undefined, execute: async (ctx) => {
+    await ctx.step("prepare", {}, () => "ready");
+    for (let index = 0; index < 41; index++) await ctx.step(`image-${index}`, { index }, () => ({ jobId: index + 1, status: "succeeded" }), { imageGeneration: true });
+    return ctx.step("review", {}, () => "done");
+  } });
+  try {
+    const created = await runtime.create({ agentType: "productionAgent", projectId: 11, requestedBy: 1, prompt: "generate all", idempotencyKey: "unlimited-media-own-counter",
+      intent: { mediaBudgetMode: "zero_unlimited" }, limits: { maxModelCalls: 0, maxToolSteps: 2, maxOutputTokens: 10, maxImageGenerations: 0, maxVideoGenerations: 0 } });
+    await runtime.runOnce(); const run = await runtime.get(created.run.id);
+    assert.equal(run.status, "succeeded", run.errorMessage ?? "");
+    assert.equal(run.imageGenerations, 41); assert.equal(run.toolSteps, 2);
+  } finally { await runtime.stop(); await f.destroy(); }
+});
+
 test("resuming after media reconciliation reads the updated receipt without reserving another generation", options, async () => {
   const f = await fixture();
   let resolved = false, queries = 0;
@@ -27,6 +43,46 @@ test("resuming after media reconciliation reads the updated receipt without rese
     const done = await runtime.get(waiting.id);
     assert.equal(done.status, "succeeded"); assert.equal(done.imageGenerations, 1); assert.equal(queries, 2);
   } finally { await f.destroy(); }
+});
+
+test("public zero-unlimited intent bypasses only media zero limits while legacy zero remains blocked", options, async () => {
+  const f = await fixture();
+  let calls = 0;
+  const runtime = new BuiltinAgentRuntime({
+    db: f.db,
+    authorize: async () => undefined,
+    execute: async (ctx) => ctx.step(`image-${ctx.run.id}`, { run: ctx.run.id }, async () => {
+      calls += 1;
+      return { status: "succeeded" };
+    }, { imageGeneration: true }),
+  });
+  try {
+    const unlimited = await runtime.create({
+      agentType: "productionAgent", projectId: 11, requestedBy: 1, prompt: "new public run",
+      idempotencyKey: "media-zero-unlimited", intent: { mediaBudgetMode: "zero_unlimited" },
+      limits: { maxModelCalls: 0, maxToolSteps: 1, maxOutputTokens: 10, maxImageGenerations: 0, maxVideoGenerations: 0 },
+    });
+    await runtime.runOnce();
+    const unlimitedDone = await runtime.get(unlimited.run.id);
+    assert.equal(unlimitedDone.status, "succeeded");
+    assert.equal(unlimitedDone.imageGenerations, 1);
+    assert.equal(calls, 1);
+
+    const legacy = await runtime.create({
+      agentType: "productionAgent", projectId: 11, requestedBy: 1, prompt: "old run",
+      idempotencyKey: "media-zero-legacy",
+      limits: { maxModelCalls: 0, maxToolSteps: 1, maxOutputTokens: 10, maxImageGenerations: 0, maxVideoGenerations: 0 },
+    });
+    await runtime.runOnce();
+    const legacyDone = await runtime.get(legacy.run.id);
+    assert.equal(legacyDone.status, "failed");
+    assert.equal(legacyDone.errorCode, "BUDGET_EXCEEDED");
+    assert.equal(legacyDone.imageGenerations, 0);
+    assert.equal(calls, 1);
+  } finally {
+    await runtime.stop();
+    await f.destroy();
+  }
 });
 
 test("revoked authority pauses a run and another authorized team member can take over without changing its creator", options, async () => {

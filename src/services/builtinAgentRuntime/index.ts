@@ -11,6 +11,7 @@ import {
   type BuiltinRunStatus,
   type BuiltinRunView,
   type CreateBuiltinRun,
+  hasUnlimitedMediaBudget,
   hasIndependentProductionOutput,
 } from "../builtinAgent/contracts";
 
@@ -682,14 +683,24 @@ export class BuiltinAgentRuntime {
       // consumes no additional generation authorization after a lease change.
       const imageGeneration = Boolean(options.imageGeneration && !existing?.imageGeneration);
       const videoGeneration = Boolean(options.videoGeneration && !existing?.videoGeneration);
-      const updates: Record<string, unknown> = { toolSteps: trx.raw('"toolSteps" + 1') };
+      const intent = parseJson<Record<string, unknown>>(row.intent);
+      // New runs count media against their own counters, rather than imposing
+      // a hidden 40-image ceiling through the separate orchestration budget.
+      const separateMediaStep = intent?.mediaBudgetMode === "zero_unlimited" && Boolean(options.imageGeneration || options.videoGeneration) && !modelCall;
+      const updates: Record<string, unknown> = { updatedAt: this.now() };
+      if (!separateMediaStep) updates.toolSteps = trx.raw('"toolSteps" + 1');
       if (modelCall) updates.modelCalls = trx.raw('"modelCalls" + 1');
       if (imageGeneration) updates.imageGenerations = trx.raw('"imageGenerations" + 1');
       if (videoGeneration) updates.videoGenerations = trx.raw('"videoGenerations" + 1');
-      const conditions = trx(RUNS).where({ id: run.id, leaseOwner: this.workerId, leaseEpoch: epoch, status: "running" }).andWhere("toolSteps", "<", limits.maxToolSteps);
+      const conditions = trx(RUNS).where({ id: run.id, leaseOwner: this.workerId, leaseEpoch: epoch, status: "running" });
+      if (!separateMediaStep) conditions.andWhere("toolSteps", "<", limits.maxToolSteps);
       if (modelCall) conditions.andWhere("modelCalls", "<", limits.maxModelCalls);
-      if (imageGeneration) conditions.andWhere("imageGenerations", "<", limits.maxImageGenerations);
-      if (videoGeneration) conditions.andWhere("videoGenerations", "<", limits.maxVideoGenerations);
+      if (imageGeneration && !hasUnlimitedMediaBudget({ limits, intent: parseJson(row.intent) }, "image")) {
+        conditions.andWhere("imageGenerations", "<", limits.maxImageGenerations);
+      }
+      if (videoGeneration && !hasUnlimitedMediaBudget({ limits, intent: parseJson(row.intent) }, "video")) {
+        conditions.andWhere("videoGenerations", "<", limits.maxVideoGenerations);
+      }
       const changed = await conditions.update(updates);
       if (changed !== 1) throw new BuiltinRuntimeError("BUDGET_EXCEEDED", `Step budget exceeded for ${key}`);
       const now = this.now();

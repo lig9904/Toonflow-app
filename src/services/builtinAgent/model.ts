@@ -40,3 +40,12 @@ export async function loadBuiltinSkill(name: string): Promise<string> {
   if (!/^[a-z_]+\.md$/.test(name)) throw new Error("Invalid builtin skill name");
   return fs.readFile(path.join(u.getPath("skills"), name), "utf8");
 }
+
+export function builtinVisualStyleGuide(name: string): string {
+  return /^[\p{L}\p{N}_-]+$/u.test(name) ? u.getArtPrompt(name, "art_skills", "art_storyboard_video") : "";
+}
+
+export function builtinDirectorGuide(name: string): string {
+  if (!/^[\p{L}\p{N}_-]+$/u.test(name)) return "";
+  return [u.getArtPrompt(name, "story_skills", "director_planning_narrative"), u.getArtPrompt(name, "story_skills", "director_storyboard_table_narrative")].filter(Boolean).join("\n\n");
+}

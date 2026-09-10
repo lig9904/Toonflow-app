@@ -5,9 +5,13 @@ import type { ProductionMediaCapability, ProductionMediaRequest } from "./produc
 import type { ImageGenerationService, ImageGenerationReceipt } from "../imageJobs/runtime";
 import { ImageGenerationError } from "../imageJobs/runtime";
 import { VideoJobService, hashVideoJobRequest, type VideoJob, type VideoTaskProvider } from "../videoJobs";
-import { loadOwnedVideoReferences, parseVideoMode, type VideoReferenceInput } from "../videoJobs/request";
+import { loadOwnedVideoReferences, parseVideoMode, videoReferenceOptionsForProvider, type VideoReferenceInput } from "../videoJobs/request";
 import { lockProjectTransaction } from "../../lib/dbTransaction";
 import type { ResolvedImageModel } from "../../lib/imageModelSelection";
+import { buildStoryboardImagePrompt, visualStyleHint } from "../../lib/storyboardVisualContract";
+import { reconcileStoredStoryboardReferences } from "../storyboardVisuals";
+import { snapshotImageReference, type ImageReferenceSnapshot } from "../imageJobs/referenceSnapshot";
+import { matchVideoGenerationDuration, videoTailHoldInstruction } from "../../lib/videoGenerationTiming";
 
 export interface MediaModelCapabilities {
   type?: string;
@@ -23,6 +27,8 @@ interface Dependencies {
   modelFor(key: string, type: "image" | "video"): Promise<MediaModelCapabilities>;
   videoProviderFor(key: string): Promise<VideoTaskProvider>;
   toBase64(path: string): Promise<string>;
+  visualStyleGuide?(styleName: string): string;
+  mediaRootDir?: string;
   pollMs?: number;
 }
 
@@ -74,8 +80,30 @@ export function createProductionMediaCapabilities(deps: Dependencies): Productio
       catch (error) { if (!(error instanceof ImageGenerationError) || error.code !== "NOT_FOUND") throw error; }
       if (receipt && (receipt.target.kind !== request.targetKind || Number(receipt.target.id) !== request.targetId)) throw new BuiltinRuntimeError("CONFLICT", "图片任务已绑定其他目标");
       if (!receipt) {
-        const storyboardIds = Array.isArray(request.params.referenceStoryboardIds) ? request.params.referenceStoryboardIds.map(Number) : [];
-        const assetIds = Array.isArray(request.params.referenceAssetIds) ? request.params.referenceAssetIds.map(Number) : [];
+        let storyboardIds = Array.isArray(request.params.referenceStoryboardIds) ? request.params.referenceStoryboardIds.map(Number) : [];
+        let assetIds = Array.isArray(request.params.referenceAssetIds) ? request.params.referenceAssetIds.map(Number) : [];
+        let prompt = String(request.params.prompt ?? "");
+        let expectedVersion = Number(request.params.expectedVersion ?? 0);
+        let referenceAssets: ImageReferenceSnapshot[] | undefined;
+        if (request.targetKind === "storyboard") {
+          const versions = await reconcileStoredStoryboardReferences(deps.db, { projectId: request.projectId, scriptId: request.scriptId,
+            storyboardIds: [request.targetId], expectedVersions: { [request.targetId]: expectedVersion } });
+          expectedVersion = versions[request.targetId];
+          const board = await deps.db("o_storyboard").where({ id: request.targetId, projectId: request.projectId, scriptId: request.scriptId }).first();
+          const assets = await deps.db("o_assets2Storyboard as link").join("o_assets as asset", "asset.id", "link.assetId")
+            .leftJoin("o_image as image", "image.id", "asset.imageId")
+            .where("link.storyboardId", request.targetId).andWhere("asset.projectId", request.projectId).orderBy("link.id").select("asset.*", "image.filePath");
+          const project = await deps.db("o_project").where({ id: request.projectId }).first();
+          assetIds = assets.map((asset) => Number(asset.id));
+          referenceAssets = assets.map((asset) => snapshotImageReference(asset, String(asset.filePath ?? "")));
+          // Re-generation starts from canonical assets. Feeding an old rejected
+          // storyboard back automatically would reinforce its wrong identity.
+          storyboardIds = [];
+          prompt = buildStoryboardImagePrompt({ ...board, assets,
+            style: visualStyleHint(project?.artStyle ?? "", deps.visualStyleGuide?.(project?.artStyle ?? "") ?? ""),
+            instruction: typeof request.params.imageInstruction === "string" ? request.params.imageInstruction : undefined,
+          });
+        }
         const referenceInputs: VideoReferenceInput[] = [
           ...storyboardIds.map((id) => ({ id, sources: "storyboard" as const, fileType: "image" as const })),
           ...assetIds.map((id) => ({ id, sources: "assets" as const, fileType: "image" as const })),
@@ -89,8 +117,9 @@ export function createProductionMediaCapabilities(deps: Dependencies): Productio
         if (request.targetKind === "track") throw new BuiltinRuntimeError("INVALID_INPUT", "图片任务不能绑定视频轨道");
         await request.ctx.assertActive();
         receipt = await deps.images.prepare({ generationKey: request.generationKey, projectId: request.projectId, modelKey: request.modelKey,
-          config: { prompt: String(request.params.prompt ?? ""), size: String(request.params.size ?? ""), aspectRatio: String(request.params.aspectRatio ?? ""), referenceList: references as Array<{ type: "image"; base64: string }> },
-          target: { kind: request.targetKind, id: request.targetId, scriptId: request.scriptId, expectedVersion: Number(request.params.expectedVersion ?? 0) },
+          referenceAssets,
+          config: { prompt, size: String(request.params.size ?? ""), aspectRatio: String(request.params.aspectRatio ?? ""), referenceList: references as Array<{ type: "image"; base64: string }> },
+          target: { kind: request.targetKind, id: request.targetId, scriptId: request.scriptId, expectedVersion },
           builtinRun: { id: request.ctx.run.id, inputRevision: request.ctx.run.inputRevision ?? 0 },
         });
         await request.ctx.emit("media.reserved", { kind: "image", jobId: receipt.jobId, targetKind: request.targetKind, targetId: request.targetId });
@@ -110,25 +139,33 @@ export function createProductionMediaCapabilities(deps: Dependencies): Productio
       if (job && (job.scriptId !== request.scriptId || job.trackId !== request.targetId)) throw new BuiltinRuntimeError("CONFLICT", "视频任务已绑定其他轨道");
       if (!job) {
         const model = await deps.modelFor(request.modelKey, "video");
-        const settings = validateVideoParameters(model, request.params);
+        const plannedDuration = Number(request.params.duration);
+        let duration: number;
+        try { duration = matchVideoGenerationDuration(model, plannedDuration, String(request.params.resolution ?? "")); }
+        catch (error) { throw new BuiltinRuntimeError("INVALID_INPUT", error instanceof Error ? error.message : String(error)); }
+        const settings = validateVideoParameters(model, { ...request.params, duration });
         const storyboardIds = Array.isArray(request.params.storyboardIds) ? [...new Set(request.params.storyboardIds.map(Number))] : [];
         const rows = await deps.db("o_storyboard").where({ projectId: request.projectId, scriptId: request.scriptId, trackId: request.targetId }).orderBy("index").orderBy("id");
         if (!storyboardIds.length || rows.length !== storyboardIds.length || rows.some((row) => !storyboardIds.includes(Number(row.id)))) throw new BuiltinRuntimeError("INVALID_INPUT", "视频生成必须包含当前轨道的完整分镜，请重新读取轨道");
         const imageIds = rows.filter((row) => row.filePath).map((row) => Number(row.id));
-        const linkedAssets = await deps.db("o_assets2Storyboard as link").join("o_assets as asset", "asset.id", "link.assetId").join("o_image as image", "image.id", "asset.imageId")
-          .where("asset.projectId", request.projectId).whereIn("link.storyboardId", storyboardIds).whereNotNull("image.filePath").select("asset.id", "image.type").orderBy("link.id");
+        const readLinkedAssets = (db: Knex | Knex.Transaction) => db("o_assets2Storyboard as link").join("o_assets as asset", "asset.id", "link.assetId").leftJoin("o_image as image", "image.id", "asset.imageId")
+          .where("asset.projectId", request.projectId).whereIn("link.storyboardId", storyboardIds)
+          .select("link.storyboardId", "asset.id", "asset.imageId", "asset.name", "asset.describe", "asset.assetsId", "image.type", "image.filePath").orderBy("link.id");
+        const linkedAssets = await readLinkedAssets(deps.db);
         const assets = [...new Map(linkedAssets.map((row) => [Number(row.id), { id: Number(row.id), type: row.type }])).values()];
         const referenceInputs = selectReferences(settings.mode, imageIds, assets);
-        const referenceList = await loadOwnedVideoReferences(deps.db, request.projectId, request.scriptId, referenceInputs, deps.toBase64);
         const provider = await deps.videoProviderFor(request.modelKey);
+        const referenceList = await loadOwnedVideoReferences(deps.db, request.projectId, request.scriptId, referenceInputs, deps.toBase64,
+          videoReferenceOptionsForProvider(provider, deps.mediaRootDir ?? ""));
         const project = await deps.db("o_project").where({ id: request.projectId }).first();
-        const config = { ...settings, prompt: String(request.params.prompt ?? ""), referenceList, aspectRatio: project?.videoRatio };
+        const config = { ...settings, prompt: [String(request.params.prompt ?? ""), videoTailHoldInstruction(plannedDuration, duration)].filter(Boolean).join("\n"), referenceList, aspectRatio: project?.videoRatio };
         if (!config.prompt || !config.aspectRatio) throw new BuiltinRuntimeError("INVALID_INPUT", "视频提示词或画幅缺失");
         const requestHash = hashVideoJobRequest({ modelKey: request.modelKey, providerFingerprint: provider.fingerprint, projectId: request.projectId, scriptId: request.scriptId, trackId: request.targetId, config });
         const pathKey = createHash("sha256").update(request.generationKey).digest("hex");
         const reserved = await request.ctx.commit(`video.reserve:${request.targetId}`, { generationKey: request.generationKey, requestHash }, async (trx) => {
           await lockProjectTransaction(trx, request.projectId);
           await assertTrackUnchanged(trx, request, rows);
+          if (JSON.stringify(await readLinkedAssets(trx)) !== JSON.stringify(linkedAssets)) throw new BuiltinRuntimeError("CONFLICT", "视频参考素材或绑定关系已修改，本次旧请求未提交");
           return deps.videos.reserveNewVideos([{ idempotencyKey: request.generationKey, request: { modelKey: request.modelKey, providerFingerprint: provider.fingerprint,
             projectId: request.projectId, scriptId: request.scriptId, trackId: request.targetId, config, outputPath: `/${request.projectId}/video/${pathKey}.mp4` }, requestHash }], trx).then((results) => results[0]);
         });

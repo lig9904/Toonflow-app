@@ -56,13 +56,21 @@ export function createBuiltinAgentRouter(deps: BuiltinHttpDependencies): express
     await deps.authorize(requestedBy, input.projectId, "edit", input.scriptId);
     if (input.agentType === "productionAgent" && input.scriptId == null) throw new BuiltinRuntimeError("INVALID_INPUT", "制作任务需要指定剧集");
     const { thinkLevel, ...runInput } = input;
+    // This marker is persisted on every new public run. It scopes the new
+    // zero-is-unlimited behavior to runs created by this route; older rows
+    // without the marker keep their historical zero-denies-media behavior.
+    const intent = {
+      mediaBudgetMode: "zero_unlimited" as const,
+      ...(thinkLevel === undefined ? {} : { thinkLevel }),
+      ...(input.agentType === "productionAgent" && input.limits?.maxOutputTokens === undefined
+        ? { outputBudgetMode: "model_per_call" as const }
+        : {}),
+    };
     const result = await deps.runtime.create({
       ...runInput,
       requestedBy,
       limits: { ...defaultBuiltinRunLimits, ...input.limits },
-      ...((input.agentType === "productionAgent" && input.limits?.maxOutputTokens === undefined) || thinkLevel !== undefined
-        ? { intent: { ...(thinkLevel === undefined ? {} : { thinkLevel }),
-          ...(input.agentType === "productionAgent" && input.limits?.maxOutputTokens === undefined ? { outputBudgetMode: "model_per_call" } : {}) } } : {}),
+      intent,
     });
     res.send({ code: 200, data: result });
   }));

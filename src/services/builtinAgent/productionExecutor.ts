@@ -11,8 +11,9 @@ import type { StructuredModelRequest, StructuredScriptModel } from "./scriptExec
 import { createAssetExtractionHelper } from "./assetExtraction";
 import { getCreativeState } from "../creativeWorkspace";
 import pLimit from "p-limit";
-import { builtinThinkLevelFromIntent, hasIndependentProductionOutput } from "./contracts";
-import { productionActionLabels, productionDecisionPrompt, productionStageContract } from "./productionPrompts";
+import { builtinThinkLevelFromIntent, hasIndependentProductionOutput, hasUnlimitedMediaBudget } from "./contracts";
+import { productionActionLabels, productionDecisionPrompt, productionStageContract, explicitProductionTextScope } from "./productionPrompts";
+import { reconcileStoryboardAssetIds, buildStoryboardVideoPrompt } from "../../lib/storyboardVisualContract";
 
 export interface ProductionMediaRequest {
   ctx: BuiltinExecutionContext;
@@ -35,6 +36,8 @@ export interface ProductionExecutorDependencies {
   db: Knex;
   model: StructuredScriptModel;
   loadSkill(name: string): Promise<string>;
+  visualStyleGuide?(styleName: string): string;
+  directorGuide?(name: string): string;
   media?: ProductionMediaCapability;
   videoModelMetadata?: (modelKey: string) => Promise<{ mode?: unknown; resolution?: unknown; audio?: unknown }>;
 }
@@ -53,9 +56,9 @@ const deriveSchema = z.object({ assets: z.array(z.object({ id: z.number().int().
 const storyboardSchema = z.object({
   items: z.array(z.object({
     id: z.number().int().positive().nullable().default(null),
-    prompt: z.string().max(20_000), duration: z.number().positive().max(300), track: z.string().trim().min(1).max(100),
-    videoDesc: z.string().max(20_000), shouldGenerateImage: z.number().int().min(0).max(1),
-    associateAssetsIds: z.array(z.number().int().positive()).max(100), expectedVersion: z.number().int().nonnegative().nullable().default(null),
+    prompt: z.string().max(20_000).describe("图片的可见画面：景别、构图、角色、动作、场景、道具；对白和画外声音放 videoDesc"), duration: z.number().positive().max(300), track: z.string().trim().min(1).max(100),
+    videoDesc: z.string().max(20_000).describe("完整视频动作、运镜和声音；台词逐字保留，明确说话人及画外声音"), shouldGenerateImage: z.number().int().min(0).max(1),
+    associateAssetsIds: z.array(z.number().int().positive()).max(100).describe("本镜可见角色、场景、道具的真实素材ID，不能遗漏或只在场头引用"), expectedVersion: z.number().int().nonnegative().nullable().default(null),
   }).strict()).min(1).max(500),
   summary: z.string().max(4000),
 }).strict();
@@ -83,8 +86,26 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
       const episode = await deps.db("o_script").where({ id: scriptId, projectId }).first();
       if (!row || !episode) throw new BuiltinRuntimeError("FORBIDDEN", "项目或剧集不属于当前任务");
       const scriptVersion = await getCreativeState(deps.db, "script", scriptId, projectId);
-      return { id: projectId, scriptId, scriptVersion: scriptVersion.version, name: row.name ?? "", artStyle: row.artStyle ?? "", imageModel: row.imageModel ?? "", videoModel: row.videoModel ?? row.videoModelKey ?? "", imageQuality: row.imageQuality ?? "1K", videoRatio: row.videoRatio ?? "16:9", videoMode: row.mode ?? row.videoMode, videoResolution: row.videoResolution ?? row.resolution, audio: row.generateAudio ?? row.audio, script: episode.content ?? "" };
+      return { id: projectId, scriptId, scriptVersion: scriptVersion.version, name: row.name ?? "", directorManual: row.directorManual ?? "", directorGuide: deps.directorGuide?.(row.directorManual ?? "") ?? "", artStyle: row.artStyle ?? "", visualStyleGuide: deps.visualStyleGuide?.(row.artStyle ?? "") ?? "", imageModel: row.imageModel ?? "", videoModel: row.videoModel ?? row.videoModelKey ?? "", imageQuality: row.imageQuality ?? "1K", videoRatio: row.videoRatio ?? "16:9", videoMode: row.mode ?? row.videoMode, videoResolution: row.videoResolution ?? row.resolution, audio: row.generateAudio ?? row.audio, script: episode.content ?? "" };
     });
+    const assertSourceCurrent = async (db: Knex | Knex.Transaction, checkMedia = false) => {
+      const currentScript = await db("o_script").where({ id: scriptId, projectId }).first();
+      const currentProject = await db("o_project").where({ id: projectId }).first();
+      if (!currentScript || !currentProject || String(currentScript.content ?? "") !== project.script
+        || String(currentProject.directorManual ?? "") !== project.directorManual || String(currentProject.artStyle ?? "") !== project.artStyle) {
+        throw new BuiltinRuntimeError("CONFLICT", "剧本或导演/风格设定已被修改，本次旧结果未写入；请基于最新画布继续制作");
+      }
+      if (checkMedia && (String(currentProject.imageModel ?? "") !== project.imageModel || String(currentProject.videoModel ?? currentProject.videoModelKey ?? "") !== project.videoModel
+        || String(currentProject.imageQuality ?? "1K") !== project.imageQuality || String(currentProject.videoRatio ?? "16:9") !== project.videoRatio
+        || (currentProject.mode ?? currentProject.videoMode) !== project.videoMode || (currentProject.videoResolution ?? currentProject.resolution) !== project.videoResolution
+        || (currentProject.generateAudio ?? currentProject.audio) !== project.audio)) throw new BuiltinRuntimeError("CONFLICT", "项目媒体配置已被修改，本次旧生成请求已停止");
+      const capturedAssets = flow.assets.flatMap((asset: any) => [asset, ...asset.derive]);
+      const currentAssets = capturedAssets.length ? await db("o_assets").where({ projectId }).whereIn("id", capturedAssets.map((asset: any) => asset.id)) : [];
+      if (capturedAssets.some((asset: any) => {
+        const current = currentAssets.find((row) => Number(row.id) === Number(asset.id));
+        return !current || String(current.name ?? "") !== asset.name || String(current.describe ?? "") !== asset.desc || Number(current.assetsId ?? 0) !== Number(asset.assetsId ?? 0);
+      })) throw new BuiltinRuntimeError("CONFLICT", "素材设定已被修改，本次旧结果未写入；请基于最新画布继续制作");
+    };
     let flow = await ctx.step(`production.flow:r${revision}`, { projectId, scriptId }, () => readProductionFlow(deps.db, projectId, scriptId, async (path) => path));
     const refreshFlow = async (after: string) => {
       const read = () => readProductionFlow(deps.db, projectId, scriptId, async (path) => path);
@@ -121,9 +142,15 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
     };
     const planBudget = Math.min(1800, Math.floor(run.limits.maxOutputTokens / 3));
     const plan = await model("plan", "productionAgent:decisionAgent", "production_agent_decision.md", planSchema, { request: requestText, project, flow,
-      authorization: { maxImageGenerations: run.limits.maxImageGenerations, maxVideoGenerations: run.limits.maxVideoGenerations } }, planBudget);
+      authorization: { maxImageGenerations: run.limits.maxImageGenerations, maxVideoGenerations: run.limits.maxVideoGenerations,
+        imageUnlimited: hasUnlimitedMediaBudget(run, "image"), videoUnlimited: hasUnlimitedMediaBudget(run, "video") } }, planBudget);
     // Compatibility names describe the same operation, so canonicalize once.
     const requestedActions = new Set(plan.actions.map(canonical));
+    const explicitTextScope = explicitProductionTextScope(requestText);
+    if (explicitTextScope) {
+      requestedActions.clear();
+      for (const action of explicitTextScope) requestedActions.add(action);
+    }
     const actions: CanonicalPhase[] = ORDER.filter((action) => requestedActions.has(action));
     let knownTopAssets = new Set(flow.assets.map((asset: any) => Number(asset.id)));
     let knownAssets = new Set(flow.assets.flatMap((asset: any) => [Number(asset.id), ...asset.derive.map((child: any) => Number(child.id))]));
@@ -140,6 +167,7 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
     const executionIssues: Array<Record<string, unknown>> = plan.question ? [{ message: plan.question }] : [];
     let targetAssetIds = [...new Set(plan.assetIds)];
     let targetStoryboardIds = [...new Set(plan.storyboardIds)];
+    const unavailableStoryboardImages = new Set<number>();
 
     for (const action of ORDER) {
       if (!selected.has(action)) continue;
@@ -151,8 +179,11 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
         knownTopAssets = new Set(flow.assets.map((asset: any) => Number(asset.id)));
         knownAssets = new Set(flow.assets.flatMap((asset: any) => [Number(asset.id), ...asset.derive.map((child: any) => Number(child.id))]));
       } else if (action === "planning") {
-        const planResult = await model("directorPlan", "productionAgent:directorPlanAgent", "production_execution_director_plan.md", planningSchema, { request: requestText, project, flow }, textActionCount > 1 ? Math.min(4096, budget) : budget);
-        const saved = await ctx.commit(`production.planning:r${revision}`, { projectId, scriptId, expected: flow.planningVersion, planResult }, (trx) => saveProductionPlanning(trx as unknown as Knex, projectId, scriptId, flow.planningVersion, { scriptPlan: planResult.scriptPlan, storyboardTable: flow.storyboardTable }));
+        const planResult = await model("directorPlan", "productionAgent:directorPlanAgent", "builtin_production_director.md", planningSchema, { request: requestText, project, flow }, textActionCount > 1 ? Math.min(4096, budget) : budget);
+        const saved = await ctx.commit(`production.planning:r${revision}`, { projectId, scriptId, expected: flow.planningVersion, planResult }, async (trx) => {
+          await assertSourceCurrent(trx);
+          return saveProductionPlanning(trx as unknown as Knex, projectId, scriptId, flow.planningVersion, { scriptPlan: planResult.scriptPlan, storyboardTable: flow.storyboardTable });
+        });
         output.planning = saved;
         flow = await refreshFlow("planning");
         await ctx.emit("artifact.saved", { kind: "productionPlanning", ids: [projectId, scriptId], version: saved.planningVersion });
@@ -162,8 +193,9 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
           executionIssues.push({ action, message: "未确定衍生素材范围，已跳过该步骤；可直接在画布调整素材后重新发起制作。" });
           continue;
         }
-        const derived = await model("deriveAssets", "productionAgent:deriveAssetsAgent", "production_execution_derive_assets.md", deriveSchema, { request: requestText, project, flow, parentAssetIds: targetAssetIds }, budget);
+        const derived = await model("deriveAssets", "productionAgent:deriveAssetsAgent", "builtin_production_derive.md", deriveSchema, { request: requestText, project, flow, parentAssetIds: targetAssetIds }, budget);
         const created = await ctx.commit(`production.assets:r${revision}`, { projectId, scriptId, derived }, async (trx) => {
+          await assertSourceCurrent(trx);
           const ids: unknown[] = [];
           for (const item of derived.assets) {
             if (!knownTopAssets.has(item.parentAssetId) || !targetAssetIds.includes(item.parentAssetId)) throw new BuiltinRuntimeError("INVALID_INPUT", "衍生资产父 ID 必须是本次选定的项目顶层素材");
@@ -196,12 +228,15 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
         if (savedAssetIds.length && !selected.has("generateImages")) await ctx.emit("message.completed", { text: `已保存 ${savedAssetIds.length} 个衍生素材描述，本次没有生成图片。需要出图时可授权图片次数并生成衍生素材图片。` });
       } else if (action === "storyboard") {
         // Long shot lists can use tokens left over from the compact director plan.
-        const storyboard = await model("storyboard", "productionAgent:storyboardTableAgent", "production_execution_storyboard_table.md", storyboardSchema, { request: requestText, project, flow, selectedStoryboardIds: plan.storyboardIds }, run.limits.maxOutputTokens, selected.has("review") ? 1024 : 0);
+        const storyboard = await model("storyboard", "productionAgent:storyboardTableAgent", "builtin_production_storyboard.md", storyboardSchema, { request: requestText, project, flow, selectedStoryboardIds: plan.storyboardIds }, run.limits.maxOutputTokens, selected.has("review") ? 1024 : 0);
         const created = await ctx.commit(`production.storyboard.commit:r${revision}`, { projectId, scriptId, storyboard }, async (trx) => {
+          await assertSourceCurrent(trx);
+          const visualAssets = flow.assets.flatMap((asset: any) => [asset, ...asset.derive]);
           const additions: NewStoryboard[] = [];
           const existingIds: number[] = [];
           for (const item of storyboard.items) {
             if (item.associateAssetsIds.some((id) => !knownAssets.has(id))) throw new BuiltinRuntimeError("INVALID_INPUT", "分镜引用了项目外素材");
+            item.associateAssetsIds = reconcileStoryboardAssetIds(item, visualAssets);
             if (item.id == null) { additions.push({ prompt: item.prompt, duration: item.duration, track: item.track, videoDesc: item.videoDesc, shouldGenerateImage: item.shouldGenerateImage, associateAssetsIds: item.associateAssetsIds }); continue; }
             const old = knownStoryboards.get(item.id);
             if (!old) throw new BuiltinRuntimeError("INVALID_INPUT", "分镜 ID 不属于当前剧集");
@@ -261,19 +296,20 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
           executionIssues.push({ action, message: "没有可生成的素材、分镜或视频轨道，已跳过该步骤。" });
           continue;
         }
-        if (targets.length > limit) throw new BuiltinRuntimeError("BUDGET_EXCEEDED", `${action} 超过本次运行授权额度`);
+        if (!hasUnlimitedMediaBudget(run, action === "generateImages" ? "image" : "video") && targets.length > limit) throw new BuiltinRuntimeError("BUDGET_EXCEEDED", `${action} 超过本次运行生成数量上限`);
         if (targets.some((item) => !item.source)) throw new BuiltinRuntimeError("INVALID_INPUT", "媒体生成引用了项目外实体");
         const results: unknown[] = [];
         const issues: Array<{ targetKind: string; targetId: number; message: string; result?: unknown }> = [];
         const performTarget = async (target: MediaTarget) => {
           await ctx.assertActive();
+          await assertSourceCurrent(deps.db, true);
           const source = target.source as any;
           // A human answer or worker restart resumes the same generation. A new
           // generation of this target requires a new run with its own allowance.
           const generationKey = `builtin:${run.id}:${action}:${target.targetKind}:${target.targetId}`;
           const videoMetadata = action === "generateVideos" && deps.videoModelMetadata ? await deps.videoModelMetadata(project.videoModel) : {};
           const videoSources = action === "generateVideos" ? target.storyboardIds.map((id) => knownStoryboards.get(id)).filter(Boolean) as any[] : [];
-          const storedVideoPrompt = videoSources.map((item) => item.videoDesc || item.prompt || "").filter(Boolean).join("\n");
+          const storedVideoPrompt = buildStoryboardVideoPrompt(videoSources);
           const storedImagePrompt = target.targetKind === "asset" && selected.has("deriveAssets") ? source.desc || source.prompt || source.name || "" : source.prompt || source.desc || source.name || "";
           const imagePromptUpdated = target.targetKind === "storyboard" ? selected.has("storyboard") : selected.has("deriveAssets") || selected.has("extractAssets");
           const imageRequest = imagePromptUpdated ? "" : requestText;
@@ -285,10 +321,10 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
             prompt: selected.has("storyboard") ? storedVideoPrompt : `${storedVideoPrompt}\n本次制作要求（优先落实其中的画面和声音要求）：${requestText}`,
             storyboardIds: target.storyboardIds,
             expectedVersions: Object.fromEntries(videoSources.map((item) => [Number(item.id), Number(item.collaboration?.version ?? 0)])),
-          } : { prompt: [storedImagePrompt, project.artStyle ? `画风：${project.artStyle}` : "", imageRequest ? `本次画面要求（优先于旧画面描述）：${imageRequest}` : ""].filter(Boolean).join("\n"), size: project.imageQuality, aspectRatio: project.videoRatio,
+          } : { prompt: [storedImagePrompt, project.artStyle ? `画风：${project.artStyle}` : "", imageRequest ? `本次画面要求（优先于旧画面描述）：${imageRequest}` : ""].filter(Boolean).join("\n"), imageInstruction: imageRequest, size: project.imageQuality, aspectRatio: project.videoRatio,
             expectedVersion: target.targetKind === "storyboard" ? Number(source.collaboration?.version ?? 0) : Number(source.imageId ?? 0),
             referenceAssetIds: target.targetKind === "storyboard" ? source.associateAssetsIds ?? [] : source.assetsId != null ? [Number(source.assetsId)] : Number(source.imageId ?? 0) > 0 ? [target.targetId] : [],
-            referenceStoryboardIds: target.targetKind === "storyboard" && source.src ? [target.targetId] : [] };
+            referenceStoryboardIds: [] };
           if (action === "generateVideos" && (videoParams.mode === undefined || videoParams.resolution === undefined || Number(videoParams.duration) <= 0 || !videoParams.prompt)) throw new BuiltinRuntimeError("INVALID_INPUT", "视频生成缺少已验证的模式、分辨率、时长或提示词");
           const result = await ctx.step(`production.${action}:${target.targetKind}:${target.targetId}`, { projectId, scriptId, targetKind: target.targetKind, targetId: target.targetId, generationKey }, () => action === "generateImages" ? deps.media!.generateImage!({ ctx, projectId, scriptId, targetKind: target.targetKind, targetId: target.targetId, storyboardId: target.targetKind === "storyboard" ? target.targetId : undefined, modelKey: project.imageModel, generationKey, params: videoParams }) : deps.media!.generateVideo!({ ctx, projectId, scriptId, targetKind: "track", targetId: target.targetId, modelKey: project.videoModel, generationKey, params: videoParams }), { imageGeneration: action === "generateImages", videoGeneration: action === "generateVideos" });
           const status = mediaResultStatus(result);
@@ -309,6 +345,7 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
         for (const batch of batches) {
           const concurrency = pLimit(2);
           const outcomes = await Promise.allSettled(batch.map((target) => concurrency(async () => {
+            if (action === "generateVideos" && target.storyboardIds.some((id) => unavailableStoryboardImages.has(id))) throw new BuiltinRuntimeError("CONFLICT", "本轮分镜图未完成或未应用，已跳过对应视频，避免使用旧图片继续制作");
             if (target.targetKind === "asset" && target.source.assetsId != null && failedAssetIds.has(Number(target.source.assetsId))) throw new BuiltinRuntimeError("CONFLICT", "父素材尚不可用，本次跳过该衍生图片");
             if (target.targetKind === "storyboard" && (target.source.associateAssetsIds ?? []).some((id: number) => failedAssetIds.has(Number(id)))) throw new BuiltinRuntimeError("CONFLICT", "引用素材尚不可用，本次跳过该分镜图片");
             return performTarget(target);
@@ -324,6 +361,7 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
               issues.push({ targetKind: target.targetKind, targetId: target.targetId, message: error instanceof Error ? error.message : "媒体任务失败" });
             }
             if (target.targetKind === "asset" && (outcome.status === "rejected" || outcome.value.needsReview)) failedAssetIds.add(target.targetId);
+            if (action === "generateImages" && target.targetKind === "storyboard" && (outcome.status === "rejected" || outcome.value.needsReview)) unavailableStoryboardImages.add(target.targetId);
           }
         }
         output[action] = results;
@@ -334,7 +372,7 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
           await ctx.emit("message.completed", { text: `本步骤已结束，${issues.length} 项未应用或未完成；生成结果已保留，可直接在画布调整。其余可执行步骤继续进行。` });
         }
       } else if (action === "review") {
-        const review = await model("review", "productionAgent:supervisionAgent", "production_agent_supervision.md", reviewSchema, { request: requestText, project, flow, output }, budget);
+        const review = await model("review", "productionAgent:supervisionAgent", "builtin_production_review.md", reviewSchema, { request: requestText, project, flow, output }, budget);
         output.review = review;
         await ctx.emit("message.completed", { text: [review.summary, ...review.findings].join("\n") });
       }

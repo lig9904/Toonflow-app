@@ -26,6 +26,9 @@ import { teamAuthMiddleware, type TeamPrincipal } from "@/services/team";
 import { authorizeRoute, resolveAuthorizedMedia } from "@/services/team/authorization";
 import { getProductionImageGenerationService } from "@/services/productionImageJobRuntime";
 import { configureMediaJobRecoveryExecutors } from "@/services/mediaJobControl";
+import { cleanupExpiredVideoReferenceLeases, ensureVideoReferenceBridgeSchema } from "@/services/videoReferenceBridge";
+import { createVideoReferenceBridgeRouter } from "@/services/videoReferenceBridge/http";
+import { ensureVideoPromptJobSchema } from "@/services/videoPromptJobs";
 
 const app = express();
 const server = http.createServer(app);
@@ -57,6 +60,9 @@ async function checkPermissions() {
 
 export default async function startServe(randomPort: Boolean = false) {
   await dbReady;
+  await ensureVideoPromptJobSchema(u.db);
+  await ensureVideoReferenceBridgeSchema(u.db);
+  await cleanupExpiredVideoReferenceLeases(u.db);
   await finishLegacyProductionWaits(u.db);
   await checkPermissions();
   await u.oss.ready();
@@ -73,7 +79,7 @@ export default async function startServe(randomPort: Boolean = false) {
 
   expressWs(app);
 
-  app.use(logger("dev"));
+  app.use(logger("dev", { skip: (req) => req.path === "/media-bridge" || req.path.startsWith("/media-bridge/") }));
   app.use(cors({ origin: "*" }));
   app.use(express.json({ limit: "100mb" }));
   app.use(express.urlencoded({ extended: true, limit: "100mb" }));
@@ -92,6 +98,17 @@ export default async function startServe(randomPort: Boolean = false) {
     fs.mkdirSync(ossDir, { recursive: true });
   }
   console.log("文件目录:", ossDir);
+
+  // KZ reference leases are bearer URLs for one verified file. They are
+  // deliberately outside /oss, whose team-session middleware would prevent
+  // an upstream provider from downloading a selected reference.
+  app.use("/media-bridge", createVideoReferenceBridgeRouter({
+    db: u.db,
+    rootDir: ossDir,
+    secret: String(process.env.TOONFLOW_MEDIA_BRIDGE_SECRET || ""),
+    publicOrigin: process.env.TOONFLOW_MEDIA_PUBLIC_ORIGIN,
+  }));
+
   app.use(
     "/oss",
     authenticate,

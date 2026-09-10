@@ -2,7 +2,7 @@ import u from "../../utils";
 import { BuiltinAgentRuntime, BuiltinRuntimeError } from "../builtinAgentRuntime";
 import { requireProjectAccess, requireTeamRole } from "../team";
 import { createScriptAgentExecutor } from "./scriptExecutor";
-import { configuredScriptModel, loadBuiltinSkill } from "./model";
+import { configuredScriptModel, loadBuiltinSkill, builtinVisualStyleGuide, builtinDirectorGuide } from "./model";
 import type { BuiltinRunView } from "./contracts";
 import { createProductionAgentExecutor } from "./productionExecutor";
 import { createProductionMediaCapabilities, defaultVideoSettings } from "./media";
@@ -36,12 +36,14 @@ async function authorizeRun(run: BuiltinRunView, transaction?: Knex.Transaction)
 
 export function getBuiltinAgentRuntime(): BuiltinAgentRuntime {
   if (!singleton) {
-    const script = createScriptAgentExecutor({ db: u.db, model: configuredScriptModel, loadSkill: loadBuiltinSkill });
+    const script = createScriptAgentExecutor({ db: u.db, model: configuredScriptModel, loadSkill: loadBuiltinSkill, directorGuide: builtinDirectorGuide });
     const audio = createAudioMatchExecutor({ db: u.db, model: configuredScriptModel });
     const novelEvents = createNovelEventExecutor({ db: u.db, model: configuredScriptModel, fallbackPrompt: async () => String(await u.getPrompts("event") ?? "") });
     const production = createProductionAgentExecutor({ db: u.db, model: configuredScriptModel, loadSkill: loadBuiltinSkill,
+      visualStyleGuide: builtinVisualStyleGuide, directorGuide: builtinDirectorGuide,
       videoModelMetadata: async (key) => defaultVideoSettings(await getConfiguredMediaModel(key, "video")),
       media: createProductionMediaCapabilities({ db: u.db, images: getProductionImageGenerationService(), videos: getRuntimeVideoJobService(),
+        visualStyleGuide: builtinVisualStyleGuide, mediaRootDir: u.getPath("oss"),
         imageModelFor: resolveConfiguredImageModel, modelFor: getConfiguredMediaModel, videoProviderFor: (key) => getPersistentVideoTaskProvider(key as `${string}:${string}`), toBase64: (path) => u.oss.getImageBase64(path) }),
     });
     singleton = new BuiltinAgentRuntime({

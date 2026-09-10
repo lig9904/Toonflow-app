@@ -89,14 +89,15 @@ test("builtin script roles save structured artifacts without a browser or XML ca
   } finally { await f.destroy(); }
 });
 
-test("builtin script question creates a human checkpoint instead of marking work complete", options, async () => {
+test("unresolved script scope ends clearly without creating a human checkpoint or claiming completion", options, async () => {
   const f = await fixture();
   try {
     const model: StructuredScriptModel = { async generate(req) { return { value: req.schema.parse({ actions: [], chapterIds: [], targetScriptIds: [], question: "需要使用哪一集？", summary: "" }), outputTokens: 8 }; } };
     const runtime = new BuiltinAgentRuntime({ db: f.db, authorize: async () => {}, execute: createScriptAgentExecutor({ db: f.db, model, loadSkill: async () => "test" }) });
     const { run } = await runtime.create({ agentType: "scriptAgent", projectId: f.projectId, requestedBy: 1, prompt: "edit that one", idempotencyKey: "human-checkpoint-run", limits: defaultBuiltinRunLimits });
     await runtime.runOnce();
-    assert.equal((await runtime.get(run.id)).status, "waiting_human");
+    assert.equal((await runtime.get(run.id)).status, "failed");
+    assert.match((await runtime.get(run.id)).errorMessage ?? "", /需要使用哪一集/);
     assert.equal((await readScriptWorkspace(f.db, f.projectId)).version, 0);
   } finally { await f.destroy(); }
 });

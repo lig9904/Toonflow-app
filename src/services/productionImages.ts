@@ -4,6 +4,9 @@ import type { Knex } from "knex";
 import { notifyProductionChange } from "./productionEvents";
 import { assertAssetNotLockedReference, ProductionAssetError } from "./productionAssets";
 import { ImageGenerationError, type ImageGenerationReceipt, type ImageGenerationService } from "./imageJobs/runtime";
+import { buildStoryboardImagePrompt, visualStyleHint, StoryboardVisualError } from "../lib/storyboardVisualContract";
+import { reconcileStoredStoryboardReferences } from "./storyboardVisuals";
+import { snapshotImageReference } from "./imageJobs/referenceSnapshot";
 
 export class ProductionImageError extends Error {
   constructor(message: string, public readonly status = 400) {
@@ -158,6 +161,8 @@ export async function generateDerivedAssetImages(db: Knex, args: {
 export async function prepareStoryboardImages(db: Knex, args: {
   projectId: number; scriptId: number; storyboardIds: number[]; concurrentCount?: number; compulsory?: boolean; runtime: ProductionImageRuntime; generationKeyPrefix?: string;
 }) {
+  try { await reconcileStoredStoryboardReferences(db, args); }
+  catch (error) { if (error instanceof StoryboardVisualError) throw new ProductionImageError(error.message, error.status); throw error; }
   if (args.runtime.imageJobs) return prepareDurableStoryboardImages(db, args as typeof args & { runtime: ProductionImageRuntime & { imageJobs: ImageGenerationService } });
   const ids = [...new Set(args.storyboardIds)];
   if (!ids.length) throw new ProductionImageError("storyboardIds不能为空");
@@ -255,7 +260,9 @@ export async function prepareStoryboardImages(db: Knex, args: {
     await bounded(generateList, args.concurrentCount ?? 5, async (row) => {
     try {
       const references = (imageIdsByStoryboard.get(Number(row.id)) || []).map((id) => ({ type: "image" as const, base64: imageBase64.get(id)! }));
-      const image = await args.runtime.generateImage!({ model: String(settings.imageModel), prompt: String(row.prompt || ""), size: settings.imageQuality as "1K" | "2K" | "4K", aspectRatio: (settings.videoRatio || "16:9") as `${number}:${number}`, referenceList: references, projectId: args.projectId, scriptId: args.scriptId, kind: "storyboard" });
+      const assets = prepared.links.filter((link) => Number(link.storyboardId) === Number(row.id)).map((link) => assetMap.get(Number(link.assetId))!);
+      const prompt = buildStoryboardImagePrompt({ ...row, assets, style: visualStyleHint(settings.artStyle, args.runtime.getArtPrompt(settings.artStyle, "art_skills", "art_storyboard_video")) });
+      const image = await args.runtime.generateImage!({ model: String(settings.imageModel), prompt, size: settings.imageQuality as "1K" | "2K" | "4K", aspectRatio: (settings.videoRatio || "16:9") as `${number}:${number}`, referenceList: references, projectId: args.projectId, scriptId: args.scriptId, kind: "storyboard" });
       const savePath = `/${args.projectId}/assets/${args.scriptId}/${args.runtime.uuid()}.jpg`;
       await image.save(savePath);
       await writeStoryboardResult(Number(row.id), { filePath: savePath, state: "已完成", reason: null });
@@ -415,7 +422,14 @@ async function prepareDurableStoryboardImages(db: Knex, args: {
     const existing = await findGeneration(args.runtime.imageJobs, args.projectId, generationKey);
     const receipt = await args.runtime.imageJobs.prepare({
       generationKey, projectId: args.projectId, modelKey: String(settings.imageModel),
-      config: { prompt: String(row.prompt || ""), referenceList, size: String(settings.imageQuality), aspectRatio: String(settings.videoRatio || "16:9") },
+      referenceAssets: prepared.links.filter((link) => Number(link.storyboardId) === Number(row.id)).map((link) => {
+        const asset = assetById.get(Number(link.assetId))!;
+        return snapshotImageReference(asset, String(prepared.images.find((image) => Number(image.id) === Number(asset.imageId))!.filePath));
+      }),
+      config: { prompt: buildStoryboardImagePrompt({ ...row,
+        assets: prepared.links.filter((link) => Number(link.storyboardId) === Number(row.id)).map((link) => assetById.get(Number(link.assetId))!),
+        style: visualStyleHint(settings.artStyle, args.runtime.getArtPrompt(settings.artStyle, "art_skills", "art_storyboard_video")),
+      }), referenceList, size: String(settings.imageQuality), aspectRatio: String(settings.videoRatio || "16:9") },
       target: { kind: "storyboard", id: Number(row.id), scriptId: args.scriptId, expectedVersion: existing?.target.expectedVersion ?? prepared.stateVersions.get(Number(row.id)) ?? 0 },
     });
     receipts.set(Number(row.id), receipt);

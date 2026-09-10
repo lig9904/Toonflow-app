@@ -1,5 +1,6 @@
 import type { Knex } from "knex";
 import { resolveVideoReferenceMediaType } from "@/lib/videoPromptReferences";
+import { issueVideoReferenceLease, type VideoReferenceLeaseOptions, type VideoReferenceSource } from "@/services/videoReferenceBridge";
 import { VideoJobError } from "./index";
 
 export interface VideoReferenceInput {
@@ -8,15 +9,62 @@ export interface VideoReferenceInput {
   fileType?: "image" | "video" | "audio";
 }
 
+export interface VideoReferenceLoadOptions extends Partial<VideoReferenceLeaseOptions> {
+  transport?: "base64" | "url";
+}
+
+export type LoadedVideoReference = {
+  type: "image" | "video" | "audio";
+  base64?: string;
+  url?: string;
+  source?: VideoReferenceSource;
+  leaseId?: string;
+  contentHash?: string;
+  sizeBytes?: number;
+  mtimeMs?: number;
+};
+
+export function videoReferenceOptionsForProvider(provider: { referenceTransport?: "base64" | "url" }, rootDir: string): VideoReferenceLoadOptions | undefined {
+  if (provider.referenceTransport !== "url") return undefined;
+  return {
+    transport: "url",
+    rootDir,
+    publicOrigin: String(process.env.TOONFLOW_MEDIA_PUBLIC_ORIGIN || ""),
+    secret: String(process.env.TOONFLOW_MEDIA_BRIDGE_SECRET || ""),
+  };
+}
+
+export function loadOwnedVideoReferences(
+  db: Knex,
+  projectId: number,
+  scriptId: number,
+  uploadData: VideoReferenceInput[],
+  toBase64: (path: string) => Promise<string>,
+): Promise<Array<{ type: "image" | "video" | "audio"; base64: string }>>;
+export function loadOwnedVideoReferences(
+  db: Knex,
+  projectId: number,
+  scriptId: number,
+  uploadData: VideoReferenceInput[],
+  toBase64: (path: string) => Promise<string>,
+  options?: VideoReferenceLoadOptions,
+): Promise<LoadedVideoReference[]>;
 export async function loadOwnedVideoReferences(
   db: Knex,
   projectId: number,
   scriptId: number,
   uploadData: VideoReferenceInput[],
   toBase64: (path: string) => Promise<string>,
-): Promise<Array<{ type: "image" | "video" | "audio"; base64: string }>> {
+  options: VideoReferenceLoadOptions = {},
+): Promise<LoadedVideoReference[]> {
   return Promise.all(uploadData.map(async (item) => {
     if (!Number.isSafeInteger(item.id) || item.id <= 0) throw new VideoJobError("INVALID_INPUT", "引用素材 ID 不合法");
+    const source: VideoReferenceSource = { projectId, scriptId, id: item.id, sources: item.sources, fileType: item.fileType };
+    if (options.transport === "url") {
+      if (!options.rootDir || !options.publicOrigin || !options.secret) throw new VideoJobError("UNSUPPORTED_PROVIDER", "KZ 参考素材桥接未配置媒体公网 origin 或 bridge secret");
+      const lease = await issueVideoReferenceLease(db, source, options as VideoReferenceLeaseOptions);
+      return { type: lease.type, url: lease.url, source, leaseId: lease.leaseId, contentHash: lease.contentHash, sizeBytes: lease.sizeBytes, mtimeMs: lease.mtimeMs };
+    }
     if (item.sources === "storyboard") {
       const row = await db("o_storyboard as storyboard")
         .join("o_script as script", "script.id", "storyboard.scriptId")

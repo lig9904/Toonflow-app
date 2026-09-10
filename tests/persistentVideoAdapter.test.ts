@@ -46,6 +46,8 @@ test("legacy Volcengine adapter remains supported and endpoint fingerprint is st
   const first = createPersistentVideoTaskProvider(input);
   const second = createPersistentVideoTaskProvider({ ...input, endpoint: "https://ark.example/v3" });
   assert.equal(first.fingerprint, second.fingerprint);
+  assert.equal(first.fingerprint, createPersistentVideoTaskProvider({ ...input, referenceTransport: "base64" }).fingerprint);
+  assert.notEqual(first.fingerprint, createPersistentVideoTaskProvider({ ...input, referenceTransport: "url" }).fingerprint);
 });
 
 test("adapter timeout rejects instead of leaving a durable worker slot occupied", async () => {

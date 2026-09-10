@@ -25,6 +25,7 @@ export interface ScriptExecutorDependencies {
   db: Knex;
   model: StructuredScriptModel;
   loadSkill(name: string): Promise<string>;
+  directorGuide?(name: string): string;
 }
 
 const actionSchema = z.enum(["storySkeleton", "adaptationStrategy", "script", "extractAssets", "review"]);
@@ -49,7 +50,7 @@ const reviewSchema = z.object({ findings: z.array(z.string().max(4000)).max(50),
 const hash = (data: unknown) => createHash("sha256").update(JSON.stringify(data)).digest("hex");
 
 interface ScriptInput {
-  project: { id: number; name: string; projectType: string; intro: string; type: string; artStyle: string; directorManual: string; videoRatio: string };
+  project: { id: number; name: string; projectType: string; intro: string; type: string; artStyle: string; directorManual: string; directorGuide?: string; videoRatio: string };
   workspace: ScriptWorkspace;
   chapters: Array<{ id: number; chapterIndex: number; chapter: string; event: string }>;
   assets: Array<{ id: number; name: string; type: string; describe: string }>;
@@ -68,6 +69,7 @@ export function createScriptAgentExecutor(deps: ScriptExecutorDependencies) {
     const input = await ctx.step<ScriptInput>(`script.input:r${revision}`, { projectId, prompt: requestText }, async () => {
       const project = await deps.db("o_project").where({ id: projectId }).select("id", "name", "projectType", "intro", "type", "artStyle", "directorManual", "videoRatio").first();
       if (!project) throw new BuiltinRuntimeError("NOT_FOUND", "项目不存在");
+      project.directorGuide = deps.directorGuide?.(project.directorManual ?? "") ?? "";
       const workspace = await readScriptWorkspace(deps.db, projectId);
       const chapters = await deps.db("o_novel").where({ projectId }).orderBy("chapterIndex").select("id", "chapterIndex", "chapter", "event").limit(2000);
       const assets = await deps.db("o_assets").where({ projectId }).whereNull("assetsId").orderBy("id").select("id", "name", "type", "describe").limit(2000);
@@ -89,7 +91,7 @@ export function createScriptAgentExecutor(deps: ScriptExecutorDependencies) {
     };
     const planBudget = Math.min(1500, Math.floor(run.limits.maxOutputTokens / 3));
     if (planBudget < 128) throw new BuiltinRuntimeError("BUDGET_EXCEEDED", "输出额度不足以执行剧本任务");
-    const plan = await model("script.plan", "scriptAgent:decisionAgent", "script_agent_decision.md", planSchema, {
+    const plan = await model("script.plan", "scriptAgent:decisionAgent", "builtin_script_decision.md", planSchema, {
       request: requestText,
       project: input.project,
       workspace: input.workspace,
@@ -101,10 +103,11 @@ export function createScriptAgentExecutor(deps: ScriptExecutorDependencies) {
     if (plan.chapterIds.some((id) => !input.chapters.some((c) => Number(c.id) === id)) || plan.targetScriptIds.some((id) => !input.workspace.script.some((s) => s.id === id))) {
       throw new BuiltinRuntimeError("INVALID_INPUT", "规划引用了项目外或未提供的内容");
     }
+    if (plan.question && !plan.actions.length) {
+      throw new BuiltinRuntimeError("INVALID_INPUT", `本次没有可执行的剧本步骤：${plan.question}`);
+    }
     if (plan.question) {
       await ctx.emit("message.completed", { text: plan.question });
-      // Runtime handles the explicit human checkpoint without claiming the creative work succeeded.
-      return ctx.waitForHuman(plan.question);
     }
     await ctx.emit("message.completed", { text: plan.summary });
     if (!plan.actions.length) return { summary: plan.summary, saved: false };
@@ -122,13 +125,13 @@ export function createScriptAgentExecutor(deps: ScriptExecutorDependencies) {
       const data = { request: requestText, project: input.project, workspace: input.workspace, assets: input.assets, sources, targetScriptIds: plan.targetScriptIds, proposal };
       switch (action) {
         case "storySkeleton":
-          proposal.storySkeleton = (await model("script.skeleton", "scriptAgent:storySkeletonAgent", "script_execution_skeleton.md", contentSchema, data, perRoleBudget)).content;
+          proposal.storySkeleton = (await model("script.skeleton", "scriptAgent:storySkeletonAgent", "builtin_script_skeleton.md", contentSchema, data, perRoleBudget)).content;
           break;
         case "adaptationStrategy":
-          proposal.adaptationStrategy = (await model("script.adaptation", "scriptAgent:adaptationStrategyAgent", "script_execution_adaptation.md", contentSchema, data, perRoleBudget)).content;
+          proposal.adaptationStrategy = (await model("script.adaptation", "scriptAgent:adaptationStrategyAgent", "builtin_script_adaptation.md", contentSchema, data, perRoleBudget)).content;
           break;
         case "script": {
-          const result = await model("script.episodes", "scriptAgent:scriptAgent", "script_execution_script.md", scriptsSchema, data, perRoleBudget);
+          const result = await model("script.episodes", "scriptAgent:scriptAgent", "builtin_script_episodes.md", scriptsSchema, data, perRoleBudget);
           for (const s of result.script) {
             if (s.id != null && !plan.targetScriptIds.includes(s.id)) throw new BuiltinRuntimeError("INVALID_INPUT", "结果试图修改未选定的剧本");
             if (s.assets?.some((id) => !input.assets.some((a) => Number(a.id) === id))) throw new BuiltinRuntimeError("INVALID_INPUT", "结果引用了未知素材");
@@ -158,14 +161,17 @@ export function createScriptAgentExecutor(deps: ScriptExecutorDependencies) {
     let extraction;
     if (plan.actions.includes("extractAssets")) {
       const targetIds = [...new Set([...plan.targetScriptIds, ...(saved?.createdScriptIds ?? [])])];
-      if (!targetIds.length) await ctx.waitForHuman("请先指定要提取素材的剧集，或在本次运行中生成剧本。", { projectId });
-      const sourceWorkspace = saved ?? input.workspace;
-      extraction = await extractAssets(ctx, { projectId, sourceScripts: targetIds.map((id) => ({ id, expectedVersion: sourceWorkspace.script.find((item) => item.id === id)!.version })),
-        request: requestText, maxOutputTokens: perRoleBudget, stepKey: "script.assets" });
+      if (!targetIds.length) {
+        await ctx.emit("message.completed", { text: "本次没有确定可提取素材的剧集，已跳过素材提取；其他已保存结果保留。" });
+      } else {
+        const sourceWorkspace = saved ?? input.workspace;
+        extraction = await extractAssets(ctx, { projectId, sourceScripts: targetIds.map((id) => ({ id, expectedVersion: sourceWorkspace.script.find((item) => item.id === id)!.version })),
+          request: requestText, maxOutputTokens: perRoleBudget, stepKey: "script.assets" });
+      }
     }
     const finalWorkspace = extraction ? await ctx.step(`script.afterAssets:r${revision}`, { projectId, extraction }, () => readScriptWorkspace(deps.db, projectId)) : saved ?? input.workspace;
     if (plan.actions.includes("review")) {
-      review = await model("script.review", "scriptAgent:supervisionAgent", "script_agent_supervision.md", reviewSchema,
+      review = await model("script.review", "scriptAgent:supervisionAgent", "builtin_script_review.md", reviewSchema,
         { request: requestText, project: input.project, workspace: finalWorkspace, sources, proposal, extraction }, perRoleBudget);
     }
     if (review) await ctx.emit("message.completed", { text: [review.summary, ...review.findings].join("\n") });

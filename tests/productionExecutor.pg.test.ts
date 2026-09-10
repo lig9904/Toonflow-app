@@ -15,6 +15,72 @@ import { finishLegacyProductionWaits } from "../src/services/builtinAgent/finish
 
 const options = { skip: !process.env.TOONFLOW_TEST_DATABASE_URL };
 
+test("new zero-unlimited media runs reach the media executor while text-only scope stays text-only", options, async () => {
+  const f = await fixture(); let images = 0;
+  try {
+    const model = modelFor((request) => {
+      if (request.role === "productionAgent:decisionAgent") {
+        assert.equal(request.input.authorization.imageUnlimited, true);
+        return { actions: ["generateImages"], assetIds: [f.assetId], storyboardIds: [], question: null, summary: "image" };
+      }
+      return { scriptPlan: "The requested director plan" };
+    }, []);
+    const agent = runtime(f, model, { generateImage: async () => { images++; return { jobId: 1, status: "succeeded", selected: true }; } });
+    for (const [key, prompt] of [["unlimited-image", "生成图片"], ["unlimited-plan-only", "只生成导演计划"]]) {
+      const created = await agent.create({ agentType: "productionAgent", projectId: f.projectId, scriptId: f.scriptId, requestedBy: 1, prompt, idempotencyKey: key,
+        limits: defaultBuiltinRunLimits, intent: { mediaBudgetMode: "zero_unlimited" } });
+      await agent.runOnce(); assert.equal((await agent.get(created.run.id)).status, "succeeded", (await agent.get(created.run.id)).errorMessage ?? "");
+    }
+    assert.equal(images, 1);
+    const planning = JSON.parse((await f.db("o_agentWorkData").where({ projectId: f.projectId, key: "productionAgent" }).first()).data);
+    assert.equal(planning.scriptPlan, "The requested director plan");
+  } finally { await f.destroy(); }
+});
+
+test("structured storyboard output repairs an exact omitted visible character before saving", options, async () => {
+  const f = await fixture();
+  try {
+    const [baili] = await insertRowsReturningIds(f.db, "o_assets", { projectId: f.projectId, name: "雪璃", type: "role", describe: "成年狐族女性" });
+    await f.db("o_scriptAssets").insert({ scriptId: f.scriptId, assetId: baili });
+    const model = modelFor((request) => request.role === "productionAgent:decisionAgent"
+      ? { actions: ["storyboard"], assetIds: [], storyboardIds: [], question: null, summary: "storyboard" }
+      : { items: [{ id: null, prompt: "Hero抱臂，雪璃压住笑声。近景。", videoDesc: "Hero说：『今天安静。』", duration: 3, track: "S06", shouldGenerateImage: 1, associateAssetsIds: [f.assetId] }], summary: "S06" }, []);
+    const result = await runOnce(f, model);
+    assert.equal(result.run.status, "succeeded", result.run.errorMessage ?? "");
+    const board = await f.db("o_storyboard").where({ projectId: f.projectId }).first();
+    assert.deepEqual((await f.db("o_assets2Storyboard").where({ storyboardId: board.id }).orderBy("id")).map((row) => Number(row.assetId)), [f.assetId, baili]);
+    assert.match(board.videoDesc, /今天安静/);
+  } finally { await f.destroy(); }
+});
+
+test("a script changed during director planning rejects the obsolete plan", options, async () => {
+  const f = await fixture();
+  try {
+    const model = modelFor(async (request) => {
+      if (request.role === "productionAgent:decisionAgent") return { actions: ["planning"], assetIds: [], storyboardIds: [], question: null, summary: "plan" };
+      await f.db("o_script").where({ id: f.scriptId }).update({ content: "Human revised the episode" });
+      return { scriptPlan: "Stale plan" };
+    }, []);
+    const result = await runOnce(f, model);
+    assert.equal(result.run.status, "failed"); assert.match(result.run.errorMessage ?? "", /剧本.*已被修改/);
+    assert.equal((await f.db("o_agentWorkData").where({ projectId: f.projectId, key: "productionAgent" })).length, 0);
+  } finally { await f.destroy(); }
+});
+
+test("new storyboard rows cannot be written from an obsolete character identity snapshot", options, async () => {
+  const f = await fixture();
+  try {
+    const model = modelFor(async (request) => {
+      if (request.role === "productionAgent:decisionAgent") return { actions: ["storyboard"], assetIds: [], storyboardIds: [], question: null, summary: "board" };
+      await f.db("o_assets").where({ id: f.assetId }).update({ describe: "Human changed the role" });
+      return { items: [{ id: null, prompt: "Hero faces the sea", videoDesc: "Static shot", duration: 3, track: "S01", shouldGenerateImage: 0, associateAssetsIds: [f.assetId] }], summary: "board" };
+    }, []);
+    const result = await runOnce(f, model);
+    assert.equal(result.run.status, "failed"); assert.match(result.run.errorMessage ?? "", /素材设定已被修改/);
+    assert.equal((await f.db("o_storyboard").where({ projectId: f.projectId })).length, 0);
+  } finally { await f.destroy(); }
+});
+
 test("a saved but unapplied image does not block later production review", options, async () => {
   const f = await fixture();
   try {

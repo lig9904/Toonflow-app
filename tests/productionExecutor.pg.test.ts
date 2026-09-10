@@ -4,13 +4,112 @@ import { createPostgresFixture, migratePostgresFixture } from "../src/lib/postgr
 import { insertRowsReturningIds } from "../src/lib/insertRows";
 import { ensureProductionStateSchema, ProductionStateService } from "../src/services/productionState";
 import { BuiltinAgentRuntime, ensureBuiltinAgentRuntimeSchema } from "../src/services/builtinAgentRuntime";
+import { StructuredModelOutputError } from "../src/lib/structuredModelOutput";
 import { createProductionAgentExecutor, type ProductionMediaCapability } from "../src/services/builtinAgent/productionExecutor";
 import type { StructuredScriptModel } from "../src/services/builtinAgent/scriptExecutor";
 import { defaultBuiltinRunLimits } from "../src/services/builtinAgent/contracts";
 import { ensureCreativeWorkspaceSchema } from "../src/services/creativeWorkspace";
 import { saveProductionPlanning } from "../src/services/productionFlow";
+import { ensureAssetExtractionWorkspaceSchema } from "../src/services/assetExtractionWorkspace";
 
 const options = { skip: !process.env.TOONFLOW_TEST_DATABASE_URL };
+
+test("independent production resumes the same task without replaying its saved director plan", options, async () => {
+  const f = await fixture();
+  let release!: () => void;
+  try {
+    let entered!: () => void;
+    const waiting = new Promise<void>((resolve) => { entered = resolve; });
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    let storyboardCalls = 0, directorCalls = 0;
+    const model: StructuredScriptModel = { async generate(request) {
+      assert.equal(request.useModelOutputLimit, true);
+      if (request.role === "productionAgent:decisionAgent") return { value: request.schema.parse({ actions: ["extractAssets", "planning", "deriveAssets", "storyboard"], assetIds: [f.assetId], storyboardIds: [], question: null, summary: "Plan and storyboard" }), outputTokens: 100 };
+      if (request.role === "universalAi") return { value: request.schema.parse({ roles: [{ action: "reuse", assetId: f.assetId, expectedVersion: 0 }], scenes: [], props: [], summary: "Reuse" }), outputTokens: 600 };
+      if (request.role === "productionAgent:deriveAssetsAgent") return { value: request.schema.parse({ assets: [] }), outputTokens: 7 };
+      if (request.role === "productionAgent:directorPlanAgent") { directorCalls++; return { value: request.schema.parse({ scriptPlan: "Saved before interruption" }), outputTokens: 14000 }; }
+      storyboardCalls++;
+      if (storyboardCalls === 1) { entered(); await blocked; }
+      return { value: request.schema.parse({ items: [{ id: null, expectedVersion: null, prompt: "Resumed shot", videoDesc: "", duration: 3, track: "A", shouldGenerateImage: 0, associateAssetsIds: [f.assetId] }], summary: "Done" }), outputTokens: 2000 };
+    } };
+    const agent = runtime(f, model);
+    const created = await agent.create({ agentType: "productionAgent", projectId: f.projectId, scriptId: f.scriptId, requestedBy: 1, prompt: "Produce", idempotencyKey: "independent-output-resume", limits: defaultBuiltinRunLimits, intent: { outputBudgetMode: "model_per_call" } });
+    const running = agent.runOnce();
+    await Promise.race([waiting, running.then(() => { throw new Error("Run stopped before reaching storyboard"); })]);
+    const current = await agent.get(created.run.id);
+    const paused = await agent.control(current.id, current.version, "pause");
+    release(); await running;
+    await agent.control(current.id, paused.version, "resume");
+    await agent.runOnce();
+    const done = await agent.get(current.id);
+    assert.equal(done.status, "succeeded", done.errorMessage ?? "");
+    assert.equal(directorCalls, 1); assert.equal(storyboardCalls, 2);
+    assert.equal(done.outputTokens, 16707);
+    assert.equal((await f.db("o_storyboard").where({ scriptId: f.scriptId })).length, 1);
+  } finally { release?.(); await f.destroy(); }
+});
+
+test("full production gives every model call an independent limit and saves an 18-shot episode beyond the old total", options, async () => {
+  const f = await fixture();
+  try {
+    const calls: string[] = [];
+    const model: StructuredScriptModel = { async generate(request) {
+      calls.push(request.role);
+      assert.equal(request.useModelOutputLimit, true, "No stage may share the old 12000-token allowance");
+      assert.equal(request.maxOutputTokens, 0, "The adapter resolves the configured model limit");
+      let value: unknown, outputTokens: number;
+      if (request.role === "productionAgent:decisionAgent") {
+        value = { actions: ["extractAssets", "planning", "deriveAssets", "storyboard"], assetIds: [f.assetId], storyboardIds: [], question: null, summary: "Prepare" }; outputTokens = 135;
+      } else if (request.role === "universalAi") {
+        value = { roles: [{ action: "reuse", assetId: f.assetId, expectedVersion: 0 }], scenes: [], props: [], bindings: [{ scriptId: f.scriptId, assets: [{ kind: "existing", assetId: f.assetId }] }], summary: "Reuse" }; outputTokens = 608;
+      } else if (request.role === "productionAgent:directorPlanAgent") {
+        value = { scriptPlan: "Independent complete director plan" }; outputTokens = 7000;
+      } else if (request.role === "productionAgent:deriveAssetsAgent") {
+        assert.equal((request.input as any).flow.scriptPlan, "Independent complete director plan");
+        value = { assets: [] }; outputTokens = 7;
+      } else {
+        assert.equal((request.input as any).flow.scriptPlan, "Independent complete director plan");
+        value = { items: Array.from({ length: 18 }, (_, index) => ({ id: null, expectedVersion: null, prompt: `Independent shot ${index + 1}`, videoDesc: `Action ${index + 1}`, duration: index < 6 ? 4 : 3, track: `shot-${index}`, shouldGenerateImage: 0, associateAssetsIds: [f.assetId] })), summary: "18 shots" }; outputTokens = 10000;
+      }
+      return { value: request.schema.parse(value), outputTokens, maxOutputTokens: 384000 };
+    } };
+    const agent = runtime(f, model);
+    const created = await agent.create({ agentType: "productionAgent", projectId: f.projectId, scriptId: f.scriptId, requestedBy: 1, prompt: "全部生成", idempotencyKey: "independent-output-full", limits: defaultBuiltinRunLimits, intent: { thinkLevel: 0, outputBudgetMode: "model_per_call" } });
+    await agent.runOnce();
+    const done = await agent.get(created.run.id);
+    assert.equal(done.status, "succeeded", done.errorMessage ?? "");
+    assert.equal(done.outputTokens, 17750);
+    assert.equal(calls.length, 5);
+    const shots = await f.db("o_storyboard").where({ projectId: f.projectId, scriptId: f.scriptId });
+    assert.equal(shots.length, 18); assert.equal(shots.reduce((sum, row) => sum + Number(row.duration), 0), 60);
+    const steps = await f.db("ext_builtin_run_steps").where({ runId: done.id, modelCall: true });
+    assert(steps.every((step) => step.result.maxOutputTokens === 384000));
+    const events = await agent.events(done.id);
+    assert(events.some((event) => event.type === "artifact.saved" && (event.data as any).kind === "productionPlanning"));
+    assert.equal(done.imageGenerations, 0); assert.equal(done.videoGenerations, 0);
+  } finally { await f.destroy(); }
+});
+
+test("independent model output failures keep usage and earlier data without retrying", options, async () => {
+  const f = await fixture();
+  try {
+    await saveProductionPlanning(f.db, f.projectId, f.scriptId, 0, { scriptPlan: "Human plan", storyboardTable: "Human table" });
+    let calls = 0;
+    const model: StructuredScriptModel = { async generate(request) {
+      calls++;
+      if (request.role === "productionAgent:decisionAgent") return { value: request.schema.parse({ actions: ["planning"], assetIds: [], storyboardIds: [], question: null, summary: "Plan" }), outputTokens: 100 };
+      throw new StructuredModelOutputError("MODEL_OUTPUT_LIMIT", { role: request.role, maxOutputTokens: 24000, outputTokens: 24000, finishReason: "length", reasoningTokens: 0, textCharacters: 20000 });
+    } };
+    const agent = runtime(f, model);
+    const created = await agent.create({ agentType: "productionAgent", projectId: f.projectId, scriptId: f.scriptId, requestedBy: 1, prompt: "Plan", idempotencyKey: "independent-output-failure", limits: defaultBuiltinRunLimits, intent: { outputBudgetMode: "model_per_call" } });
+    await agent.runOnce();
+    const done = await agent.get(created.run.id);
+    assert.equal(done.status, "failed"); assert.equal(done.errorCode, "MODEL_OUTPUT_LIMIT");
+    assert.equal(done.outputTokens, 24100); assert.equal(calls, 2);
+    const data = JSON.parse((await f.db("o_agentWorkData").where({ projectId: f.projectId, episodesId: f.scriptId, key: "productionAgent" }).first()).data);
+    assert.equal(data.scriptPlan, "Human plan"); assert.equal(data.storyboardTable, "Human table");
+  } finally { await f.destroy(); }
+});
 
 test("independent image targets complete concurrently while one conflicted target waits for human review", options, async () => {
   const f = await fixture();
@@ -47,6 +146,7 @@ async function fixture() {
   await ensureProductionStateSchema(f.db);
   await ensureBuiltinAgentRuntimeSchema(f.db);
   await ensureCreativeWorkspaceSchema(f.db);
+  await ensureAssetExtractionWorkspaceSchema(f.db);
   const [projectId] = await insertRowsReturningIds(f.db, "o_project", { userId: 1, name: "Production", projectType: "short", imageModel: "image:test", imageQuality: "1K", videoRatio: "16:9" });
   const [scriptId] = await insertRowsReturningIds(f.db, "o_script", { projectId, name: "Episode", content: "A script" });
   const [assetId] = await insertRowsReturningIds(f.db, "o_assets", { projectId, name: "Hero", type: "role", describe: "hero" });

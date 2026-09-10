@@ -84,7 +84,9 @@ export function createProductionAgentSocketRoute(dependencies: ProductionAgentSo
           const actor = await currentPrincipal();
           await authorizeSocketContext(dependencies, actor, context, "edit");
           const input = chatInput(data);
-          const result = await dependencies.runtime.create({ agentType: "productionAgent", projectId: context.projectId, scriptId: context.scriptId, requestedBy: actor.id, prompt: input.prompt, idempotencyKey: input.idempotencyKey, limits: input.limits });
+          const explicitTotal = data.limits && typeof data.limits === "object" && "maxOutputTokens" in data.limits;
+          const result = await dependencies.runtime.create({ agentType: "productionAgent", projectId: context.projectId, scriptId: context.scriptId, requestedBy: actor.id, prompt: input.prompt, idempotencyKey: input.idempotencyKey, limits: input.limits,
+            ...(explicitTotal ? {} : { intent: { outputBudgetMode: "model_per_call" } }) });
           socket.emit("builtinRunCreated", { runId: result.run.id, reused: result.reused, isolationKey: context.isolationKey });
           callback?.({ success: true, runId: result.run.id, reused: result.reused });
         } catch (error) { callback?.({ success: false, code: errorCode(error), message: "内置 Agent 任务未创建，请刷新后重试" }); if (shouldDisconnect(error)) disconnectSocket(socket); }

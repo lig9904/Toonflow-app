@@ -60,7 +60,9 @@ export function createBuiltinAgentRouter(deps: BuiltinHttpDependencies): express
       ...runInput,
       requestedBy,
       limits: { ...defaultBuiltinRunLimits, ...input.limits },
-      ...(thinkLevel === undefined ? {} : { intent: { thinkLevel } }),
+      ...((input.agentType === "productionAgent" && input.limits?.maxOutputTokens === undefined) || thinkLevel !== undefined
+        ? { intent: { ...(thinkLevel === undefined ? {} : { thinkLevel }),
+          ...(input.agentType === "productionAgent" && input.limits?.maxOutputTokens === undefined ? { outputBudgetMode: "model_per_call" } : {}) } } : {}),
     });
     res.send({ code: 200, data: result });
   }));

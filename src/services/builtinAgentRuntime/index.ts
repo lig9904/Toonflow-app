@@ -11,6 +11,7 @@ import {
   type BuiltinRunStatus,
   type BuiltinRunView,
   type CreateBuiltinRun,
+  hasIndependentProductionOutput,
 } from "../builtinAgent/contracts";
 
 const RUNS = "ext_builtin_runs";
@@ -790,7 +791,11 @@ export class BuiltinAgentRuntime {
     await this.db.transaction(async (trx) => {
       const row = await this.lockActiveRun(trx, runId, epoch);
       const limits = limitsOf(row.limits);
-      const changed = await trx(RUNS).where({ id: runId, leaseOwner: this.workerId, leaseEpoch: epoch, status: "running" }).andWhere("outputTokens", "<=", limits.maxOutputTokens - tokens).update({ outputTokens: trx.raw('"outputTokens" + ?', [tokens]) });
+      const query = trx(RUNS).where({ id: runId, leaseOwner: this.workerId, leaseEpoch: epoch, status: "running" });
+      // Each new production call is bounded by its configured model. Keep actual
+      // aggregate usage for reporting; do not make later stages share this cap.
+      if (!hasIndependentProductionOutput(row.agentType, parseJson(row.intent))) query.andWhere("outputTokens", "<=", limits.maxOutputTokens - tokens);
+      const changed = await query.update({ outputTokens: trx.raw('"outputTokens" + ?', [tokens]) });
       if (changed !== 1) throw new BuiltinRuntimeError("BUDGET_EXCEEDED", "Output token budget exceeded");
     });
   }

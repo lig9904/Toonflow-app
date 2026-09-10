@@ -5,6 +5,12 @@ export type BuiltinRunStatus = typeof builtinRunStatuses[number];
 export type BuiltinControlAction = "pause" | "resume" | "cancel" | "takeover";
 export type BuiltinThinkLevel = 0 | 1 | 2 | 3;
 
+/** New production runs give each model request its own model-level output limit. */
+export function hasIndependentProductionOutput(agentType: string, intent: unknown): boolean {
+  return agentType === "productionAgent" && !!intent && typeof intent === "object" && !Array.isArray(intent)
+    && (intent as Record<string, unknown>).outputBudgetMode === "model_per_call";
+}
+
 /** Public starts persist this server-owned preference in intent; older runs default to thinking off. */
 export function builtinThinkLevelFromIntent(intent: unknown): BuiltinThinkLevel {
   if (!intent || typeof intent !== "object" || Array.isArray(intent)) return 0;

@@ -2,6 +2,8 @@
 
 Subsequent production-output and workspace-storage fixes are recorded in [1.1.8-yd.4.3](STRUCTURED-OUTPUT-FIX.md).
 
+Independent per-request production output and checkpoint recovery are recorded in [1.1.8-yd.4.4](INDEPENDENT-PRODUCTION-OUTPUT.md).
+
 The shared-team builtin Agent release is deployed. It includes the six documented Seedance 2.5 Standard models in the existing relay, and a live ScriptAgent → ProductionAgent → video job completed successfully.
 
 ## Included behavior

@@ -11,7 +11,7 @@ import type { StructuredModelRequest, StructuredScriptModel } from "./scriptExec
 import { createAssetExtractionHelper } from "./assetExtraction";
 import { getCreativeState } from "../creativeWorkspace";
 import pLimit from "p-limit";
-import { builtinThinkLevelFromIntent } from "./contracts";
+import { builtinThinkLevelFromIntent, hasIndependentProductionOutput } from "./contracts";
 import { productionActionLabels, productionDecisionPrompt, productionStageContract } from "./productionPrompts";
 
 export interface ProductionMediaRequest {
@@ -76,6 +76,7 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
     const scriptId = run.scriptId;
     const revision = run.inputRevision ?? 0;
     const thinkLevel = builtinThinkLevelFromIntent(run.intent);
+    const independentOutput = hasIndependentProductionOutput(run.agentType, run.intent);
     const requestText = run.continuation ? `${run.prompt}\n\n人工补充与续作要求：\n${run.continuation}` : run.prompt;
     const project = await ctx.step(`production.input:r${revision}`, { projectId, scriptId, requestText }, async () => {
       const row = await deps.db("o_project").where({ id: projectId }).first();
@@ -85,19 +86,25 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
       return { id: projectId, scriptId, scriptVersion: scriptVersion.version, name: row.name ?? "", artStyle: row.artStyle ?? "", imageModel: row.imageModel ?? "", videoModel: row.videoModel ?? row.videoModelKey ?? "", imageQuality: row.imageQuality ?? "1K", videoRatio: row.videoRatio ?? "16:9", videoMode: row.mode ?? row.videoMode, videoResolution: row.videoResolution ?? row.resolution, audio: row.generateAudio ?? row.audio, script: episode.content ?? "" };
     });
     let flow = await ctx.step(`production.flow:r${revision}`, { projectId, scriptId }, () => readProductionFlow(deps.db, projectId, scriptId, async (path) => path));
+    const refreshFlow = async (after: string) => {
+      const read = () => readProductionFlow(deps.db, projectId, scriptId, async (path) => path);
+      // A later completed stage may already have changed this workspace when a
+      // worker resumes. Replay the original stage input, not our later writes.
+      return independentOutput ? ctx.step(`production.flow.after.${after}:r${revision}`, { projectId, scriptId }, read) : read();
+    };
     const skillCache = new Map<string, string>();
     const skill = async (name: string) => { if (!skillCache.has(name)) skillCache.set(name, await deps.loadSkill(name)); return skillCache.get(name)!; };
     const model = async <T>(key: string, role: StructuredModelRequest<T>["role"], skillName: string, schema: z.ZodType<T>, input: unknown, budget: number, reserveTokens = 0): Promise<T> => {
-      if (budget < 128) throw new BuiltinRuntimeError("BUDGET_EXCEEDED", "输出额度不足以执行制作阶段");
+      if (!independentOutput && budget < 128) throw new BuiltinRuntimeError("BUDGET_EXCEEDED", "输出额度不足以执行制作阶段");
       await ctx.assertActive();
       const system = role === "productionAgent:decisionAgent" ? productionDecisionPrompt
         : `${await skill(skillName)}\n\n当前服务器执行契约（取代上述旧工具、XML和前端保存流程）：${productionStageContract(role)} 所有项目、剧集、素材、分镜 ID 必须来自输入。`;
-      const result = await ctx.step(`production.${key}:r${revision}`, { input, role, systemHash: hash(system), budget, reserveTokens }, async () => {
-        const remaining = ctx.remainingOutputTokens ? await ctx.remainingOutputTokens() : run.limits.maxOutputTokens;
-        const effectiveBudget = Math.min(budget, remaining - reserveTokens);
-        if (effectiveBudget < 128) throw new BuiltinRuntimeError("BUDGET_EXCEEDED", "本次运行的剩余文本输出额度不足，请缩小下一步范围；已保存结果保留");
-        const generated = await deps.model.generate({ role, system, input, schema, maxOutputTokens: effectiveBudget, signal: ctx.signal, thinkLevel });
-        return { value: schema.parse(generated.value), outputTokens: generated.outputTokens };
+      const result = await ctx.step(`production.${key}:r${revision}`, { input, role, systemHash: hash(system), ...(independentOutput ? { outputBudgetMode: "model_per_call" } : { budget, reserveTokens }) }, async () => {
+        const remaining = !independentOutput && ctx.remainingOutputTokens ? await ctx.remainingOutputTokens() : run.limits.maxOutputTokens;
+        const effectiveBudget = independentOutput ? 0 : Math.min(budget, remaining - reserveTokens);
+        if (!independentOutput && effectiveBudget < 128) throw new BuiltinRuntimeError("BUDGET_EXCEEDED", "本次运行的剩余文本输出额度不足，请缩小下一步范围；已保存结果保留");
+        const generated = await deps.model.generate({ role, system, input, schema, maxOutputTokens: effectiveBudget, ...(independentOutput ? { useModelOutputLimit: true } : {}), signal: ctx.signal, thinkLevel });
+        return { value: schema.parse(generated.value), outputTokens: generated.outputTokens, ...(generated.maxOutputTokens ? { maxOutputTokens: generated.maxOutputTokens } : {}) };
       }, { modelCall: true });
       return result.value;
     };
@@ -115,7 +122,7 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
     await ctx.emit("message.completed", { text: actions.length ? `准备执行：${actions.map((action) => productionActionLabels[action]).join("、")}。保存完成后会显示实际产物。` : "本轮未执行制作步骤，也未写入数据。" });
     const selected = new Set(actions);
     const remainingBudget = run.limits.maxOutputTokens - planBudget;
-    if (remainingBudget < actions.length * 128) throw new BuiltinRuntimeError("BUDGET_EXCEEDED", "输出额度不足以执行所选制作阶段");
+    if (!independentOutput && remainingBudget < actions.length * 128) throw new BuiltinRuntimeError("BUDGET_EXCEEDED", "输出额度不足以执行所选制作阶段");
     const textActionCount = actions.filter((action) => action !== "generateImages" && action !== "generateVideos").length;
     const budget = Math.floor(remainingBudget / Math.max(1, textActionCount));
     const output: Record<string, unknown> = { projectId, scriptId, revision, actions };
@@ -125,17 +132,17 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
     for (const action of ORDER) {
       if (!selected.has(action)) continue;
       if (action === "extractAssets") {
-        const extraction = await extractAssets(ctx, { projectId, sourceScripts: [{ id: scriptId, expectedVersion: project.scriptVersion }], request: requestText, maxOutputTokens: budget, stepKey: "production.extractAssets" });
+        const extraction = await extractAssets(ctx, { projectId, sourceScripts: [{ id: scriptId, expectedVersion: project.scriptVersion }], request: requestText, maxOutputTokens: budget, ...(independentOutput ? { useModelOutputLimit: true } : {}), stepKey: "production.extractAssets" });
         output.assets = extraction;
         targetAssetIds = extraction.assetIds;
-        flow = await readProductionFlow(deps.db, projectId, scriptId, async (path) => path);
+        flow = await refreshFlow("extractAssets");
         knownTopAssets = new Set(flow.assets.map((asset: any) => Number(asset.id)));
         knownAssets = new Set(flow.assets.flatMap((asset: any) => [Number(asset.id), ...asset.derive.map((child: any) => Number(child.id))]));
       } else if (action === "planning") {
         const planResult = await model("directorPlan", "productionAgent:directorPlanAgent", "production_execution_director_plan.md", planningSchema, { request: requestText, project, flow }, textActionCount > 1 ? Math.min(4096, budget) : budget);
         const saved = await ctx.commit(`production.planning:r${revision}`, { projectId, scriptId, expected: flow.planningVersion, planResult }, (trx) => saveProductionPlanning(trx as unknown as Knex, projectId, scriptId, flow.planningVersion, { scriptPlan: planResult.scriptPlan, storyboardTable: flow.storyboardTable }));
         output.planning = saved;
-        flow = await readProductionFlow(deps.db, projectId, scriptId, async (path) => path);
+        flow = await refreshFlow("planning");
         await ctx.emit("artifact.saved", { kind: "productionPlanning", ids: [projectId, scriptId], version: saved.planningVersion });
       } else if (action === "deriveAssets") {
         if (!targetAssetIds.length) await ctx.waitForHuman(`请指定需要分析衍生版本的素材名称或 ID，或回复“全部当前剧集素材”。可选素材示例：${flow.assets.slice(0, 20).map((asset: any) => `${String(asset.name ?? "未命名").slice(0, 80)}（ID ${asset.id}）`).join("、") || "当前剧集尚未关联基础素材"}`, { projectId, scriptId });
@@ -153,7 +160,7 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
         });
         output.derivedAssets = created;
         targetAssetIds = (created as Array<{ id: number }>).map((item) => Number(item.id));
-        flow = await readProductionFlow(deps.db, projectId, scriptId, async (path) => path);
+        flow = await refreshFlow("deriveAssets");
         knownTopAssets = new Set(flow.assets.map((asset: any) => Number(asset.id)));
         knownAssets = new Set(flow.assets.flatMap((asset: any) => [Number(asset.id), ...asset.derive.map((child: any) => Number(child.id))]));
         if (targetAssetIds.length) await ctx.emit("artifact.saved", { kind: "assets", ids: targetAssetIds });
@@ -199,7 +206,7 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
         });
         output.storyboardIds = created;
         targetStoryboardIds = created;
-        flow = await readProductionFlow(deps.db, projectId, scriptId, async (path) => path);
+        flow = await refreshFlow("storyboard");
         knownStoryboards = new Map(flow.storyboard.map((storyboard: any) => [Number(storyboard.id), storyboard]));
         await ctx.emit("artifact.saved", { kind: "storyboards", ids: created });
       } else if (action === "generateImages" || action === "generateVideos") {

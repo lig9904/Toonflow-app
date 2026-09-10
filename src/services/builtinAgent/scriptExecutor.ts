@@ -14,10 +14,11 @@ export interface StructuredModelRequest<T> {
   input: unknown;
   schema: z.ZodType<T>;
   maxOutputTokens: number;
+  useModelOutputLimit?: boolean;
   signal: AbortSignal;
   thinkLevel: BuiltinThinkLevel;
 }
-export interface StructuredModelResult<T> { value: T; outputTokens: number; }
+export interface StructuredModelResult<T> { value: T; outputTokens: number; maxOutputTokens?: number; }
 export interface StructuredScriptModel { generate<T>(request: StructuredModelRequest<T>): Promise<StructuredModelResult<T>>; }
 export interface ScriptExecutorDependencies {
   db: Knex;

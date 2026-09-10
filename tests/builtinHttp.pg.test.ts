@@ -15,6 +15,26 @@ import { createScriptAgentExecutor, type StructuredScriptModel } from "../src/se
 
 const options = { skip: !process.env.TOONFLOW_TEST_DATABASE_URL };
 const legacyKey = "isolated-http-fixture-signing-key";
+
+test("new production starts use independent model calls while explicit legacy totals and idempotency stay intact", options, async () => {
+  const f = await setup();
+  try {
+    const [scriptId] = await insertRowsReturningIds(f.db, "o_script", { projectId: f.projectId, name: "Episode", content: "Fixture" });
+    const cookie = await f.login("editor-a", "fixture-password-a");
+    const input = { agentType: "productionAgent", projectId: f.projectId, scriptId, prompt: "全部生成", idempotencyKey: "production-independent-http", thinkLevel: 0, limits: { maxImageGenerations: 0, maxVideoGenerations: 0 } };
+    const created = await f.post("/api/builtinAgent/start", input, cookie);
+    assert.equal(created.status, 200, JSON.stringify(created.body));
+    assert.deepEqual(created.body.data.run.intent, { thinkLevel: 0, outputBudgetMode: "model_per_call" });
+    assert.equal((await f.post("/api/builtinAgent/start", input, cookie)).body.data.reused, true);
+    const legacy = await f.post("/api/builtinAgent/start", { ...input, idempotencyKey: "production-explicit-total-http", limits: { maxOutputTokens: 6000 } }, cookie);
+    assert.equal(legacy.status, 200); assert.deepEqual(legacy.body.data.run.intent, { thinkLevel: 0 });
+    assert.equal(legacy.body.data.run.limits.maxOutputTokens, 6000);
+    assert.equal(created.body.data.run.limits.maxImageGenerations, 0); assert.equal(created.body.data.run.limits.maxVideoGenerations, 0);
+    const forged = await f.post("/api/builtinAgent/start", { ...input, intent: { outputBudgetMode: "model_per_call" } }, cookie);
+    assert.equal(forged.status, 400);
+    assert.equal(f.modelCalls, 0);
+  } finally { await f.close(); }
+});
 async function setup() {
   const f = await createPostgresFixture();
   await migratePostgresFixture(f.db);

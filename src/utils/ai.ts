@@ -5,6 +5,7 @@ import { transform } from "sucrase";
 import u from "@/utils";
 import { createPersistentVideoTaskProvider, type PersistentVideoTaskProvider } from "@/lib/persistentVideoAdapter";
 import { textExecutionOptions } from "@/lib/textExecutionOptions";
+import { textModelOutputLimit } from "@/lib/textModelOutputLimit";
 import { createPersistentImageTaskProvider, type PersistentImageTaskProvider } from "@/lib/persistentImageAdapter";
 import { resolveRegisteredImageModel, type ResolvedImageModel } from "@/lib/imageModelSelection";
 
@@ -153,6 +154,18 @@ async function getVendorTemplateFn(fnName: FnName, modelName: `${string}:${strin
       return fn(selectedModel, effectiveThink, thinkLevel);
     };
   else return <T>(input: T) => fn(input, selectedModel);
+}
+
+/** Read limits from the same role and enabled model registry used for generation. */
+export async function getConfiguredTextOutputLimit(key: AiType): Promise<number | undefined> {
+  const config = await getModelConfig(key);
+  const modelName = await resolveModelName(key);
+  const { selectedModel, running, enabled } = await loadVendorRuntime(modelName);
+  if (!enabled || selectedModel.type !== "text") throw new Error("模型未启用或不是文本模型");
+  return textModelOutputLimit({ modelName: selectedModel.modelName,
+    baseUrl: running.vendor?.inputValues?.baseUrl,
+    declaredMaxOutputTokens: selectedModel.maxOutputTokens,
+    configuredMaxOutputTokens: config?.maxOutputTokens });
 }
 
 export type { PersistentVideoTaskProvider } from "@/lib/persistentVideoAdapter";

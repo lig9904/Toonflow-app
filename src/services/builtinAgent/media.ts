@@ -101,7 +101,7 @@ export function createProductionMediaCapabilities(deps: Dependencies): Productio
       }
       await request.ctx.assertActive();
       if (receipt.status === "failed") throw new BuiltinRuntimeError("INVALID_INPUT", receipt.error ?? "图片生成失败");
-      await request.ctx.emit("artifact.saved", { kind: "image", jobId: receipt.jobId, targetKind: request.targetKind, targetId: request.targetId, path: receipt.artifactPath, selected: receipt.selected });
+      if (receipt.status === "succeeded" && receipt.artifactPath) await request.ctx.emit("artifact.saved", { kind: "image", jobId: receipt.jobId, targetKind: request.targetKind, targetId: request.targetId, path: receipt.artifactPath, selected: receipt.selected });
       return receipt;
     },
     async generateVideo(request) {

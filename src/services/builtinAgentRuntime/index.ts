@@ -710,7 +710,7 @@ export class BuiltinAgentRuntime {
     await this.assertForMutation(run.id, epoch, controller);
     const mediaResult = result as { status?: string; selected?: boolean } | null;
     const waitingOnMedia = (options.imageGeneration || options.videoGeneration) && mediaResult &&
-      (mediaResult.status === "needs_reconciliation" || (options.imageGeneration && mediaResult.status === "succeeded" && mediaResult.selected === false));
+      (mediaResult.status === "needs_reconciliation" || (run.agentType !== "productionAgent" && options.imageGeneration && mediaResult.status === "succeeded" && mediaResult.selected === false));
     if (waitingOnMedia) {
       // Keep the reservation, but do not cache a mutable reconciliation state
       // as final. On resume the capability reads the same durable job again.

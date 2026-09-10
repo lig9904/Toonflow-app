@@ -6,6 +6,8 @@ Independent per-request production output and checkpoint recovery are recorded i
 
 Live canvas previews, capability-driven quality choices, autosave and image-preparation recovery are recorded in [1.1.8-yd.4.5](CANVAS-LIVE-UPDATE-FIX.md).
 
+Production without mandatory human handoffs and direct generated-image viewing are recorded in [1.1.8-yd.4.6](NONBLOCKING-PRODUCTION-RESULTS.md).
+
 The shared-team builtin Agent release is deployed. It includes the six documented Seedance 2.5 Standard models in the existing relay, and a live ScriptAgent → ProductionAgent → video job completed successfully.
 
 ## Included behavior

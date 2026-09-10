@@ -11,8 +11,62 @@ import { defaultBuiltinRunLimits } from "../src/services/builtinAgent/contracts"
 import { ensureCreativeWorkspaceSchema } from "../src/services/creativeWorkspace";
 import { saveProductionPlanning } from "../src/services/productionFlow";
 import { ensureAssetExtractionWorkspaceSchema } from "../src/services/assetExtractionWorkspace";
+import { finishLegacyProductionWaits } from "../src/services/builtinAgent/finishLegacyProductionWaits";
 
 const options = { skip: !process.env.TOONFLOW_TEST_DATABASE_URL };
+
+test("a saved but unapplied image does not block later production review", options, async () => {
+  const f = await fixture();
+  try {
+    const calls: string[] = [];
+    const model = modelFor((request) => request.role === "productionAgent:decisionAgent" ? { actions: ["generateImages", "review"], assetIds: [f.assetId], storyboardIds: [], question: null, summary: "Image and review" } : { findings: [], summary: "Reviewed" }, calls);
+    const result = await runOnce(f, model, { generateImage: async () => ({ status: "succeeded", jobId: 1, artifactPath: "/1/assets/retained.jpg", selected: false }) }, { ...defaultBuiltinRunLimits, maxImageGenerations: 1 });
+    assert.equal(result.run.status, "succeeded", result.run.errorMessage ?? "");
+    assert.equal((result.run.result as any).outcome, "complete_with_notes");
+    assert(calls.includes("productionAgent:supervisionAgent"));
+    const imageStep = await f.db("ext_builtin_run_steps").where({ runId: result.run.id, imageGeneration: true }).first();
+    assert.equal(imageStep.status, "completed");
+    assert.equal((await f.db("ext_builtin_runs").where({ id: result.run.id }).first()).waitingQuestion, null);
+  } finally { await f.destroy(); }
+});
+
+test("same-name derived output reuses the existing entity without overwriting its description or billing twice", options, async () => {
+  const f = await fixture();
+  try {
+    const [child] = await insertRowsReturningIds(f.db, "o_assets", { projectId: f.projectId, assetsId: f.assetId, type: "role", name: "Existing variant", describe: "Human description" });
+    const generated: number[] = [];
+    const model = modelFor((request) => request.role === "productionAgent:decisionAgent" ? { actions: ["deriveAssets", "generateImages"], assetIds: [f.assetId], storyboardIds: [], question: null, summary: "Use variants" } : { assets: [{ id: null, expectedVersion: null, parentAssetId: f.assetId, name: "Existing variant", description: "Unrequested replacement" }] }, []);
+    const result = await runOnce(f, model, { generateImage: async (request) => { generated.push(request.targetId); return { jobId: 1, status: "succeeded", selected: true }; } }, { ...defaultBuiltinRunLimits, maxImageGenerations: 1 });
+    assert.equal(result.run.status, "succeeded", result.run.errorMessage ?? "");
+    assert.deepEqual(generated, [child]);
+    assert.equal((await f.db("o_assets").where({ assetsId: f.assetId })).length, 1);
+    assert.equal((await f.db("o_assets").where({ id: child }).first()).describe, "Human description");
+  } finally { await f.destroy(); }
+});
+
+test("legacy production waits end idempotently without replaying work or changing script-agent waits", options, async () => {
+  const f = await fixture();
+  try {
+    let calls = 0;
+    const agent = new BuiltinAgentRuntime({ db: f.db, authorize: async () => undefined, execute: async (ctx) => {
+      calls++;
+      await ctx.waitForHuman("Old handoff", ctx.run.prompt === "saved" ? { action: "generateImages", completed: [{ result: { status: "succeeded", artifactPath: "/1/assets/saved.jpg" } }], issues: [{ result: { status: "succeeded" } }] } : {});
+    } });
+    const ids: string[] = [];
+    for (const [agentType, prompt] of [["productionAgent", "saved"], ["productionAgent", "empty"], ["scriptAgent", "script"]] as const) {
+      const created = await agent.create({ agentType, prompt, projectId: f.projectId, scriptId: f.scriptId, requestedBy: 1, idempotencyKey: `legacy-wait-${prompt}`, limits: defaultBuiltinRunLimits });
+      ids.push(created.run.id); await agent.runOnce();
+    }
+    assert.equal(await finishLegacyProductionWaits(f.db), 2);
+    assert.equal(await finishLegacyProductionWaits(f.db), 0);
+    assert.equal((await agent.get(ids[0])).status, "succeeded");
+    assert.equal(((await agent.get(ids[0])).result as any).outcome, "complete_with_notes");
+    assert.equal((await agent.get(ids[1])).status, "failed");
+    assert.equal((await agent.get(ids[2])).status, "waiting_human");
+    assert.equal(calls, 3);
+    assert.equal(await agent.runOnce(), false);
+  } finally { await f.destroy(); }
+});
 
 test("an authorized derived-image run renders existing unpictured children even when analysis adds none", options, async () => {
   const f = await fixture();
@@ -139,7 +193,7 @@ test("independent model output failures keep usage and earlier data without retr
   } finally { await f.destroy(); }
 });
 
-test("independent image targets complete concurrently while one conflicted target waits for human review", options, async () => {
+test("independent image targets finish without a human handoff when one target conflicts", options, async () => {
   const f = await fixture();
   try {
     const [bad, good] = await insertRowsReturningIds(f.db, "o_storyboard", [
@@ -159,12 +213,11 @@ test("independent image targets complete concurrently while one conflicted targe
       return { status: "succeeded", jobId: 99, selected: true };
     } };
     const result = await runOnce(f, modelFor(() => ({ actions: ["generateImages"], assetIds: [], storyboardIds: [bad, good], question: null, summary: "two shots" }), []), media, { ...defaultBuiltinRunLimits, maxImageGenerations: 2 });
-    assert.equal(result.run.status, "waiting_human", result.run.errorMessage ?? "");
+    assert.equal(result.run.status, "succeeded", result.run.errorMessage ?? "");
     assert.deepEqual(completed, [good]);
-    const events = await result.agent.events(result.run.id);
-    const pause = events.findLast((event) => event.type === "run.status");
-    assert.equal((pause!.data as any).data.issues[0].targetId, bad);
-    assert.equal((pause!.data as any).data.completed[0].targetId, good);
+    assert.equal((result.run.result as any).outcome, "partial");
+    assert.equal((result.run.result as any).issues[0].targetId, bad);
+    assert.equal((result.run.result as any).generateImages[0].targetId, good);
   } finally { await f.destroy(); }
 });
 
@@ -328,26 +381,14 @@ test("human edit between flow read and agent commit rejects stale storyboard out
   } finally { await f.destroy(); }
 });
 
-test("human question pauses and continuation resumes under a new revision", options, async () => {
+test("missing production information ends with a clear error instead of waiting for a chat reply", options, async () => {
   const f = await fixture();
   try {
-    let calls = 0;
-    const model: StructuredScriptModel = { async generate(request) {
-      calls += 1;
-      if (calls === 1) return { value: request.schema.parse({ actions: [], assetIds: [], storyboardIds: [], question: "Which episode?", summary: "need answer" }), outputTokens: 8 };
-      if (request.role === "productionAgent:decisionAgent") return { value: request.schema.parse({ actions: ["review"], assetIds: [], storyboardIds: [], question: null, summary: "continued" }), outputTokens: 8 };
-      return { value: request.schema.parse({ findings: [], summary: "reviewed" }), outputTokens: 8 };
-    } };
-    const agent = runtime(f, model);
-    const created = await agent.create({ agentType: "productionAgent", projectId: f.projectId, scriptId: f.scriptId, requestedBy: 1, prompt: "plan", idempotencyKey: "production-human", limits: defaultBuiltinRunLimits });
-    await agent.runOnce();
-    const waiting = await agent.get(created.run.id);
-    assert.equal(waiting.status, "waiting_human");
-    const resumed = await agent.control(created.run.id, waiting.version, "resume", "Episode 2");
-    assert.equal(resumed.inputRevision, 1);
-    await agent.runOnce();
-    const finished = await agent.get(created.run.id);
-    assert.equal(finished.status, "succeeded", finished.errorMessage ?? "");
+    const model = modelFor(() => ({ actions: [], assetIds: [], storyboardIds: [], question: "Which episode?", summary: "need information" }), []);
+    const result = await runOnce(f, model);
+    assert.equal(result.run.status, "failed");
+    assert.equal(result.run.errorCode, "INVALID_INPUT");
+    assert.equal((await f.db("ext_builtin_runs").where({ id: result.run.id }).first()).waitingQuestion, null);
   } finally { await f.destroy(); }
 });
 

@@ -129,7 +129,7 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
     let knownAssets = new Set(flow.assets.flatMap((asset: any) => [Number(asset.id), ...asset.derive.map((child: any) => Number(child.id))]));
     let knownStoryboards = new Map(flow.storyboard.map((storyboard: any) => [Number(storyboard.id), storyboard]));
     if (plan.assetIds.some((id) => !knownAssets.has(id)) || plan.storyboardIds.some((id) => !knownStoryboards.has(id))) throw new BuiltinRuntimeError("INVALID_INPUT", "制作规划引用了项目外实体");
-    if (plan.question) { await ctx.emit("message.completed", { text: plan.question }); await ctx.waitForHuman(plan.question, { projectId, scriptId }); }
+    if (plan.question && !actions.length) throw new BuiltinRuntimeError("INVALID_INPUT", `本次没有可执行的制作步骤：${plan.question}`);
     await ctx.emit("message.completed", { text: actions.length ? `准备执行：${actions.map((action) => productionActionLabels[action]).join("、")}。保存完成后会显示实际产物。` : "本轮未执行制作步骤，也未写入数据。" });
     const selected = new Set(actions);
     const remainingBudget = run.limits.maxOutputTokens - planBudget;
@@ -137,6 +137,7 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
     const textActionCount = actions.filter((action) => action !== "generateImages" && action !== "generateVideos").length;
     const budget = Math.floor(remainingBudget / Math.max(1, textActionCount));
     const output: Record<string, unknown> = { projectId, scriptId, revision, actions };
+    const executionIssues: Array<Record<string, unknown>> = plan.question ? [{ message: plan.question }] : [];
     let targetAssetIds = [...new Set(plan.assetIds)];
     let targetStoryboardIds = [...new Set(plan.storyboardIds)];
 
@@ -157,12 +158,25 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
         await ctx.emit("artifact.saved", { kind: "productionPlanning", ids: [projectId, scriptId], version: saved.planningVersion });
       } else if (action === "deriveAssets") {
         const requestedParentIds = [...targetAssetIds];
-        if (!targetAssetIds.length) await ctx.waitForHuman(`请指定需要分析衍生版本的素材名称或 ID，或回复“全部当前剧集素材”。可选素材示例：${flow.assets.slice(0, 20).map((asset: any) => `${String(asset.name ?? "未命名").slice(0, 80)}（ID ${asset.id}）`).join("、") || "当前剧集尚未关联基础素材"}`, { projectId, scriptId });
+        if (!targetAssetIds.length) {
+          executionIssues.push({ action, message: "未确定衍生素材范围，已跳过该步骤；可直接在画布调整素材后重新发起制作。" });
+          continue;
+        }
         const derived = await model("deriveAssets", "productionAgent:deriveAssetsAgent", "production_execution_derive_assets.md", deriveSchema, { request: requestText, project, flow, parentAssetIds: targetAssetIds }, budget);
         const created = await ctx.commit(`production.assets:r${revision}`, { projectId, scriptId, derived }, async (trx) => {
           const ids: unknown[] = [];
           for (const item of derived.assets) {
             if (!knownTopAssets.has(item.parentAssetId) || !targetAssetIds.includes(item.parentAssetId)) throw new BuiltinRuntimeError("INVALID_INPUT", "衍生资产父 ID 必须是本次选定的项目顶层素材");
+            if (item.id == null) {
+              const sameName = flow.assets.find((asset: any) => Number(asset.id) === item.parentAssetId)?.derive.filter((child: any) => String(child.name).trim() === item.name.trim()) ?? [];
+              if (sameName.length > 1) throw new BuiltinRuntimeError("CONFLICT", `同名衍生素材“${item.name}”不唯一，已停止重复创建`);
+              if (sameName.length === 1) {
+                const existing = await trx("o_assets").where({ id: sameName[0].id, projectId, assetsId: item.parentAssetId }).first();
+                if (!existing || String(existing.name).trim() !== item.name.trim()) throw new BuiltinRuntimeError("CONFLICT", "衍生素材在分析期间已被修改或移除");
+                ids.push({ id: Number(existing.id), reused: true });
+                continue;
+              }
+            }
             const captured = item.id == null ? undefined : flow.assets.flatMap((asset: any) => asset.derive).find((asset: any) => Number(asset.id) === item.id);
             if (item.id != null && (!captured || (item.expectedVersion != null && item.expectedVersion !== Number(captured.version ?? 0)))) throw new BuiltinRuntimeError("CONFLICT", "衍生素材已不在读取范围或模型返回了错误版本");
             ids.push(await createOrUpdateDerivedAsset(trx as unknown as Knex, { projectId, scriptId, parentAssetId: item.parentAssetId, id: item.id ?? undefined,
@@ -171,7 +185,7 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
           return ids;
         });
         output.derivedAssets = created;
-        const savedAssetIds = (created as Array<{ id: number }>).map((item) => Number(item.id));
+        const savedAssetIds = (created as Array<{ id: number; reused?: boolean }>).filter((item) => !item.reused).map((item) => Number(item.id));
         targetAssetIds = savedAssetIds;
         flow = await refreshFlow("deriveAssets");
         knownTopAssets = new Set(flow.assets.map((asset: any) => Number(asset.id)));
@@ -179,7 +193,7 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
         if (selected.has("generateImages")) targetAssetIds = [...new Set([...targetAssetIds, ...flow.assets.filter((asset: any) => requestedParentIds.includes(Number(asset.id))).flatMap((asset: any) => asset.derive.filter((child: any) => !child.src).map((child: any) => Number(child.id)))])];
         if (savedAssetIds.length) await ctx.emit("artifact.saved", { kind: "assets", ids: savedAssetIds });
         else await ctx.emit("message.completed", { text: targetAssetIds.length && selected.has("generateImages") ? `衍生描述已存在，准备生成 ${targetAssetIds.length} 个缺失的衍生素材图片。` : "衍生素材分析完成，本次没有新增或更新衍生版本。" });
-        if (created.length && !selected.has("generateImages")) await ctx.emit("message.completed", { text: `已保存 ${created.length} 个衍生素材描述，本次没有生成图片。需要出图时请授权图片次数并明确要求生成衍生素材图片。` });
+        if (savedAssetIds.length && !selected.has("generateImages")) await ctx.emit("message.completed", { text: `已保存 ${savedAssetIds.length} 个衍生素材描述，本次没有生成图片。需要出图时可授权图片次数并生成衍生素材图片。` });
       } else if (action === "storyboard") {
         // Long shot lists can use tokens left over from the compact director plan.
         const storyboard = await model("storyboard", "productionAgent:storyboardTableAgent", "production_execution_storyboard_table.md", storyboardSchema, { request: requestText, project, flow, selectedStoryboardIds: plan.storyboardIds }, run.limits.maxOutputTokens, selected.has("review") ? 1024 : 0);
@@ -243,7 +257,10 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
           await ctx.emit("message.completed", { text: "本次没有需要出图的衍生素材，未调用图片模型。" });
           continue;
         }
-        if (!targets.length) await ctx.waitForHuman("请明确本次要生成的素材、分镜或视频轨道", { action, projectId, scriptId });
+        if (!targets.length) {
+          executionIssues.push({ action, message: "没有可生成的素材、分镜或视频轨道，已跳过该步骤。" });
+          continue;
+        }
         if (targets.length > limit) throw new BuiltinRuntimeError("BUDGET_EXCEEDED", `${action} 超过本次运行授权额度`);
         if (targets.some((item) => !item.source)) throw new BuiltinRuntimeError("INVALID_INPUT", "媒体生成引用了项目外实体");
         const results: unknown[] = [];
@@ -292,15 +309,15 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
         for (const batch of batches) {
           const concurrency = pLimit(2);
           const outcomes = await Promise.allSettled(batch.map((target) => concurrency(async () => {
-            if (target.targetKind === "asset" && target.source.assetsId != null && failedAssetIds.has(Number(target.source.assetsId))) throw new BuiltinRuntimeError("CONFLICT", "父素材需要人工核对，该衍生图片暂未提交");
-            if (target.targetKind === "storyboard" && (target.source.associateAssetsIds ?? []).some((id: number) => failedAssetIds.has(Number(id)))) throw new BuiltinRuntimeError("CONFLICT", "引用素材需要人工核对，该分镜暂未提交");
+            if (target.targetKind === "asset" && target.source.assetsId != null && failedAssetIds.has(Number(target.source.assetsId))) throw new BuiltinRuntimeError("CONFLICT", "父素材尚不可用，本次跳过该衍生图片");
+            if (target.targetKind === "storyboard" && (target.source.associateAssetsIds ?? []).some((id: number) => failedAssetIds.has(Number(id)))) throw new BuiltinRuntimeError("CONFLICT", "引用素材尚不可用，本次跳过该分镜图片");
             return performTarget(target);
           })));
           for (let index = 0; index < outcomes.length; index++) {
             const outcome = outcomes[index], target = batch[index];
             if (outcome.status === "fulfilled") {
               results.push(outcome.value);
-              if (outcome.value.needsReview) issues.push({ targetKind: target.targetKind, targetId: target.targetId, message: "生成结果已保留，需核对后选用", result: outcome.value.result });
+              if (outcome.value.needsReview) issues.push({ targetKind: target.targetKind, targetId: target.targetId, message: "生成结果已保存；目标内容已变更或不可用，未覆盖当前画布。", result: outcome.value.result });
             } else {
               const error = outcome.reason;
               if (error instanceof BuiltinRuntimeError && ["LEASE_LOST", "PAUSED", "CANCELLED", "WAITING_HUMAN"].includes(error.code)) throw error;
@@ -312,12 +329,19 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
         output[action] = results;
         flow = await readProductionFlow(deps.db, projectId, scriptId, async (path) => path);
         knownStoryboards = new Map(flow.storyboard.map((storyboard: any) => [Number(storyboard.id), storyboard]));
-        if (issues.length) await ctx.waitForHuman("部分素材或镜头需要核对，其余成功结果已保存。请说明接下来处理的范围。", { action, completed: results, issues });
+        if (issues.length) {
+          executionIssues.push(...issues.map((issue) => ({ action, ...issue })));
+          await ctx.emit("message.completed", { text: `本步骤已结束，${issues.length} 项未应用或未完成；生成结果已保留，可直接在画布调整。其余可执行步骤继续进行。` });
+        }
       } else if (action === "review") {
         const review = await model("review", "productionAgent:supervisionAgent", "production_agent_supervision.md", reviewSchema, { request: requestText, project, flow, output }, budget);
         output.review = review;
         await ctx.emit("message.completed", { text: [review.summary, ...review.findings].join("\n") });
       }
+    }
+    if (executionIssues.length) {
+      output.outcome = executionIssues.every((issue) => (issue.result as { status?: string } | undefined)?.status === "succeeded") ? "complete_with_notes" : "partial";
+      output.issues = executionIssues;
     }
     return output;
   };

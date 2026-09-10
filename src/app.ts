@@ -19,6 +19,7 @@ import { isEletron } from "@/utils/getPath";
 import { ensureThumbnail, ThumbnailSize } from "@/utils/image";
 import { getBuiltinAgentRuntime, authorizeBuiltinProject } from "@/services/builtinAgent/runtime";
 import { createBuiltinAgentRouter } from "@/services/builtinAgent/http";
+import { finishLegacyProductionWaits } from "@/services/builtinAgent/finishLegacyProductionWaits";
 import { createTeamRouter } from "@/routes/team";
 import { createApplicationSessionRouter, applicationAllowedOrigins } from "@/services/applicationSession";
 import { teamAuthMiddleware, type TeamPrincipal } from "@/services/team";
@@ -56,6 +57,7 @@ async function checkPermissions() {
 
 export default async function startServe(randomPort: Boolean = false) {
   await dbReady;
+  await finishLegacyProductionWaits(u.db);
   await checkPermissions();
   await u.oss.ready();
   configureMediaJobRecoveryExecutors({ image: getProductionImageGenerationService(), video: getRuntimeVideoJobService() });

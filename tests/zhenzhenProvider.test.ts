@@ -17,6 +17,48 @@ function modelOf(fixture: ZhenzhenFixture, type: string): any {
 }
 
 describe("Zhenzhen provider public contract", () => {
+  it("uses adaptive reference framing for 2.5 I2V while preserving resolution and audio", async () => {
+    const f = await loadZhenzhenProvider();
+    const model = f.provider.vendor.models.find((m: any) => m.modelName === "seedance-2.5-standard-i2v");
+    f.setHandler((call) => new Response(JSON.stringify(call.url.endsWith("/v1/files/upload") ? { url: "https://example.test/start.png" } : { id: "framed-task" }), { status: 200 }));
+    await f.provider.submitVideoTask({ prompt: "shot", duration: 4, resolution: "1080p", aspectRatio: "9:16", audio: true, mode: "endFrameOptional", referenceList: [imageRef()] }, model);
+    assert.equal(model.referenceRatio, "adaptive");
+    const request = f.calls.find((c) => c.url.endsWith("/v1/videos"))!;
+    assert.deepEqual((request.body as any).metadata, { resolution: "1080p", ratio: "adaptive", generate_audio: true });
+  });
+
+  it("retries a throttled upload with a fresh multipart stream, then submits generation once", async () => {
+    const f = await loadZhenzhenProvider(); let uploads = 0;
+    const model = f.provider.vendor.models.find((m: any) => m.modelName === "seedance-2.5-standard-i2v");
+    f.setHandler((call) => {
+      if (call.url.endsWith("/v1/files/upload")) return ++uploads === 1
+        ? new Response(JSON.stringify({ error: "rate limited" }), { status: 429, headers: { "retry-after": "0" } })
+        : new Response(JSON.stringify({ url: "https://example.test/retried.png" }), { status: 200 });
+      return new Response(JSON.stringify({ id: "one-generation" }), { status: 200 });
+    });
+    const value = await f.provider.submitVideoTask({ prompt: "shot", duration: 4, resolution: "1080p", aspectRatio: "9:16", mode: "endFrameOptional", referenceList: [imageRef()] }, model);
+    assert.equal(value.taskId, "one-generation");
+    assert.equal(uploads, 2); assert.notEqual(f.calls[0].body, f.calls[1].body);
+    assert.equal(f.calls.filter((c) => c.url.endsWith("/v1/videos")).length, 1);
+  });
+
+  it("marks a long upload throttle as not submitted and an HTTP request rejection as rejected", async () => {
+    const f = await loadZhenzhenProvider();
+    const model = f.provider.vendor.models.find((m: any) => m.modelName === "seedance-2.5-standard-i2v");
+    const config = { prompt: "shot", duration: 4, resolution: "1080p", aspectRatio: "9:16", mode: "endFrameOptional", referenceList: [imageRef()] };
+    f.setHandler(() => new Response(JSON.stringify({ error: "rate limited" }), { status: 429, headers: { "retry-after": "120" } }));
+    await assert.rejects(f.provider.submitVideoTask(config, model), (e: any) => e.submissionOutcome === "not_submitted");
+    assert.equal(f.calls.some((c) => c.url.endsWith("/v1/videos")), false);
+    f.resetCalls();
+    f.setHandler((call) => call.url.endsWith("/v1/files/upload")
+      ? new Response(JSON.stringify({ url: "https://example.test/uploaded.png" }), { status: 200 })
+      : new Response(JSON.stringify({ error: { message: "price preview invalid_parameter" } }), { status: 400 }));
+    await assert.rejects(f.provider.submitVideoTask(config, model), (e: any) => e.submissionOutcome === "rejected");
+    assert.equal(f.calls.filter((c) => c.url.endsWith("/v1/videos")).length, 1);
+    f.resetCalls();
+    f.setHandler(() => { throw new Error("connection lost after send"); });
+    await assert.rejects(f.provider.submitVideoTask(config, model), (e: any) => e.submissionOutcome == null);
+  });
   it("exposes the vendor metadata and all required public functions", async (t) => {
     const fixture = await fixtureOrSkip(t);
     if (!fixture) return;

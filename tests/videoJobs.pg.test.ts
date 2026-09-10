@@ -42,6 +42,63 @@ test("PostgreSQL idempotent reservation and restart query use one upstream task"
   } finally { await f.close(); }
 });
 
+test("explicit provider non-submission outcomes fail the job without another POST", { skip: !url }, async () => {
+  const f = await fixture();
+  try {
+    let submits = 0;
+    const provider: VideoTaskProvider = {
+      fingerprint: "explicit-outcome-provider",
+      submit: async () => {
+        submits += 1;
+        throw Object.assign(new Error("HTTP 429 reference upload"), { submissionOutcome: "not_submitted" });
+      },
+      query: async () => ({ status: "pending" }),
+    };
+    const service = new VideoJobService(f.db, { providerFor: async () => provider, download: async () => undefined, schedule: false });
+    const request: VideoJobRequest = { modelKey: "model", providerFingerprint: provider.fingerprint, projectId: 1, scriptId: 10, trackId: 20, outputPath: "/1/video/not-submitted.mp4", config: { prompt: "scene" } };
+    const reserved = await service.reserveNewVideo("pg-explicit-not-submitted", request);
+    const failed = await service.submitReserved(reserved.job.id);
+    assert.equal(failed.status, "FAILED");
+    assert.equal(failed.submissionOutcome, "not_submitted");
+    assert.equal((await f.db("o_video").where({ id: failed.videoId }).first()).state, "生成失败");
+    await service.submitReserved(reserved.job.id);
+    assert.equal(submits, 1);
+    service.stop();
+  } finally { await f.close(); }
+});
+
+test("provider rejection is failed while timeout remains reconciliation", { skip: !url }, async () => {
+  const f = await fixture();
+  try {
+    let submits = 0;
+    let mode: "rejected" | "timeout" = "rejected";
+    const provider: VideoTaskProvider = {
+      fingerprint: "rejected-timeout-provider",
+      submit: async () => {
+        submits += 1;
+        if (mode === "rejected") throw Object.assign(new Error("HTTP 400 invalid_parameter"), { submissionOutcome: "rejected" });
+        throw new Error("socket timeout");
+      },
+      query: async () => ({ status: "pending" }),
+    };
+    const service = new VideoJobService(f.db, { providerFor: async () => provider, download: async () => undefined, schedule: false });
+    const rejectedRequest: VideoJobRequest = { modelKey: "model", providerFingerprint: provider.fingerprint, projectId: 1, scriptId: 10, trackId: 20, outputPath: "/1/video/rejected.mp4", config: { prompt: "scene" } };
+    const rejected = await service.reserveNewVideo("pg-explicit-rejected", rejectedRequest);
+    const rejectedResult = await service.submitReserved(rejected.job.id);
+    assert.equal(rejectedResult.status, "FAILED");
+    assert.equal(rejectedResult.submissionOutcome, "rejected");
+
+    mode = "timeout";
+    const timeoutRequest = { ...rejectedRequest, outputPath: "/1/video/timeout.mp4" };
+    const timeout = await service.reserveNewVideo("pg-unknown-timeout", timeoutRequest);
+    const timeoutResult = await service.submitReserved(timeout.job.id);
+    assert.equal(timeoutResult.status, "RECONCILIATION_REQUIRED");
+    assert.equal(timeoutResult.submissionOutcome, "unknown");
+    assert.equal(submits, 2);
+    service.stop();
+  } finally { await f.close(); }
+});
+
 test("PostgreSQL submission lease fences other processes and preserves a late upstream receipt", { skip: !url }, async () => {
   const f = await fixture();
   const secondDb = knex({ client: "pg", connection: url!, searchPath: [f.schema], pool: { min: 0, max: 2 } });

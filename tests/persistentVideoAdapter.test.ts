@@ -54,3 +54,17 @@ test("adapter timeout rejects instead of leaving a durable worker slot occupied"
   const provider = good({ timeoutMs: 5, queryVideoTask: async () => new Promise(() => {}) });
   await assert.rejects(provider.query("task"), PersistentVideoAdapterError);
 });
+
+test("adapter preserves an explicit provider submission outcome while leaving timeout unknown", async () => {
+  const rejected = good({ submitVideoTask: async () => { throw Object.assign(new Error("HTTP 400 invalid_parameter"), { submissionOutcome: "rejected" }); } });
+  await assert.rejects(rejected.submit({}), (error: any) => error instanceof PersistentVideoAdapterError && error.submissionOutcome === "rejected");
+  const notSubmitted = good({ submitVideoTask: async () => ({ submissionOutcome: "not_submitted" }) });
+  await assert.rejects(notSubmitted.submit({}), (error: any) => error instanceof PersistentVideoAdapterError && error.submissionOutcome === "not_submitted");
+  const timeout = good({ submitVideoTask: async () => new Promise(() => {}), timeoutMs: 5 });
+  await assert.rejects(timeout.submit({}), (error: any) => error instanceof PersistentVideoAdapterError && error.submissionOutcome === undefined);
+});
+
+test("an actual task receipt takes precedence over a contradictory rejection marker", async () => {
+  const provider = good({ submitVideoTask: async () => ({ taskId: "accepted-task", submissionOutcome: "rejected" }) });
+  assert.deepEqual(await provider.submit({}), { taskId: "accepted-task" });
+});

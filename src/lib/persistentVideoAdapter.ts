@@ -7,6 +7,9 @@ export interface PersistentVideoTaskProvider {
   query(taskId: string): Promise<{ status: "pending" | "succeeded" | "failed"; outputUrl?: string; error?: string }>;
 }
 
+/** The provider explicitly knows whether a submission reached the upstream. */
+export type VideoSubmissionOutcome = "submitted" | "not_submitted" | "rejected" | "unknown";
+
 export interface PersistentVideoAdapterInput {
   vendorId: string;
   modelName: string;
@@ -22,9 +25,12 @@ export interface PersistentVideoAdapterInput {
 }
 
 export class PersistentVideoAdapterError extends Error {
-  constructor(message: string) {
+  readonly submissionOutcome?: VideoSubmissionOutcome;
+
+  constructor(message: string, options: { submissionOutcome?: VideoSubmissionOutcome } = {}) {
     super(message);
     this.name = "PersistentVideoAdapterError";
+    this.submissionOutcome = options.submissionOutcome;
   }
 }
 
@@ -55,7 +61,13 @@ export function createPersistentVideoTaskProvider(input: PersistentVideoAdapterI
   return {
     fingerprint,
     referenceTransport: input.referenceTransport ?? "base64",
-    submit: async (config) => validateSubmit(await withTimeout(() => submitFn.call(input.runtime, config, input.model), timeoutMs)),
+    submit: async (config) => {
+      try {
+        return validateSubmit(await withTimeout(() => submitFn.call(input.runtime, config, input.model), timeoutMs));
+      } catch (error) {
+        throw normalizeSubmissionError(error);
+      }
+    },
     query: async (taskId) => validateQuery(await withTimeout(() => queryFn.call(input.runtime, taskId), timeoutMs)),
   };
 }
@@ -75,6 +87,11 @@ function withTimeout<T>(operation: () => Promise<T>, timeoutMs: number): Promise
 }
 
 function validateSubmit(value: unknown): { taskId: string } {
+  const receivedId = value && typeof value === "object" ? (value as { taskId?: unknown }).taskId : undefined;
+  if (typeof receivedId === "string" && receivedId.trim() && receivedId.trim().length <= 512 && !/[\u0000-\u001F\u007F]/.test(receivedId)) return { taskId: receivedId.trim() };
+  if (value && typeof value === "object" && isExplicitOutcome((value as { submissionOutcome?: unknown }).submissionOutcome)) {
+    throw new PersistentVideoAdapterError("submitVideoTask 明确报告未提交或被拒绝", { submissionOutcome: (value as { submissionOutcome: VideoSubmissionOutcome }).submissionOutcome });
+  }
   if (!value || typeof value !== "object" || typeof (value as { taskId?: unknown }).taskId !== "string") {
     throw new PersistentVideoAdapterError("submitVideoTask 未返回 taskId");
   }
@@ -83,6 +100,19 @@ function validateSubmit(value: unknown): { taskId: string } {
     throw new PersistentVideoAdapterError("submitVideoTask 返回的 taskId 不合法");
   }
   return { taskId };
+}
+
+function isExplicitOutcome(value: unknown): value is "not_submitted" | "rejected" {
+  return value === "not_submitted" || value === "rejected";
+}
+
+function normalizeSubmissionError(error: unknown): PersistentVideoAdapterError | unknown {
+  const outcome = error && typeof error === "object" ? (error as { submissionOutcome?: unknown }).submissionOutcome : undefined;
+  if (isExplicitOutcome(outcome)) {
+    const message = error && typeof error === "object" && typeof (error as { message?: unknown }).message === "string" ? (error as { message: string }).message : String(error);
+    return new PersistentVideoAdapterError(message, { submissionOutcome: outcome });
+  }
+  return error;
 }
 
 function validateQuery(value: unknown): { status: "pending" | "succeeded" | "failed"; outputUrl?: string; error?: string } {

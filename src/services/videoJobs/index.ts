@@ -4,6 +4,7 @@ import { lockProjectTransaction } from "@/lib/dbTransaction";
 import { insertRowsReturningIds } from "@/lib/insertRows";
 import { renewVideoReferenceConfigLeases } from "@/services/videoReferenceBridge";
 import getPath from "@/utils/getPath";
+import type { VideoSubmissionOutcome } from "@/lib/persistentVideoAdapter";
 
 export type VideoJobStatus =
   | "SUBMITTING"
@@ -49,6 +50,7 @@ export interface VideoJob {
   createdAt: number;
   updatedAt: number;
   submissionLeaseUntil: number | null;
+  submissionOutcome: VideoSubmissionOutcome | null;
 }
 
 export interface VideoTaskProvider {
@@ -104,6 +106,7 @@ interface JobRow {
   updatedAt: number;
   submissionOwner: string | null;
   submissionLeaseUntil: number | null;
+  submissionOutcome: VideoSubmissionOutcome | null;
 }
 
 export async function ensureVideoJobsSchema(db: Knex): Promise<void> {
@@ -132,6 +135,7 @@ export async function ensureVideoJobsSchema(db: Knex): Promise<void> {
         "updatedAt" bigint NOT NULL,
         "submissionOwner" text,
         "submissionLeaseUntil" bigint,
+        "submissionOutcome" text,
         UNIQUE ("projectId", "idempotencyKey")
       )
     `);
@@ -139,6 +143,7 @@ export async function ensureVideoJobsSchema(db: Knex): Promise<void> {
     await db.raw(`CREATE INDEX IF NOT EXISTS "ext_video_jobs_project_script_track_idx" ON "ext_video_jobs" ("projectId", "scriptId", "trackId")`);
     await db.raw(`ALTER TABLE "ext_video_jobs" ADD COLUMN IF NOT EXISTS "submissionOwner" text`);
     await db.raw(`ALTER TABLE "ext_video_jobs" ADD COLUMN IF NOT EXISTS "submissionLeaseUntil" bigint`);
+    await db.raw(`ALTER TABLE "ext_video_jobs" ADD COLUMN IF NOT EXISTS "submissionOutcome" text`);
     await db.raw(`CREATE INDEX IF NOT EXISTS "ext_video_jobs_submission_lease_idx" ON "ext_video_jobs" (status, "submissionLeaseUntil")`);
     return;
   }
@@ -166,6 +171,7 @@ export async function ensureVideoJobsSchema(db: Knex): Promise<void> {
       table.integer("updatedAt").notNullable();
       table.text("submissionOwner");
       table.integer("submissionLeaseUntil");
+      table.text("submissionOutcome");
       table.index(["status", "nextPollAt"]);
       table.index(["projectId", "scriptId", "trackId"]);
       table.unique(["projectId", "idempotencyKey"]);
@@ -173,6 +179,7 @@ export async function ensureVideoJobsSchema(db: Knex): Promise<void> {
   }
   if (!(await db.schema.hasColumn("ext_video_jobs", "submissionOwner"))) await db.schema.alterTable("ext_video_jobs", (table) => table.text("submissionOwner"));
   if (!(await db.schema.hasColumn("ext_video_jobs", "submissionLeaseUntil"))) await db.schema.alterTable("ext_video_jobs", (table) => table.integer("submissionLeaseUntil"));
+  if (!(await db.schema.hasColumn("ext_video_jobs", "submissionOutcome"))) await db.schema.alterTable("ext_video_jobs", (table) => table.text("submissionOutcome"));
 }
 
 function isPostgres(db: Knex | Knex.Transaction): boolean {
@@ -442,6 +449,7 @@ export class VideoJobService {
             .whereNull("upstreamTaskId")
             .update({
               upstreamTaskId: submitted.taskId,
+              submissionOutcome: "submitted",
               status: "SUBMITTED",
               payload: JSON.stringify(compactVideoPayload(job.payload)),
               nextPollAt: this.now(),
@@ -454,10 +462,15 @@ export class VideoJobService {
         });
       } catch (error) {
         if (error instanceof VideoJobError && error.code === "CONFLICT") throw error;
-        await this.db.transaction(async (trx) => {
-          const current = await trx<JobRow>("ext_video_jobs").where({ id: job.id }).first();
-          if (current && !current.upstreamTaskId) await this.markReconciliation(trx, current, `提交结果不确定：${errorMessage(error)}`, true);
-        });
+        const outcome = submissionOutcome(error);
+        if (outcome === "not_submitted" || outcome === "rejected") {
+          await this.failUnsubmitted(job, `${outcome === "rejected" ? "上游拒绝视频任务" : "视频任务未提交到上游"}：${errorMessage(error)}`, outcome);
+        } else {
+          await this.db.transaction(async (trx) => {
+            const current = await trx<JobRow>("ext_video_jobs").where({ id: job.id }).first();
+            if (current && !current.upstreamTaskId && current.status === "SUBMITTING" && current.submissionOwner === this.workerId) await this.markReconciliation(trx, current, `提交结果不确定：${errorMessage(error)}`, true);
+          });
+        }
         return this.get(jobId);
       }
       job = await this.get(jobId);
@@ -508,7 +521,7 @@ export class VideoJobService {
       await this.dependencies.download(url, job.outputPath);
       await this.db.transaction(async (trx) => {
         await trx("ext_video_jobs").where({ id: job.id }).update({
-          status: "SUCCEEDED", payload: JSON.stringify(compactVideoPayload(job.payload)), nextPollAt: null, updatedAt: this.now(), lastError: null,
+          status: "SUCCEEDED", submissionOutcome: "submitted", payload: JSON.stringify(compactVideoPayload(job.payload)), nextPollAt: null, updatedAt: this.now(), lastError: null,
         });
         await trx("o_video").where({ id: job.videoId, projectId: job.projectId, scriptId: job.scriptId, videoTrackId: job.trackId }).update({
           state: "生成成功", filePath: job.outputPath, errorReason: null,
@@ -554,9 +567,23 @@ export class VideoJobService {
     return this.get(job.id);
   }
 
+  /** Mark only a reservation with an explicit provider non-submission result.
+   * The NULL upstream predicate protects a task that may have received a task
+   * ID through another racing worker from being overwritten as FAILED.
+   */
+  private async failUnsubmitted(job: VideoJob, message: string, outcome: "not_submitted" | "rejected"): Promise<VideoJob> {
+    await this.db.transaction(async (trx) => {
+      const changed = await trx("ext_video_jobs").where({ id: job.id, status: "SUBMITTING", submissionOwner: this.workerId }).whereNull("upstreamTaskId").update({
+        status: "FAILED", submissionOutcome: outcome, payload: JSON.stringify(compactVideoPayload(job.payload)), nextPollAt: null, lastError: message, updatedAt: this.now(),
+      });
+      if (changed) await trx("o_video").where({ id: job.videoId, projectId: job.projectId, scriptId: job.scriptId, videoTrackId: job.trackId }).update({ state: "生成失败", errorReason: message });
+    });
+    return this.get(job.id);
+  }
+
   private async fail(job: VideoJob, message: string): Promise<VideoJob> {
     await this.db.transaction(async (trx) => {
-      await trx("ext_video_jobs").where({ id: job.id }).update({ status: "FAILED", payload: JSON.stringify(compactVideoPayload(job.payload)), nextPollAt: null, lastError: message, updatedAt: this.now() });
+      await trx("ext_video_jobs").where({ id: job.id }).update({ status: "FAILED", ...(job.upstreamTaskId ? { submissionOutcome: "submitted" } : {}), payload: JSON.stringify(compactVideoPayload(job.payload)), nextPollAt: null, lastError: message, updatedAt: this.now() });
       await trx("o_video").where({ id: job.videoId, projectId: job.projectId, scriptId: job.scriptId, videoTrackId: job.trackId }).update({
         state: "生成失败", errorReason: message,
       });
@@ -568,7 +595,7 @@ export class VideoJobService {
     let query = trx("ext_video_jobs").where({ id: row.id });
     if (onlyWithoutUpstream) query = query.whereNull("upstreamTaskId");
     const updated = await query.update({
-      status: "RECONCILIATION_REQUIRED", payload: compactPayloadText(row.payload), nextPollAt: null, lastError: message, updatedAt: this.now(),
+      status: "RECONCILIATION_REQUIRED", submissionOutcome: row.upstreamTaskId ? "submitted" : "unknown", payload: compactPayloadText(row.payload), nextPollAt: null, lastError: message, updatedAt: this.now(),
     });
     if (updated) await trx("o_video").where({ id: row.videoId, projectId: row.projectId, scriptId: row.scriptId, videoTrackId: row.trackId }).update({
       state: "需人工核对", errorReason: message,
@@ -643,6 +670,7 @@ export class VideoJobService {
       createdAt: Number(row.createdAt),
       updatedAt: Number(row.updatedAt),
       submissionLeaseUntil: row.submissionLeaseUntil == null ? null : Number(row.submissionLeaseUntil),
+      submissionOutcome: row.submissionOutcome ?? null,
       payload,
     };
   }
@@ -749,6 +777,11 @@ function stableJson(value: unknown): string {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function submissionOutcome(error: unknown): VideoSubmissionOutcome | undefined {
+  const value = error && typeof error === "object" ? (error as { submissionOutcome?: unknown }).submissionOutcome : undefined;
+  return value === "not_submitted" || value === "rejected" || value === "submitted" || value === "unknown" ? value : undefined;
 }
 
 function rowFromJob(job: VideoJob): JobRow {

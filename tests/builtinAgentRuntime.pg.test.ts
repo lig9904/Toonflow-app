@@ -273,6 +273,19 @@ test("same step key cannot perform twice and changed completed input conflicts",
   } finally { await f.destroy(); }
 });
 
+test("runtime conflicts fail the snapshot instead of silently entering a human wait", options, async () => {
+  const f = await fixture();
+  try {
+    const runtime = new BuiltinAgentRuntime({ db: f.db, authorize: async () => undefined, execute: async () => { throw new BuiltinRuntimeError("CONFLICT", "source changed"); } });
+    const created = await runtime.create({ agentType: "productionAgent", projectId: 11, scriptId: 1, requestedBy: 7, prompt: "conflict", idempotencyKey: "runtime-conflict-terminal", limits: { maxModelCalls: 0, maxToolSteps: 1, maxOutputTokens: 10, maxImageGenerations: 0, maxVideoGenerations: 0 } });
+    await runtime.runOnce();
+    const done = await runtime.get(created.run.id);
+    assert.equal(done.status, "failed");
+    assert.equal(done.errorCode, "CONFLICT");
+    assert.equal((await f.db("ext_builtin_runs").where({ id: created.run.id }).first()).waitingQuestion, null);
+  } finally { await f.destroy(); }
+});
+
 test("waitForHuman is resumable from a durable waiting_human stop", options, async () => {
   const f = await fixture();
   try {

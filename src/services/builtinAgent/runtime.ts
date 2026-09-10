@@ -55,17 +55,12 @@ export function getBuiltinAgentRuntime(): BuiltinAgentRuntime {
         if (intent?.phase === "novelEvents") await initializeNovelEventRun(trx, intent.context);
       },
       execute: async (ctx) => {
-        try {
-          if ((ctx.run.intent as { phase?: string })?.phase === "matchAudio") return await audio(ctx);
-          if ((ctx.run.intent as { phase?: string })?.phase === "novelEvents") return await novelEvents(ctx);
-          return await (ctx.run.agentType === "scriptAgent" ? script(ctx) : production(ctx));
-        } catch (error) {
-          const conflict = error as { code?: string; status?: number; message?: string };
-          if (["VERSION_CONFLICT", "STALE_VERSION", "CONFLICT", "LOCKED"].includes(conflict?.code ?? "") || [409, 423].includes(conflict?.status ?? 0)) {
-            await ctx.waitForHuman("内容已被人工修改或锁定，请确认要继续处理的范围", { code: conflict.code, message: conflict.message });
-          }
-          throw error;
-        }
+        if ((ctx.run.intent as { phase?: string })?.phase === "matchAudio") return await audio(ctx);
+        if ((ctx.run.intent as { phase?: string })?.phase === "novelEvents") return await novelEvents(ctx);
+        // Conflicts are terminal for this snapshot. The executor records the
+        // failure and preserves human content; waiting_human is reserved for
+        // explicit, user-answer checkpoints only.
+        return await (ctx.run.agentType === "scriptAgent" ? script(ctx) : production(ctx));
       },
     });
     configureAudioMatchRunStarter(async ({ requestedBy, idempotencyKey, context }) => {

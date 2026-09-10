@@ -249,11 +249,14 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
             await states.guardStoryboardMutations({ projectId, storyboardIds: existingIds, expectedVersions: Object.fromEntries(existingIds.map((id) => [id, Number(knownStoryboards.get(id)!.collaboration?.version ?? 0)])), actor: { id: `agent:${run.id}`, kind: "agent" }, mutate: async (guardedTrx) => {
               for (const item of storyboard.items.filter((candidate) => candidate.id != null)) {
                 const assetIds = [...new Set(item.associateAssetsIds)];
-                let trackId = (await guardedTrx("o_storyboard").where({ projectId, scriptId, track: item.track }).first())?.trackId;
-                if (!trackId) {
-                  const [newTrack] = await guardedTrx("o_videoTrack").insert({ projectId, scriptId, duration: 0 }).returning("id");
-                  trackId = typeof newTrack === "object" ? (newTrack as { id: number }).id : newTrack;
-                }
+                // Existing storyboard IDs are the stable identity. Preserve
+                // their persisted track binding (and therefore the track's
+                // prompt/history/lock) even when the model changes the human
+                // readable `track` label. Only addProductionStoryboards may
+                // create a track for genuinely new storyboard rows.
+                const existing = knownStoryboards.get(Number(item.id));
+                const existingTrackId = Number(existing?.trackId);
+                const trackId = Number.isSafeInteger(existingTrackId) && existingTrackId > 0 ? existingTrackId : existing?.trackId ?? null;
                 await guardedTrx("o_storyboard").where({ id: item.id, projectId, scriptId }).update({ prompt: item.prompt, videoDesc: item.videoDesc, duration: String(item.duration), track: item.track, trackId, shouldGenerateImage: item.shouldGenerateImage });
                 await guardedTrx("o_assets2Storyboard").where({ storyboardId: item.id }).del();
                 if (assetIds.length) await guardedTrx("o_assets2Storyboard").insert(assetIds.map((assetId) => ({ assetId, storyboardId: item.id })));

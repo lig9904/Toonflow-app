@@ -13,11 +13,19 @@ export class StoryboardVisualError extends Error {
 
 /** Legacy rows can contain spoken dialogue in the image field. Keep their stored
  * text intact; only remove explicitly labelled speech from the image request. */
-export function visualText(value: unknown): string {
+export function visualText(value: unknown, speakerNames: readonly string[] = []): string {
   let text = String(value ?? "");
   const quoted = "(?:『[^』]*』|「[^」]*」|“[^”]*”|\"[^\"]*\")";
   text = text.replace(new RegExp(`(?:对白|台词|旁白|画外音|内心独白|VO|OS)[（(][^）)]*[）)]\\s*[：:]?\\s*${quoted}`, "giu"), "");
   text = text.replace(new RegExp(`(?:对白|台词|旁白|画外音|内心独白|VO|OS|说|问|回答|喊道|说道)\\s*[：:]\\s*${quoted}`, "giu"), "");
+  // New structured video descriptions may retain dialogue without quotation
+  // marks. A known speaker at a sentence boundary makes the remainder of that
+  // line audio content; omit it from still-image conditioning only. The visual
+  // field remains the authoritative composition and the stored video text is
+  // untouched. Do not treat a sign containing a character name as a speaker.
+  const speakers = [...new Set(speakerNames.filter((name) => name.trim()).map(escaped))].sort((a, b) => b.length - a.length);
+  const labels = ["对白", "台词", "旁白", "画外音", "内心独白", ...speakers].join("|");
+  text = text.replace(new RegExp(`(^|[。！？；;\\n])\\s*(?:${labels})(?:[（(][^）)\\n]*[）)])?\\s*[：:][^\\n]*`, "gmu"), "$1");
   // A dedicated sound/off-screen line is not a visible character instruction.
   text = text.split(/\r?\n/).filter((line) => !/^\s*(?:对白|台词|旁白|画外音|内心独白|音效|声音|配音|VO\b|OS\b)\s*[：:（(]/iu.test(line)).join("\n");
   return text.replace(/[，,；;]\s*[，,；;]/g, "，").replace(/^[，,；;\s]+|[，,；;\s]+$/g, "").trim();
@@ -81,15 +89,22 @@ export function visualStyleHint(styleName: string, guide: string): string {
 export function buildStoryboardImagePrompt(input: {
   prompt: unknown; videoDesc?: unknown; assets: VisualAsset[]; style?: string; instruction?: string;
 }): string {
-  const picture = visualText(input.prompt);
+  const speakers = input.assets.filter((asset) => asset.type === "role").map((asset) => asset.name);
+  const picture = visualText(input.prompt, speakers);
   if (!picture) throw new StoryboardVisualError("分镜缺少可用于出图的画面描述");
-  const camera = visualText(input.videoDesc);
+  const camera = visualText(input.videoDesc, speakers);
+  const composition = /极特写|微距/.test(`${picture}\n${camera}`)
+    ? "取景约束：极特写或微距，仅展示本镜头指定的局部细节，不为完整展示参考素材而拉远。"
+    : /特写|近景/.test(`${picture}\n${camera}`) && !/全景|远景/.test(picture)
+      ? "取景约束：特写或近景，镜头指定的脸部、表情或局部动作占据画面主体；允许裁掉身躯、腿和尾巴，不要改成全身站姿展示。"
+      : "取景约束：按本镜头构图合理裁切参考素材，不要求把参考图中的全身或全部物件同时展示。";
   const references = input.assets.map((asset, index) => `参考图${index + 1}（@图${index + 1}）=${asset.name || `素材${asset.id}`}：${asset.describe || asset.desc || "严格保持该参考图中的身份与外形"}`);
   return [
     "生成一张单镜头画面。参考图只定义对应素材，不复制设定图的多视图排版。角色的物种、年龄、性别、发色、服饰和体型必须保持参考设定；不新增未要求的角色。",
     ...references,
     `画面：${picture}`,
     camera && camera !== picture ? `镜头与动作补充（仅表现可见部分）：${camera}` : "",
+    composition,
     input.style ? `视觉风格：${input.style}` : "",
     input.instruction ? `本次画面调整：${visualText(input.instruction)}` : "",
     "对白、旁白和音效不绘制成文字；除画面明确要求的标牌、屏幕等文字外，不添加字幕、气泡、标题或水印。仅按镜头构图取景，未入画或只在画外发声的角色不要画出。",

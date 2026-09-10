@@ -416,6 +416,46 @@ test("storyboard agent updates duration, track, image flag, and asset associatio
   } finally { await f.destroy(); }
 });
 
+test("rerunning existing storyboard IDs preserves their track bindings and does not create duplicate tracks", options, async () => {
+  const f = await fixture();
+  try {
+    const existing: Array<{ id: number; trackId: number; version: number }> = [];
+    for (let index = 0; index < 18; index++) {
+      const [trackId] = await insertRowsReturningIds(f.db, "o_videoTrack", { projectId: f.projectId, scriptId: f.scriptId, duration: 2, prompt: `human track prompt ${index}` });
+      const [storyboardId] = await insertRowsReturningIds(f.db, "o_storyboard", { projectId: f.projectId, scriptId: f.scriptId, index, prompt: `old ${index}`, duration: "2", track: `old-track-${index}`, trackId, videoDesc: `old desc ${index}`, shouldGenerateImage: 0, state: "未生成" });
+      const state = await new ProductionStateService(f.db).getStoryboardState(f.projectId, storyboardId);
+      existing.push({ id: storyboardId, trackId, version: state.state.version });
+    }
+    const model = modelFor((request) => request.role === "productionAgent:decisionAgent"
+      ? { actions: ["storyboard"], assetIds: [], storyboardIds: existing.map((item) => item.id), question: null, summary: "rerun" }
+      : { items: existing.map((item, index) => ({ id: item.id, expectedVersion: item.version, prompt: `updated ${index}`, duration: 2, track: `model-renamed-${index}`, videoDesc: `updated desc ${index}`, shouldGenerateImage: 0, associateAssetsIds: [f.assetId] })), summary: "rerun" }, []);
+    const result = await runOnce(f, model);
+    assert.equal(result.run.status, "succeeded", result.run.errorMessage ?? "");
+    const tracks = await f.db("o_videoTrack").where({ projectId: f.projectId, scriptId: f.scriptId });
+    assert.equal(tracks.length, 18);
+    for (const item of existing) {
+      const saved = await f.db("o_storyboard").where({ id: item.id }).first();
+      assert.equal(Number(saved.trackId), item.trackId);
+      assert.equal((await f.db("o_videoTrack").where({ id: item.trackId }).first()).prompt, `human track prompt ${existing.indexOf(item)}`);
+    }
+  } finally { await f.destroy(); }
+});
+
+test("a new storyboard without a track creates exactly one new track", options, async () => {
+  const f = await fixture();
+  try {
+    const before = await f.db("o_videoTrack").where({ projectId: f.projectId, scriptId: f.scriptId });
+    const model = modelFor((request) => request.role === "productionAgent:decisionAgent"
+      ? { actions: ["storyboard"], assetIds: [], storyboardIds: [], question: null, summary: "new" }
+      : { items: [{ id: null, prompt: "new shot", duration: 3, track: "new-track", videoDesc: "new desc", shouldGenerateImage: 0, associateAssetsIds: [f.assetId], expectedVersion: null }], summary: "new" }, []);
+    const result = await runOnce(f, model);
+    assert.equal(result.run.status, "succeeded", result.run.errorMessage ?? "");
+    const after = await f.db("o_videoTrack").where({ projectId: f.projectId, scriptId: f.scriptId });
+    assert.equal(after.length, before.length + 1);
+    assert.equal((await f.db("o_storyboard").where({ projectId: f.projectId, scriptId: f.scriptId })).length, 1);
+  } finally { await f.destroy(); }
+});
+
 test("locked storyboard and human version conflict reject agent mutation", options, async () => {
   const f = await fixture();
   try {

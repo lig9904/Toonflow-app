@@ -6,6 +6,7 @@ import { validateFields } from "@/middleware/middleware";
 import { resolveVideoReferenceMediaType } from "@/lib/videoPromptReferences";
 import { getCreativeState } from "@/services/creativeWorkspace";
 import { readBoundAudioReferences } from "@/services/roleAudioWorkspace";
+import { sortTracksByStoryboardIndex } from "@/services/trackOrdering";
 const router = express.Router();
 
 interface VideoItem {
@@ -144,7 +145,10 @@ export default router.post(
       );
     }
 
-    const trackData = await u.db("o_videoTrack").where({ projectId, scriptId });
+    const trackData = sortTracksByStoryboardIndex(
+      await u.db("o_videoTrack").where({ projectId, scriptId }),
+      storyboardList,
+    );
     const videoList = await u.db("o_video").whereIn(
       "videoTrackId",
       trackData.map((t) => t.id),

@@ -40,6 +40,20 @@ type Observation = {
   request?: { body?: unknown };
 };
 interface StructuredResponse extends Observation { readonly output: unknown; }
+export async function collectStructuredStream(stream: {
+  partialOutputStream: AsyncIterable<unknown>;
+  finishReason: PromiseLike<string>;
+  totalUsage: PromiseLike<Observation["usage"]>;
+  text: PromiseLike<string>;
+  request: PromiseLike<Observation["request"]>;
+  output: PromiseLike<unknown>;
+}, onPartial: (value: unknown) => Promise<void>): Promise<StructuredResponse> {
+  for await (const partial of stream.partialOutputStream) await onPartial(partial);
+  const [finishReason, usage, text, request] = await Promise.all([stream.finishReason, stream.totalUsage, stream.text, stream.request]);
+  let output: unknown, outputError: unknown;
+  try { output = await stream.output; } catch (error) { outputError = error; }
+  return { finishReason, usage, text, request, get output() { if (outputError) throw outputError; return output; } };
+}
 const count = (value: unknown): number | undefined => typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1_000_000 ? Math.ceil(value) : undefined;
 const reasons = new Set(["stop", "length", "content-filter", "tool-calls", "error", "other", "unknown"]);
 

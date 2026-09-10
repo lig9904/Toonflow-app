@@ -47,6 +47,7 @@ export interface ImageGenerationReceipt {
 export interface ImageGenerationServiceOptions {
   db: Knex;
   resolveModel?(modelKey: string, referenceCount: number): Promise<string>;
+  validateConfig?(modelKey: string, config: PrepareImageGenerationInput["config"]): void | Promise<void>;
   providerFor(modelKey: string): Promise<PersistentImageTaskProvider>;
   download(url: string, outputPath: string): Promise<void>;
   getSmallImageUrl?(path: string): Promise<string>;
@@ -206,6 +207,10 @@ export class ImageGenerationService {
       ...(input.builtinRun ? { builtinRun: normalizeBuiltinRun(input.builtinRun) } : {}),
     };
     const effectiveModelKey = existing?.modelKey ?? await this.resolveEffectiveModel(input.modelKey, input.config.referenceList?.length ?? 0);
+    if (!existing && this.options.validateConfig) {
+      try { await this.options.validateConfig(effectiveModelKey, input.config); }
+      catch (error) { throw new ImageGenerationError("INVALID_INPUT", error instanceof Error ? error.message : String(error)); }
+    }
     const outputPath = existing?.outputPath ?? input.outputPath ?? this.defaultOutputPath(input);
     const reserved = await this.jobs.reserve({
       projectId: input.projectId,
@@ -234,6 +239,14 @@ export class ImageGenerationService {
     if (job.projectId !== input.projectId) throw new ImageGenerationError("PROJECT_MISMATCH", "图片任务不属于当前项目", 403);
     await this.syncTerminal(job);
     return this.receipt(await this.jobs.get(job.id));
+  }
+
+  /** Release only a reservation that has never been submitted to the provider. */
+  async cancelPrepared(input: { projectId: number; jobId: number; reason: string }): Promise<void> {
+    await this.ensure();
+    const changed = await this.db("ext_image_jobs").where({ id: input.jobId, projectId: input.projectId, status: "RESERVED" }).whereNull("upstreamTaskId")
+      .update({ status: "FAILED", lastError: input.reason, nextPollAt: null, updatedAt: this.now() });
+    if (changed) await this.syncTerminal(await this.jobs.get(input.jobId));
   }
 
   async submitAndWait(input: { projectId: number; jobId: number; maxWaitMs?: number; signal?: AbortSignal }): Promise<ImageGenerationReceipt> {

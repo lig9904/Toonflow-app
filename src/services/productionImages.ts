@@ -173,6 +173,8 @@ export async function prepareStoryboardImages(db: Knex, args: {
     const assetIds = [...new Set(links.map((row) => row.assetId))];
     const assets = assetIds.length ? await trx("o_assets").whereIn("id", assetIds) : [];
     if (assets.length !== assetIds.length || assets.some((asset) => Number(asset.projectId) !== args.projectId)) throw new ProductionImageError("分镜引用素材不属于当前项目", 400);
+    const missingImages = assets.filter((asset) => asset.imageId == null);
+    if (missingImages.length) throw new ProductionImageError(`请先生成并选用引用素材的图片：${missingImages.map((asset) => asset.name || `ID ${asset.id}`).join("、")}`, 400);
     const imageIds = [...new Set(assets.map((asset) => asset.imageId).filter((id): id is number => id != null))];
     const images = imageIds.length ? await trx("o_image").whereIn("id", imageIds) : [];
     if (images.length !== imageIds.length || images.some((image) => !image.filePath)) throw new ProductionImageError("分镜引用的图片原材料不存在", 400);
@@ -384,6 +386,8 @@ async function prepareDurableStoryboardImages(db: Knex, args: {
     const assetIds = [...new Set(links.map((row) => Number(row.assetId)))];
     const assets = assetIds.length ? await trx("o_assets").whereIn("id", assetIds) : [];
     if (assets.length !== assetIds.length || assets.some((asset) => Number(asset.projectId) !== args.projectId)) throw new ProductionImageError("分镜引用素材不属于当前项目", 400);
+    const missingImages = assets.filter((asset) => asset.imageId == null);
+    if (missingImages.length) throw new ProductionImageError(`请先生成并选用引用素材的图片：${missingImages.map((asset) => asset.name || `ID ${asset.id}`).join("、")}`, 400);
     const imageIds = [...new Set(assets.map((asset) => asset.imageId).filter((id): id is number => id != null).map(Number))];
     const images = imageIds.length ? await trx("o_image").whereIn("id", imageIds) : [];
     if (images.length !== imageIds.length || images.some((image) => !image.filePath)) throw new ProductionImageError("分镜引用的图片原材料不存在", 400);
@@ -404,6 +408,7 @@ async function prepareDurableStoryboardImages(db: Knex, args: {
   const prefix = args.generationKeyPrefix ?? `web-storyboard:${args.projectId}:${args.scriptId}:${args.runtime.uuid()}`;
   const generateList = args.compulsory ? prepared.storyboards : prepared.storyboards.filter((row) => row.shouldGenerateImage !== 0);
   const receipts = new Map<number, ImageGenerationReceipt>();
+  try {
   for (const row of generateList) {
     const referenceList = prepared.links.filter((link) => Number(link.storyboardId) === Number(row.id)).map((link) => assetById.get(Number(link.assetId))).filter(Boolean).map((asset) => ({ type: "image" as const, base64: imageBase64.get(Number(asset!.imageId))! }));
     const generationKey = `${prefix}:storyboard:${row.id}`;
@@ -414,6 +419,11 @@ async function prepareDurableStoryboardImages(db: Knex, args: {
       target: { kind: "storyboard", id: Number(row.id), scriptId: args.scriptId, expectedVersion: existing?.target.expectedVersion ?? prepared.stateVersions.get(Number(row.id)) ?? 0 },
     });
     receipts.set(Number(row.id), receipt);
+  }
+  } catch (error) {
+    await Promise.all([...receipts.values()].map((receipt) => args.runtime.imageJobs.cancelPrepared({ projectId: args.projectId, jobId: receipt.jobId, reason: `本批次准备失败，未提交图片生成：${messageOf(error)}` })));
+    notifyProductionChange({ projectId: args.projectId, scriptId: args.scriptId });
+    throw error;
   }
   const preview = prepared.storyboards.map((row) => ({
     id: Number(row.id), prompt: row.prompt ?? "", videoDesc: row.videoDesc ?? "", shouldGenerateImage: row.shouldGenerateImage,

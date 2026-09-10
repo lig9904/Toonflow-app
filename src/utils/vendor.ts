@@ -1,5 +1,6 @@
 import { transform } from "sucrase";
 import fs from "fs";
+import { imageOutputSizes } from "../lib/imageRequestCapabilities";
 import path from "path";
 import u from "@/utils";
 
@@ -29,7 +30,7 @@ export async function getModelList(id: string): Promise<Array<any>> {
   const combined = [...JSON.parse(JSON.stringify(vendorData.vendor.models)), ...JSON.parse(models?.models ?? "[]")];
   const map = new Map<string, any>();
   for (const m of combined) {
-    map.set(m.modelName, m);
+    map.set(m.modelName, m.type === "image" ? { ...m, resolutions: imageOutputSizes(`${id}:${m.modelName}`, m) } : m);
   }
   return [...map.values()];
 }

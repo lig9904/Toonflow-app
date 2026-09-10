@@ -198,7 +198,7 @@ export async function getConfiguredMediaModel(key: string, type: "image" | "vide
   const { selectedModel, enabled } = await loadVendorRuntime(resolved);
   if (!enabled || selectedModel.type !== type) throw new Error("模型未启用或媒体类型不匹配");
   return { modelName: selectedModel.modelName, type: selectedModel.type, mode: selectedModel.mode,
-    audio: selectedModel.audio, durationResolutionMap: selectedModel.durationResolutionMap };
+    audio: selectedModel.audio, durationResolutionMap: selectedModel.durationResolutionMap, resolutions: selectedModel.resolutions };
 }
 
 /** Resolve a configured image model from the enabled vendor's registered metadata. */

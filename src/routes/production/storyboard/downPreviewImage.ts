@@ -2,17 +2,24 @@ import express from "express";
 import u from "@/utils";
 import { z } from "zod";
 import sharp from "sharp";
+import { requireProductionOwner, sendProductionError } from "@/services/productionHttp";
+import { ProductionImageError } from "@/services/productionImages";
 import { validateFields } from "@/middleware/middleware";
 const router = express.Router();
 
 export default router.post(
   "/",
   validateFields({
-    storyboardIds: z.array(z.number()),
+    storyboardIds: z.array(z.number().int().positive()).min(1).max(100),
+    projectId: z.number().int().positive(),
   }),
   async (req, res) => {
-    const { storyboardIds } = req.body;
-    const storyboardImage = await u.db("o_storyboard").whereIn("id", storyboardIds).select("id", "filePath");
+    try {
+    const { storyboardIds, projectId } = req.body;
+    await requireProductionOwner(req, projectId, u.db);
+    const storyboardImage = await u.db("o_storyboard").where({ projectId }).whereIn("id", storyboardIds).select("id", "filePath");
+
+    if (storyboardImage.length !== new Set(storyboardIds).size || storyboardImage.some((image) => !image.filePath)) throw new ProductionImageError("所选分镜尚无完整图片，或不属于当前项目", 409);
 
     // 按 storyboardIds 顺序构建 filePath 映射
     const filePathMap: Record<number, string> = {};
@@ -73,6 +80,7 @@ export default router.post(
       });
 
       // 生成标号标签 SVG
+      if (img.width < 32 || img.height < 32) continue;
       const label = `S${String(i + 1).padStart(2, "0")}`;
       const fontSize = Math.max(14, Math.min(img.width, img.height) * 0.06);
       const padding = Math.round(fontSize * 0.4);
@@ -112,5 +120,6 @@ export default router.post(
     res.setHeader("Content-Disposition", "attachment; filename=storyboard-preview.png");
     res.setHeader("Content-Length", resultBuffer.length);
     res.status(200).send(resultBuffer);
+    } catch (error) { return sendProductionError(res, error); }
   },
 );

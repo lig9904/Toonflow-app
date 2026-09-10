@@ -1,10 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { generateText, NoOutputGeneratedError, Output } from "ai";
+import { generateText, streamText, NoOutputGeneratedError, Output } from "ai";
 import { MockLanguageModelV3 } from "ai/test";
 import type { LanguageModelV3FinishReason } from "@ai-sdk/provider";
 import { z } from "zod";
-import { readStructuredModelOutput, StructuredModelOutputError } from "../src/lib/structuredModelOutput";
+import { readStructuredModelOutput, collectStructuredStream, StructuredModelOutputError } from "../src/lib/structuredModelOutput";
 
 const schema = z.object({ scriptPlan: z.string() }).strict();
 function model(reason: LanguageModelV3FinishReason["unified"], text: string, tokens = 5100) {
@@ -14,6 +14,27 @@ function model(reason: LanguageModelV3FinishReason["unified"], text: string, tok
   } });
 }
 const request = { role: "productionAgent:directorPlanAgent", schema, maxOutputTokens: 5100 };
+
+test("real SDK structured streaming previews partial text and still rejects a length-truncated final result", async () => {
+  for (const finish of ["stop", "length"] as const) {
+    const previews: unknown[] = [];
+    const provider = new MockLanguageModelV3({ doStream: async () => ({
+      stream: new ReadableStream({ start(controller) {
+        controller.enqueue({ type: "stream-start", warnings: [] });
+        controller.enqueue({ type: "text-start", id: "text" });
+        controller.enqueue({ type: "text-delta", id: "text", delta: '{"scriptPlan":"Visible draft' });
+        controller.enqueue({ type: "text-delta", id: "text", delta: finish === "stop" ? ' completed"}' : ' unfinished' });
+        controller.enqueue({ type: "text-end", id: "text" });
+        controller.enqueue({ type: "finish", finishReason: { unified: finish, raw: finish }, usage: { inputTokens: { total: 10, noCache: 10, cacheRead: 0, cacheWrite: 0 }, outputTokens: { total: 100, text: 100, reasoning: 0 } } });
+        controller.close();
+      } }),
+    }) });
+    const run = readStructuredModelOutput(request, (onFinish) => collectStructuredStream(streamText({ model: provider, prompt: "fixture", output: Output.object({ schema }), onFinish }), async (partial) => { previews.push(partial); }));
+    if (finish === "stop") assert.equal((await run).value.scriptPlan, "Visible draft completed");
+    else await assert.rejects(run, (error: unknown) => error instanceof StructuredModelOutputError && error.code === "MODEL_OUTPUT_LIMIT" && error.diagnostics.outputTokens === 100);
+    assert(previews.some((value: any) => value.scriptPlan?.includes("Visible draft")));
+  }
+});
 
 test("SDK length completion exposes a generic throwing getter; wrapper preserves the real reason and usage", async () => {
   const old = await generateText({ model: model("length", '{"scriptPlan":"partial'), prompt: "fixture", output: Output.object({ schema }), maxRetries: 0 });

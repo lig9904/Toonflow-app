@@ -12,6 +12,50 @@ import { generateFlowImage } from "../src/services/productionEditImages";
 
 const options = { skip: !process.env.TOONFLOW_TEST_DATABASE_URL };
 
+test("missing reference images reject the whole batch before reserving any storyboard", options, async () => {
+  const f = await fixture();
+  try {
+    const missing = await asset(f, { name: "Unrendered derived asset" });
+    const [one, two] = await insertRowsReturningIds(f.db, "o_storyboard", [{ projectId: f.projectId, scriptId: f.scriptId, prompt: "one", state: "未生成", shouldGenerateImage: 1 }, { projectId: f.projectId, scriptId: f.scriptId, prompt: "two", state: "未生成", shouldGenerateImage: 1 }]);
+    await f.db("o_assets2Storyboard").insert({ storyboardId: two, assetId: missing });
+    const log = { submits: [] as unknown[], queries: [] as string[] };
+    const service = jobs(f.db, provider(log));
+    const runtime: ProductionImageRuntime = { imageJobs: service, getArtPrompt: () => "", generatePrompt: async () => "", getImageBase64: async () => "", getSmallImageUrl: async (path) => path, uuid: () => "missing" };
+    await assert.rejects(prepareStoryboardImages(f.db, { projectId: f.projectId, scriptId: f.scriptId, storyboardIds: [one, two], compulsory: true, runtime }), /Unrendered derived asset/);
+    assert.equal((await f.db("ext_image_jobs")).length, 0);
+    assert((await f.db("o_storyboard").whereIn("id", [one, two])).every((row) => row.state === "未生成"));
+    assert.equal(log.submits.length, 0);
+  } finally { await f.destroy(); }
+});
+
+test("a late batch preparation failure releases earlier unsubmitted reservations", options, async () => {
+  const f = await fixture();
+  try {
+    const [one, two] = await insertRowsReturningIds(f.db, "o_storyboard", [{ projectId: f.projectId, scriptId: f.scriptId, prompt: "one", state: "未生成", shouldGenerateImage: 1 }, { projectId: f.projectId, scriptId: f.scriptId, prompt: "two", state: "未生成", shouldGenerateImage: 1 }]);
+    const log = { submits: [] as unknown[], queries: [] as string[] };
+    let prepared = 0;
+    const service = createImageGenerationService({ db: f.db, providerFor: async () => provider(log), download: async () => undefined, validateConfig: () => { if (++prepared === 2) throw new Error("Second target rejected"); } });
+    const runtime: ProductionImageRuntime = { imageJobs: service, getArtPrompt: () => "", generatePrompt: async () => "", getImageBase64: async () => "", getSmallImageUrl: async (path) => path, uuid: () => "cancel" };
+    await assert.rejects(prepareStoryboardImages(f.db, { projectId: f.projectId, scriptId: f.scriptId, storyboardIds: [one, two], compulsory: true, runtime }), /Second target rejected/);
+    assert.equal((await f.db("ext_image_jobs").first()).status, "FAILED");
+    assert((await f.db("o_storyboard").whereIn("id", [one, two])).every((row) => row.state !== "生成中"));
+    assert.equal(log.submits.length, 0);
+  } finally { await f.destroy(); }
+});
+
+test("unsupported Seedream size fails before claiming a target or contacting the provider", options, async () => {
+  const { validateImageOutputSize } = await import("../src/lib/imageRequestCapabilities");
+  const f = await fixture();
+  try {
+    const targetId = await asset(f);
+    const log = { submits: [] as unknown[], queries: [] as string[] };
+    const service = createImageGenerationService({ db: f.db, providerFor: async () => provider(log), download: async () => undefined, validateConfig: (key, config) => validateImageOutputSize(key, config.size) });
+    await assert.rejects(service.prepare({ projectId: f.projectId, generationKey: "bad-image-size", modelKey: "zhenzhenRelay:seedream-v5-pro-i2i", config: { prompt: "image", size: "4K", aspectRatio: "9:16" }, target: { kind: "asset", id: targetId } }), /1K\/2K/);
+    assert.equal((await f.db("ext_image_jobs")).length, 0); assert.equal(log.submits.length, 0);
+    assert.equal((await f.db("o_assets").where({ id: targetId }).first()).imageId, null);
+  } finally { await f.destroy(); }
+});
+
 async function fixture() {
   const f = await createPostgresFixture();
   await migratePostgresFixture(f.db);

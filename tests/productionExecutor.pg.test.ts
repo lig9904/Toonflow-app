@@ -14,6 +14,34 @@ import { ensureAssetExtractionWorkspaceSchema } from "../src/services/assetExtra
 
 const options = { skip: !process.env.TOONFLOW_TEST_DATABASE_URL };
 
+test("an authorized derived-image run renders existing unpictured children even when analysis adds none", options, async () => {
+  const f = await fixture();
+  try {
+    const [childId] = await insertRowsReturningIds(f.db, "o_assets", { projectId: f.projectId, assetsId: f.assetId, name: "Existing child", type: "role", describe: "new outfit" });
+    const mediaIds: number[] = [];
+    const model = modelFor((request) => request.role === "productionAgent:decisionAgent" ? { actions: ["deriveAssets", "generateImages"], assetIds: [f.assetId], storyboardIds: [], question: null, summary: "Create derived images" } : { assets: [] }, []);
+    const result = await runOnce(f, model, { generateImage: async (request) => { mediaIds.push(request.targetId); return { status: "succeeded", jobId: 1, selected: true }; } }, { ...defaultBuiltinRunLimits, maxImageGenerations: 1 });
+    assert.equal(result.run.status, "succeeded", result.run.errorMessage ?? "");
+    assert.deepEqual(mediaIds, [childId]); assert.equal(result.run.imageGenerations, 1);
+  } finally { await f.destroy(); }
+});
+
+test("director preview is emitted before its structured result is committed", options, async () => {
+  const f = await fixture();
+  try {
+    const model: StructuredScriptModel = { async generate(request) {
+      if (request.role === "productionAgent:decisionAgent") return { value: request.schema.parse({ actions: ["planning"], assetIds: [], storyboardIds: [], question: null, summary: "Plan" }), outputTokens: 10 };
+      await request.onPartial?.({ scriptPlan: "Draft in progress" });
+      assert.equal((await f.db("o_agentWorkData").where({ projectId: f.projectId, key: "productionAgent" })).length, 0);
+      assert((await f.db("ext_builtin_run_events").where({ type: "artifact.preview" })).length > 0);
+      return { value: request.schema.parse({ scriptPlan: "Completed plan" }), outputTokens: 100 };
+    } };
+    const result = await runOnce(f, model);
+    assert.equal(result.run.status, "succeeded", result.run.errorMessage ?? "");
+    assert.equal(JSON.parse((await f.db("o_agentWorkData").where({ projectId: f.projectId, key: "productionAgent" }).first()).data).scriptPlan, "Completed plan");
+  } finally { await f.destroy(); }
+});
+
 test("independent production resumes the same task without replaying its saved director plan", options, async () => {
   const f = await fixture();
   let release!: () => void;

@@ -15,6 +15,7 @@ export interface StructuredModelRequest<T> {
   schema: z.ZodType<T>;
   maxOutputTokens: number;
   useModelOutputLimit?: boolean;
+  onPartial?: (value: unknown) => Promise<void>;
   signal: AbortSignal;
   thinkLevel: BuiltinThinkLevel;
 }

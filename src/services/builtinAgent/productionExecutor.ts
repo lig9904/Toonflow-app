@@ -103,7 +103,18 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
         const remaining = !independentOutput && ctx.remainingOutputTokens ? await ctx.remainingOutputTokens() : run.limits.maxOutputTokens;
         const effectiveBudget = independentOutput ? 0 : Math.min(budget, remaining - reserveTokens);
         if (!independentOutput && effectiveBudget < 128) throw new BuiltinRuntimeError("BUDGET_EXCEEDED", "本次运行的剩余文本输出额度不足，请缩小下一步范围；已保存结果保留");
-        const generated = await deps.model.generate({ role, system, input, schema, maxOutputTokens: effectiveBudget, ...(independentOutput ? { useModelOutputLimit: true } : {}), signal: ctx.signal, thinkLevel });
+        const target = key === "directorPlan" ? "scriptPlan" : key === "storyboard" ? "storyboardTable" : undefined;
+        let lastPreviewAt = 0, lastText = "";
+        const preview = target ? async (partial: unknown) => {
+          const value = partial as { scriptPlan?: unknown; items?: unknown[] } | null;
+          const cell = (value: unknown) => String(value ?? "").replace(/\|/g, "\\|").replace(/\r?\n/g, "<br>");
+          const text = target === "scriptPlan" ? (typeof value?.scriptPlan === "string" ? value.scriptPlan : "")
+            : Array.isArray(value?.items) ? ["| 镜头 | 时长（秒） | 画面 | 视频描述 |", "|---|---|---|---|", ...value.items.map((item: any, index) => `| ${index + 1} | ${cell(item?.duration)} | ${cell(item?.prompt)} | ${cell(item?.videoDesc)} |`)].join("\n") : "";
+          if (!text || text === lastText || Date.now() - lastPreviewAt < 500) return;
+          lastPreviewAt = Date.now(); lastText = text;
+          await ctx.emit("artifact.preview", { target, text: text.slice(0, 200_000), inputRevision: revision });
+        } : undefined;
+        const generated = await deps.model.generate({ role, system, input, schema, maxOutputTokens: effectiveBudget, ...(independentOutput ? { useModelOutputLimit: true } : {}), ...(preview ? { onPartial: preview } : {}), signal: ctx.signal, thinkLevel });
         return { value: schema.parse(generated.value), outputTokens: generated.outputTokens, ...(generated.maxOutputTokens ? { maxOutputTokens: generated.maxOutputTokens } : {}) };
       }, { modelCall: true });
       return result.value;
@@ -145,6 +156,7 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
         flow = await refreshFlow("planning");
         await ctx.emit("artifact.saved", { kind: "productionPlanning", ids: [projectId, scriptId], version: saved.planningVersion });
       } else if (action === "deriveAssets") {
+        const requestedParentIds = [...targetAssetIds];
         if (!targetAssetIds.length) await ctx.waitForHuman(`请指定需要分析衍生版本的素材名称或 ID，或回复“全部当前剧集素材”。可选素材示例：${flow.assets.slice(0, 20).map((asset: any) => `${String(asset.name ?? "未命名").slice(0, 80)}（ID ${asset.id}）`).join("、") || "当前剧集尚未关联基础素材"}`, { projectId, scriptId });
         const derived = await model("deriveAssets", "productionAgent:deriveAssetsAgent", "production_execution_derive_assets.md", deriveSchema, { request: requestText, project, flow, parentAssetIds: targetAssetIds }, budget);
         const created = await ctx.commit(`production.assets:r${revision}`, { projectId, scriptId, derived }, async (trx) => {
@@ -159,12 +171,15 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
           return ids;
         });
         output.derivedAssets = created;
-        targetAssetIds = (created as Array<{ id: number }>).map((item) => Number(item.id));
+        const savedAssetIds = (created as Array<{ id: number }>).map((item) => Number(item.id));
+        targetAssetIds = savedAssetIds;
         flow = await refreshFlow("deriveAssets");
         knownTopAssets = new Set(flow.assets.map((asset: any) => Number(asset.id)));
         knownAssets = new Set(flow.assets.flatMap((asset: any) => [Number(asset.id), ...asset.derive.map((child: any) => Number(child.id))]));
-        if (targetAssetIds.length) await ctx.emit("artifact.saved", { kind: "assets", ids: targetAssetIds });
-        else await ctx.emit("message.completed", { text: "衍生素材分析完成，本次没有新增或更新衍生版本。" });
+        if (selected.has("generateImages")) targetAssetIds = [...new Set([...targetAssetIds, ...flow.assets.filter((asset: any) => requestedParentIds.includes(Number(asset.id))).flatMap((asset: any) => asset.derive.filter((child: any) => !child.src).map((child: any) => Number(child.id)))])];
+        if (savedAssetIds.length) await ctx.emit("artifact.saved", { kind: "assets", ids: savedAssetIds });
+        else await ctx.emit("message.completed", { text: targetAssetIds.length && selected.has("generateImages") ? `衍生描述已存在，准备生成 ${targetAssetIds.length} 个缺失的衍生素材图片。` : "衍生素材分析完成，本次没有新增或更新衍生版本。" });
+        if (created.length && !selected.has("generateImages")) await ctx.emit("message.completed", { text: `已保存 ${created.length} 个衍生素材描述，本次没有生成图片。需要出图时请授权图片次数并明确要求生成衍生素材图片。` });
       } else if (action === "storyboard") {
         // Long shot lists can use tokens left over from the compact director plan.
         const storyboard = await model("storyboard", "productionAgent:storyboardTableAgent", "production_execution_storyboard_table.md", storyboardSchema, { request: requestText, project, flow, selectedStoryboardIds: plan.storyboardIds }, run.limits.maxOutputTokens, selected.has("review") ? 1024 : 0);
@@ -223,6 +238,11 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
           targets.push(...storyboardIds.map((id) => ({ targetKind: "storyboard" as const, targetId: id, storyboardIds: [id], source: knownStoryboards.get(id) })));
         }
         const limit = action === "generateImages" ? run.limits.maxImageGenerations : run.limits.maxVideoGenerations;
+        if (action === "generateImages" && selected.has("deriveAssets") && !targets.length) {
+          output.generateImages = [];
+          await ctx.emit("message.completed", { text: "本次没有需要出图的衍生素材，未调用图片模型。" });
+          continue;
+        }
         if (!targets.length) await ctx.waitForHuman("请明确本次要生成的素材、分镜或视频轨道", { action, projectId, scriptId });
         if (targets.length > limit) throw new BuiltinRuntimeError("BUDGET_EXCEEDED", `${action} 超过本次运行授权额度`);
         if (targets.some((item) => !item.source)) throw new BuiltinRuntimeError("INVALID_INPUT", "媒体生成引用了项目外实体");

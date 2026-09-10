@@ -6,6 +6,7 @@ import { validateFields } from "@/middleware/middleware";
 import { requireProductionOwner, sendProductionError } from "@/services/productionHttp";
 import { prepareStoryboardImages, ProductionImageError } from "@/services/productionImages";
 import { createDurableProductionImageRuntime } from "@/services/productionImageJobRuntime";
+import { ImageGenerationError } from "@/services/imageJobs/runtime";
 
 const router = express.Router();
 
@@ -29,7 +30,7 @@ export default router.post(
       res.status(202).send(success(prepared.preview, "已接受分镜图片生成任务"));
       void prepared.run().catch((error) => console.error("[productionStoryboard] background generation failed", error));
     } catch (error) {
-      if (error instanceof ProductionImageError) return res.status(error.status).send({ error: error.message });
+      if (error instanceof ProductionImageError || error instanceof ImageGenerationError) return res.status(error.status).send({ code: error.status, message: error.message });
       return sendProductionError(res, error);
     }
   },

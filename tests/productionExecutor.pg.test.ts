@@ -401,6 +401,68 @@ test("video generation deduplicates by real track and passes full provider param
   } finally { await f.destroy(); }
 });
 
+test("scoped image instructions do not leak one storyboard's local request into another", options, async () => {
+  const f = await fixture();
+  try {
+    const [first] = await insertRowsReturningIds(f.db, "o_storyboard", { projectId: f.projectId, scriptId: f.scriptId, index: 0, prompt: "first base", duration: "2", track: "A", videoDesc: "first desc", shouldGenerateImage: 1, state: "未生成" });
+    const [second] = await insertRowsReturningIds(f.db, "o_storyboard", { projectId: f.projectId, scriptId: f.scriptId, index: 1, prompt: "second base", duration: "3", track: "B", videoDesc: "second desc", shouldGenerateImage: 1, state: "未生成" });
+    const received: any[] = [];
+    const model = modelFor((request) => request.role === "productionAgent:decisionAgent"
+      ? { actions: ["generateImages"], assetIds: [], storyboardIds: [first, second], globalMediaInstructions: "统一冷色海底光线", mediaInstructions: [
+          { targetKind: "storyboard", targetId: first, instructions: "S01 金爪海螺极特写" },
+          { targetKind: "storyboard", targetId: second, instructions: "S06 九九反应特写" },
+        ], question: null, summary: "images" }
+      : { items: [], summary: "" }, []);
+    const result = await runOnce(f, model, { generateImage: async (input) => { received.push(input); return { status: "succeeded", jobId: input.targetId }; } }, { ...defaultBuiltinRunLimits, maxImageGenerations: 2 });
+    assert.equal(result.run.status, "succeeded", result.run.errorMessage ?? "");
+    const firstInstruction = received.find((item) => item.targetId === first).params.imageInstruction;
+    const secondInstruction = received.find((item) => item.targetId === second).params.imageInstruction;
+    assert.match(firstInstruction, /统一冷色海底光线/); assert.match(firstInstruction, /S01 金爪海螺极特写/); assert.doesNotMatch(firstInstruction, /S06 九九反应特写/);
+    assert.match(secondInstruction, /统一冷色海底光线/); assert.match(secondInstruction, /S06 九九反应特写/); assert.doesNotMatch(secondInstruction, /S01 金爪海螺极特写/);
+  } finally { await f.destroy(); }
+});
+
+test("scoped video instructions stay with their track target", options, async () => {
+  const f = await fixture();
+  try {
+    const [trackA] = await insertRowsReturningIds(f.db, "o_videoTrack", { projectId: f.projectId, scriptId: f.scriptId, duration: 2 });
+    const [trackB] = await insertRowsReturningIds(f.db, "o_videoTrack", { projectId: f.projectId, scriptId: f.scriptId, duration: 3 });
+    const [first] = await insertRowsReturningIds(f.db, "o_storyboard", { projectId: f.projectId, scriptId: f.scriptId, index: 0, prompt: "first", duration: "2", track: "A", trackId: trackA, videoDesc: "first video", shouldGenerateImage: 0, state: "未生成" });
+    const [second] = await insertRowsReturningIds(f.db, "o_storyboard", { projectId: f.projectId, scriptId: f.scriptId, index: 1, prompt: "second", duration: "3", track: "B", trackId: trackB, videoDesc: "second video", shouldGenerateImage: 0, state: "未生成" });
+    const received: any[] = [];
+    const model = modelFor((request) => request.role === "productionAgent:decisionAgent"
+      ? { actions: ["generateVideos"], assetIds: [], storyboardIds: [first, second], globalMediaInstructions: "统一保留海浪环境声", mediaInstructions: [
+          { targetKind: "storyboard", targetId: first, instructions: "S01 海螺微距" },
+          { targetKind: "storyboard", targetId: second, instructions: "S06 九九反应特写" },
+        ], question: null, summary: "videos" }
+      : { items: [], summary: "" }, []);
+    const result = await runOnce(f, model, { generateVideo: async (input) => { received.push(input); return { status: "succeeded", jobId: input.targetId }; } }, { ...defaultBuiltinRunLimits, maxVideoGenerations: 2 }, "produce", async () => ({ mode: "text", resolution: "720p", audio: true }));
+    assert.equal(result.run.status, "succeeded", result.run.errorMessage ?? "");
+    const firstPrompt = received.find((item) => item.targetId === trackA).params.prompt;
+    const secondPrompt = received.find((item) => item.targetId === trackB).params.prompt;
+    assert.match(firstPrompt, /统一保留海浪环境声/); assert.match(firstPrompt, /S01 海螺微距/); assert.doesNotMatch(firstPrompt, /S06 九九反应特写/);
+    assert.match(secondPrompt, /统一保留海浪环境声/); assert.match(secondPrompt, /S06 九九反应特写/); assert.doesNotMatch(secondPrompt, /S01 海螺微距/);
+  } finally { await f.destroy(); }
+});
+
+test("media instructions for foreign or unselected targets fail before media calls", options, async () => {
+  const f = await fixture();
+  try {
+    const [selected] = await insertRowsReturningIds(f.db, "o_storyboard", { projectId: f.projectId, scriptId: f.scriptId, index: 0, prompt: "selected", duration: "2", track: "A", shouldGenerateImage: 1, state: "未生成" });
+    const [foreignProject] = await insertRowsReturningIds(f.db, "o_project", { userId: 1, name: "Foreign" });
+    const [foreignScript] = await insertRowsReturningIds(f.db, "o_script", { projectId: foreignProject, name: "Foreign episode", content: "" });
+    const [foreign] = await insertRowsReturningIds(f.db, "o_storyboard", { projectId: foreignProject, scriptId: foreignScript, index: 0, prompt: "foreign", duration: "2", track: "X", shouldGenerateImage: 1, state: "未生成" });
+    let mediaCalls = 0;
+    const model = modelFor((request) => request.role === "productionAgent:decisionAgent"
+      ? { actions: ["generateImages"], assetIds: [], storyboardIds: [selected], globalMediaInstructions: "shared", mediaInstructions: [{ targetKind: "storyboard", targetId: foreign, instructions: "must not apply" }], question: null, summary: "invalid" }
+      : { items: [], summary: "" }, []);
+    const result = await runOnce(f, model, { generateImage: async () => { mediaCalls++; return { status: "succeeded", jobId: 1 }; } }, { ...defaultBuiltinRunLimits, maxImageGenerations: 1 });
+    assert.equal(result.run.status, "failed");
+    assert.equal(mediaCalls, 0);
+    assert.match(result.run.errorMessage ?? "", /局部要求目标/);
+  } finally { await f.destroy(); }
+});
+
 test("storyboard agent updates duration, track, image flag, and asset associations under the shared guard", options, async () => {
   const f = await fixture();
   try {

@@ -127,6 +127,28 @@ test("download retries never resubmit an upstream video", async () => {
   } finally { service.stop(); await close(f); }
 });
 
+test("manual retryDownload reuses a known result without provider POST or query", async () => {
+  const f = await fixture({ maxDownloadFailures: 1, provider: { query: async () => ({ status: "succeeded", outputUrl: "https://example.test/recover.mp4" }) } });
+  try {
+    f.service.stop();
+    f.service = new VideoJobService(f.db, { providerFor: async () => f.provider, download: async () => { throw new Error("temporary CDN timeout"); }, schedule: false, initialPollDelayMs: 1, maxDownloadFailures: 1 });
+    const reserved = await f.service.reserve("download-retry-1", payload(), hashVideoJobRequest(payload()));
+    const failed = await f.service.submitReserved(reserved.job.id);
+    assert.equal(failed.status, "RECONCILIATION_REQUIRED");
+    assert.equal(f.provider.submits, 1);
+    const downloads: string[] = [];
+    f.service.stop();
+    f.service = new VideoJobService(f.db, { providerFor: async () => f.provider, download: async (url, output) => { downloads.push(`${url}:${output}`); }, schedule: false, initialPollDelayMs: 1 });
+    const [first, second] = await Promise.all([
+      f.service.retryDownload({ projectId: 1, scriptId: 10, trackId: 100, jobId: reserved.job.id }),
+      f.service.retryDownload({ projectId: 1, scriptId: 10, trackId: 100, jobId: reserved.job.id }),
+    ]);
+    assert.equal(first.status, "SUCCEEDED"); assert.equal(second.status, "SUCCEEDED");
+    assert.equal(f.provider.submits, 1); assert.equal(f.provider.queries, 0); assert.equal(downloads.length, 1);
+    await assert.rejects(f.service.retryDownload({ projectId: 2, scriptId: 20, trackId: 200, jobId: reserved.job.id }), (error: unknown) => error instanceof VideoJobError && error.code === "PROJECT_MISMATCH");
+  } finally { await close(f); }
+});
+
 test("one service observes its configured upstream submission concurrency limit", async () => {
   let active = 0; let maximum = 0;
   const f = await fixture({ maxConcurrent: 1, provider: { submit: async () => {
@@ -140,6 +162,26 @@ test("one service observes its configured upstream submission concurrency limit"
     await Promise.all([f.service.submitReserved(a.job.id), f.service.submitReserved(b.job.id)]);
     assert.equal(maximum, 1);
   } finally { await close(f); }
+});
+
+test("another project cannot reuse an authorized in-flight download promise", async () => {
+  const f = await fixture();
+  let release!: () => void;
+  let started!: () => void;
+  const startedPromise = new Promise<void>((resolve) => { started = resolve; });
+  const downloadGate = new Promise<void>((resolve) => { release = resolve; });
+  try {
+    const reserved = await f.service.reserve("download-owner-race", payload(), hashVideoJobRequest(payload()));
+    await f.db("ext_video_jobs").where({ id: reserved.job.id }).update({ status: "DOWNLOADING", upstreamTaskId: "known-task", resultUrl: "https://example.test/video.mp4" });
+    f.service.stop();
+    f.service = new VideoJobService(f.db, { providerFor: async () => f.provider, download: async () => { started(); await downloadGate; }, schedule: false });
+    const owner = f.service.retryDownload({ projectId: 1, scriptId: 10, trackId: 100, jobId: reserved.job.id });
+    await startedPromise;
+    await assert.rejects(f.service.retryDownload({ projectId: 2, scriptId: 20, trackId: 200, jobId: reserved.job.id }), (error: unknown) => error instanceof VideoJobError && error.code === "PROJECT_MISMATCH");
+    release();
+    assert.equal((await owner).status, "SUCCEEDED");
+    assert.equal(f.provider.submits, 0);
+  } finally { release(); await close(f); }
 });
 
 test("concurrent idempotent new-video reservations create exactly one video row", async () => {

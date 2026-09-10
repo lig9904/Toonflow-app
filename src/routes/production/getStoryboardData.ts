@@ -71,6 +71,8 @@ export default router.post(
           duration: item.duration ? Number(item.duration) : undefined,
           filePath: item.filePath || undefined,
           prompt: item.prompt ?? undefined,
+          videoDesc: item.videoDesc ?? undefined,
+          description: item.videoDesc ?? item.prompt ?? undefined,
           scriptId: item.scriptId ?? undefined,
           characters: charactersWithUrl,
           index: item.index,

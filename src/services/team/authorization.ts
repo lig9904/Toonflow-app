@@ -126,7 +126,7 @@ add("POST", ["/api/production/workbench/saveEditTimeline"], project("edit", "pro
 add("POST", ["/api/production/workbench/generateVideoPrompt"], project("edit", "projectId", [{ table: "o_script", field: "scriptId" }, { table: "o_videoTrack", field: "trackId" }]));
 add("POST", ["/api/production/workbench/batchGeneratePrompt"], project("edit", "projectId", [{ table: "o_script", field: "scriptId" }, { table: "o_videoTrack", field: "trackData", many: true, nestedIdField: "trackId" }]));
 add("POST", ["/api/production/saveFlowData"], project("edit", "projectId", [{ table: "o_script", field: "episodesId" }]));
-add("POST", ["/api/production/editImage/uploadImage", "/api/production/workbench/addTrack", "/api/production/workbench/batchGenerateVideo", "/api/production/workbench/generateVideo"], project("edit", "projectId", [{ table: "o_script", field: "scriptId" }]));
+add("POST", ["/api/production/editImage/uploadImage", "/api/production/workbench/addTrack", "/api/production/workbench/batchGenerateVideo", "/api/production/workbench/generateVideo", "/api/production/workbench/retryVideoDownload"], project("edit", "projectId", [{ table: "o_script", field: "scriptId" }]));
 add("POST", ["/api/production/storyboard/addStoryboard", "/api/production/storyboard/batchAddStoryboardInfo"], project("edit", "projectId", [{ table: "o_script", field: "scriptId" }, { table: "o_assets", field: "data", many: true, nestedIdField: "associateAssetsIds", nestedMany: true, optional: true }]));
 add("POST", ["/api/production/storyboard/getStoryboardData"], resource("read", "o_script", "scriptId"));
 add("POST", ["/api/novel/delNovel"], project("delete", "projectId"));

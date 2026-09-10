@@ -329,6 +329,33 @@ export class VideoJobService {
     return this.runExclusive(jobId, () => this.runJob(jobId, false));
   }
 
+  /** Retry only the download for a known upstream receipt. It never queries
+   * or submits the provider, and accepts no job without both durable fields. */
+  async retryDownload(input: { projectId: number; scriptId: number; trackId: number; jobId: number }): Promise<VideoJob> {
+    this.assertPositiveInteger(input.projectId, "projectId");
+    this.assertPositiveInteger(input.scriptId, "scriptId");
+    this.assertPositiveInteger(input.trackId, "trackId");
+    this.assertPositiveInteger(input.jobId, "jobId");
+    // Authorize before sharing an in-flight promise. Otherwise a caller from
+    // another project could reuse the first caller's already-authorized work.
+    const owned = await this.get(input.jobId);
+    if (owned.projectId !== input.projectId || owned.scriptId !== input.scriptId || owned.trackId !== input.trackId) throw new VideoJobError("PROJECT_MISMATCH", "下载任务不属于当前项目、剧集或轨道");
+    return this.runExclusive(input.jobId, async () => {
+      let job = await this.get(input.jobId);
+      if (job.projectId !== input.projectId || job.scriptId !== input.scriptId || job.trackId !== input.trackId) throw new VideoJobError("PROJECT_MISMATCH", "下载任务不属于当前项目、剧集或轨道");
+      if (job.status === "SUCCEEDED") return job;
+      if (!job.upstreamTaskId || !job.resultUrl) throw new VideoJobError("CONFLICT", "视频任务没有已知的上游任务和结果地址，不能仅重试下载");
+      if (job.status !== "DOWNLOADING" && job.status !== "RECONCILIATION_REQUIRED") throw new VideoJobError("CONFLICT", "当前视频任务不处于可重试下载状态");
+      if (job.status === "RECONCILIATION_REQUIRED") {
+        await this.db("ext_video_jobs").where({ id: job.id, projectId: job.projectId, status: "RECONCILIATION_REQUIRED" }).whereNotNull("upstreamTaskId").whereNotNull("resultUrl").update({
+          status: "DOWNLOADING", downloadFailures: 0, nextPollAt: this.now(), lastError: null, updatedAt: this.now(),
+        });
+        job = await this.get(job.id);
+      }
+      return this.download(job, job.resultUrl!);
+    });
+  }
+
   /** Resume queries/downloads only. A live submission lease is left to its creating process. */
   async resumeDueJobs(): Promise<void> {
     if (this.stopped) return;

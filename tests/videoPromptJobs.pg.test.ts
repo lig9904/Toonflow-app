@@ -63,6 +63,21 @@ test("completed idempotent retry returns the saved result after its own CAS vers
   } finally { await f.destroy(); }
 });
 
+test("the current track prompt remains authoritative after a successful job is manually edited", options, async () => {
+  const f = await fixture();
+  try {
+    const input = { projectId: f.projectId, scriptId: f.scriptId, trackId: f.firstTrack, model: "fixture:model", mode: "text", info: [], idempotencyKey: "prompt-authoritative-current" };
+    const prepared = await prepareVideoPromptJob(f.db, input);
+    await executeVideoPromptJob(f.db, prepared.job.id, async () => "generated result");
+    const version = (await getCreativeState(f.db, "track", f.firstTrack, f.projectId)).version;
+    await updateTrackPrompt(f.db, { projectId: f.projectId, scriptId: f.scriptId, trackId: f.firstTrack, expectedVersion: version, prompt: "human replacement", idempotencyKey: "prompt-authoritative-edit" }, { kind: "human", id: "human:1" });
+    const current = await f.db("o_videoTrack").where({ id: f.firstTrack, projectId: f.projectId, scriptId: f.scriptId }).first("prompt");
+    const savedJob = await f.db("ext_video_prompt_jobs").where({ id: prepared.job.id }).first("resultPrompt");
+    assert.equal(savedJob.resultPrompt, "generated result");
+    assert.equal(current.prompt, "human replacement");
+  } finally { await f.destroy(); }
+});
+
 test("cross-track storyboard references are legal while cross-project references are rejected", options, async () => {
   const f = await fixture();
   try {

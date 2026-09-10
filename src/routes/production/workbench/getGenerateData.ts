@@ -11,6 +11,8 @@ const router = express.Router();
 
 interface VideoItem {
   id: number;
+  jobId?: number;
+  downloadRetryable?: boolean;
   src: string;
   state: "未生成" | "生成中" | "已完成" | "生成失败" | "需人工核对";
 }
@@ -153,6 +155,8 @@ export default router.post(
       "videoTrackId",
       trackData.map((t) => t.id),
     );
+    const videoJobs = videoList.length ? await u.db("ext_video_jobs").whereIn("videoId", videoList.map((video) => String(video.id))).select("id", "videoId", "status", "upstreamTaskId", "resultUrl") : [];
+    const jobByVideo = new Map(videoJobs.map((job) => [Number(job.videoId), job]));
     const trackList: TrackItem[] = [];
     const trackIdMap = [...new Set<number>(trackData.map((t) => t.id!))];
     for (const trackId of trackIdMap) {
@@ -196,8 +200,9 @@ export default router.post(
         videoList: await Promise.all(
           videoList
             .filter((v) => v.videoTrackId === trackId)
-            .map(async (v) => ({
+          .map(async (v) => ({
               id: v.id!,
+              ...(jobByVideo.get(Number(v.id)) ? { jobId: Number(jobByVideo.get(Number(v.id)).id), downloadRetryable: Boolean(jobByVideo.get(Number(v.id)).upstreamTaskId && jobByVideo.get(Number(v.id)).resultUrl && ["DOWNLOADING", "RECONCILIATION_REQUIRED"].includes(String(jobByVideo.get(Number(v.id)).status))) } : {}),
               src: v.filePath ? await u.oss.getFileUrl(v.filePath) : "",
               state: v.state === "已完成" || v.state === "生成成功" ? "已完成" : v.state === "生成中" ? "生成中" : v.state === "需人工核对" ? "需人工核对" : v.state === "生成失败" ? "生成失败" : "未生成",
               errorReason: v?.errorReason ?? "",

@@ -47,6 +47,12 @@ const planSchema = z.object({
   actions: z.array(phase).max(9),
   assetIds: z.array(z.number().int().positive()).max(500).default([]),
   storyboardIds: z.array(z.number().int().positive()).max(500).default([]),
+  globalMediaInstructions: z.string().max(20_000).default(""),
+  mediaInstructions: z.array(z.object({
+    targetKind: z.enum(["asset", "storyboard", "track"]),
+    targetId: z.number().int().positive(),
+    instructions: z.string().max(20_000),
+  }).strict()).max(1000).default([]),
   question: z.string().max(2000).nullable().default(null),
   summary: z.string().max(4000),
   videoSettings: z.object({ resolution: z.string().max(50).nullable().default(null), audio: z.boolean().nullable().default(null) }).strict().nullable().default(null),
@@ -69,6 +75,55 @@ const ORDER: CanonicalPhase[] = ["extractAssets", "planning", "deriveAssets", "s
 const canonical = (value: z.infer<typeof phase>): CanonicalPhase => value === "directorPlan" ? "planning" : value === "storyboardTable" ? "storyboard" : value as CanonicalPhase;
 const hash = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 type MediaTarget = { targetKind: "asset" | "storyboard" | "track"; targetId: number; storyboardIds: number[]; source: any };
+
+const scopedMediaInstructionPrompt = `
+媒体要求分配契约：globalMediaInstructions 只能写所有目标共同适用的要求，例如画幅、整体色调、统一禁用项；mediaInstructions 必须按真实 targetKind/targetId 写单个目标的局部要求。不要把另一个分镜的人物、动作、对白或镜头景别写进全局要求。每个目标只能接收全局要求和自己的局部要求。`;
+
+function validateMediaInstructions(
+  plan: { assetIds: number[]; storyboardIds: number[]; mediaInstructions: Array<{ targetKind: "asset" | "storyboard" | "track"; targetId: number; instructions: string }> },
+  knownAssets: Set<number>,
+  knownStoryboards: Map<number, any>,
+): void {
+  const selectedAssets = new Set(plan.assetIds);
+  const selectedStoryboards = new Set(plan.storyboardIds);
+  const selectedTracks = new Set(
+    plan.storyboardIds
+      .map((id) => Number(knownStoryboards.get(id)?.trackId))
+      .filter((id) => Number.isSafeInteger(id) && id > 0),
+  );
+  const seen = new Set<string>();
+  for (const instruction of plan.mediaInstructions) {
+    const targetId = Number(instruction.targetId);
+    const key = `${instruction.targetKind}:${targetId}`;
+    if (seen.has(key)) throw new BuiltinRuntimeError("INVALID_INPUT", `媒体局部要求重复指定目标 ${key}`);
+    seen.add(key);
+    const allowed = instruction.targetKind === "asset"
+      ? knownAssets.has(targetId) && selectedAssets.has(targetId)
+      : instruction.targetKind === "storyboard"
+        ? knownStoryboards.has(targetId) && selectedStoryboards.has(targetId)
+        : selectedTracks.has(targetId);
+    if (!allowed) throw new BuiltinRuntimeError("INVALID_INPUT", `媒体局部要求目标 ${key} 不属于当前项目或本轮选中范围`);
+  }
+}
+
+function scopedMediaInstructions(
+  target: MediaTarget,
+  globalInstructions: string,
+  localInstructions: Map<string, string>,
+  requestText: string,
+  targetCount: number,
+): string {
+  const values = [globalInstructions.trim()];
+  const keys = new Set([`${target.targetKind}:${target.targetId}`, ...target.storyboardIds.map((id) => `storyboard:${id}`)]);
+  for (const key of keys) {
+    const value = localInstructions.get(key)?.trim();
+    if (value) values.push(value);
+  }
+  // Legacy plans may not have scoped fields. Keep the old request only for a
+  // genuinely single target; multi-target runs must never cross-contaminate.
+  if (values.every((value) => !value) && targetCount === 1) values.push(requestText.trim());
+  return values.filter(Boolean).join("\n");
+}
 
 export function createProductionAgentExecutor(deps: ProductionExecutorDependencies) {
   const extractAssets = createAssetExtractionHelper({ db: deps.db, model: deps.model });
@@ -118,7 +173,7 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
     const model = async <T>(key: string, role: StructuredModelRequest<T>["role"], skillName: string, schema: z.ZodType<T>, input: unknown, budget: number, reserveTokens = 0): Promise<T> => {
       if (!independentOutput && budget < 128) throw new BuiltinRuntimeError("BUDGET_EXCEEDED", "输出额度不足以执行制作阶段");
       await ctx.assertActive();
-      const system = role === "productionAgent:decisionAgent" ? productionDecisionPrompt
+      const system = role === "productionAgent:decisionAgent" ? `${productionDecisionPrompt}\n${scopedMediaInstructionPrompt}`
         : `${await skill(skillName)}\n\n当前服务器执行契约（取代上述旧工具、XML和前端保存流程）：${productionStageContract(role)} 所有项目、剧集、素材、分镜 ID 必须来自输入。`;
       const result = await ctx.step(`production.${key}:r${revision}`, { input, role, systemHash: hash(system), ...(independentOutput ? { outputBudgetMode: "model_per_call" } : { budget, reserveTokens }) }, async () => {
         const remaining = !independentOutput && ctx.remainingOutputTokens ? await ctx.remainingOutputTokens() : run.limits.maxOutputTokens;
@@ -156,6 +211,7 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
     let knownAssets = new Set(flow.assets.flatMap((asset: any) => [Number(asset.id), ...asset.derive.map((child: any) => Number(child.id))]));
     let knownStoryboards = new Map(flow.storyboard.map((storyboard: any) => [Number(storyboard.id), storyboard]));
     if (plan.assetIds.some((id) => !knownAssets.has(id)) || plan.storyboardIds.some((id) => !knownStoryboards.has(id))) throw new BuiltinRuntimeError("INVALID_INPUT", "制作规划引用了项目外实体");
+    validateMediaInstructions(plan, knownAssets, knownStoryboards);
     if (plan.question && !actions.length) throw new BuiltinRuntimeError("INVALID_INPUT", `本次没有可执行的制作步骤：${plan.question}`);
     await ctx.emit("message.completed", { text: actions.length ? `准备执行：${actions.map((action) => productionActionLabels[action]).join("、")}。保存完成后会显示实际产物。` : "本轮未执行制作步骤，也未写入数据。" });
     const selected = new Set(actions);
@@ -303,6 +359,8 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
         if (targets.some((item) => !item.source)) throw new BuiltinRuntimeError("INVALID_INPUT", "媒体生成引用了项目外实体");
         const results: unknown[] = [];
         const issues: Array<{ targetKind: string; targetId: number; message: string; result?: unknown }> = [];
+        const globalMediaInstructions = plan.globalMediaInstructions.trim();
+        const localMediaInstructions = new Map(plan.mediaInstructions.map((item) => [`${item.targetKind}:${item.targetId}`, item.instructions]));
         const performTarget = async (target: MediaTarget) => {
           await ctx.assertActive();
           await assertSourceCurrent(deps.db, true);
@@ -314,17 +372,18 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
           const videoSources = action === "generateVideos" ? target.storyboardIds.map((id) => knownStoryboards.get(id)).filter(Boolean) as any[] : [];
           const storedVideoPrompt = buildStoryboardVideoPrompt(videoSources);
           const storedImagePrompt = target.targetKind === "asset" && selected.has("deriveAssets") ? source.desc || source.prompt || source.name || "" : source.prompt || source.desc || source.name || "";
-          const imagePromptUpdated = target.targetKind === "storyboard" ? selected.has("storyboard") : selected.has("deriveAssets") || selected.has("extractAssets");
-          const imageRequest = imagePromptUpdated ? "" : requestText;
+          const scopedInstructions = scopedMediaInstructions(target, globalMediaInstructions, localMediaInstructions, requestText, targets.length);
+          const imageRequest = scopedInstructions;
+          const videoInstruction = scopedInstructions ? `本目标媒体要求（仅适用于当前目标）：${scopedInstructions}` : "";
           const videoParams: Record<string, unknown> = action === "generateVideos" ? {
             mode: project.videoMode || videoMetadata.mode,
             resolution: plan.videoSettings?.resolution ?? project.videoResolution ?? videoMetadata.resolution,
             duration: videoSources.reduce((total, item) => total + Number(item.duration || 0), 0),
             audio: plan.videoSettings?.audio ?? project.audio ?? videoMetadata.audio ?? false,
-            prompt: selected.has("storyboard") ? storedVideoPrompt : `${storedVideoPrompt}\n本次制作要求（优先落实其中的画面和声音要求）：${requestText}`,
+            prompt: [storedVideoPrompt, videoInstruction].filter(Boolean).join("\n"),
             storyboardIds: target.storyboardIds,
             expectedVersions: Object.fromEntries(videoSources.map((item) => [Number(item.id), Number(item.collaboration?.version ?? 0)])),
-          } : { prompt: [storedImagePrompt, project.artStyle ? `画风：${project.artStyle}` : "", imageRequest ? `本次画面要求（优先于旧画面描述）：${imageRequest}` : ""].filter(Boolean).join("\n"), imageInstruction: imageRequest, size: project.imageQuality, aspectRatio: project.videoRatio,
+          } : { prompt: [storedImagePrompt, project.artStyle ? `画风：${project.artStyle}` : "", imageRequest ? `本目标画面要求：${imageRequest}` : ""].filter(Boolean).join("\n"), imageInstruction: imageRequest, size: project.imageQuality, aspectRatio: project.videoRatio,
             expectedVersion: target.targetKind === "storyboard" ? Number(source.collaboration?.version ?? 0) : Number(source.imageId ?? 0),
             referenceAssetIds: target.targetKind === "storyboard" ? source.associateAssetsIds ?? [] : source.assetsId != null ? [Number(source.assetsId)] : Number(source.imageId ?? 0) > 0 ? [target.targetId] : [],
             referenceStoryboardIds: [] };

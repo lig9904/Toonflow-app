@@ -479,13 +479,25 @@ export class ImageGenerationService {
     binding = await trx<BindingRow>(BINDINGS).where({ jobId: job.id, projectId: job.projectId }).first();
     if (!binding) throw new ImageGenerationError("NOT_FOUND", "图片任务缺少目标绑定", 409);
     let selected = false;
-    const referencesCurrent = await imageReferencesMatch(trx, job.projectId, (job.payload.context as BindingContext | undefined)?.referenceAssets);
+    const savedReferences = (job.payload.context as BindingContext | undefined)?.referenceAssets;
+    // A root-image edit may legitimately use the target's previously selected
+    // image as its own reference. Preparing the job swaps that pointer to the
+    // candidate, so only external references participate in the late-result
+    // fence for an asset target. The target's own identity is covered by its
+    // immutable target signature and expected previous image below.
+    const referencesCurrent = await imageReferencesMatch(
+      trx,
+      job.projectId,
+      binding.targetKind === "asset"
+        ? savedReferences?.filter((reference) => reference.assetId !== Number(binding.targetId))
+        : savedReferences,
+    );
     if (binding.targetKind === "asset") {
       const candidateImageId = Number(binding.candidateImageId);
       await trx("o_image").where({ id: candidateImageId, assetsId: Number(binding.targetId) }).update({ filePath: job.outputPath, state: "已完成", errorReason: null });
       const asset = await trx("o_assets").where({ id: Number(binding.targetId), projectId: job.projectId }).first();
       const pointerIsExpected = asset && (Number(asset.imageId) === candidateImageId || (binding.runId && Number(asset.imageId ?? 0) === Number(binding.previousImageId ?? 0)));
-      selected = Boolean(runMaySelect && pointerIsExpected && assetSignature(asset) === binding.targetSignature && !(await lockedAssetReference(trx, Number(binding.targetId))));
+      selected = Boolean(runMaySelect && referencesCurrent && pointerIsExpected && assetSignature(asset) === binding.targetSignature && !(await lockedAssetReference(trx, Number(binding.targetId))));
       if (selected && asset && Number(asset.imageId) !== candidateImageId) await trx("o_assets").where({ id: asset.id, projectId: job.projectId, imageId: binding.previousImageId ?? null }).update({ imageId: candidateImageId });
       if (!selected && asset && Number(asset.imageId) === candidateImageId) {
         await trx("o_assets").where({ id: asset.id, projectId: job.projectId, imageId: candidateImageId }).update({ imageId: binding.previousImageId == null ? null : Number(binding.previousImageId) });
@@ -605,7 +617,10 @@ export class ImageGenerationService {
     if (!Number.isSafeInteger(input.projectId) || input.projectId <= 0) throw new ImageGenerationError("INVALID_INPUT", "projectId 必须是正整数");
     if (!input.generationKey || input.generationKey.length < 8 || input.generationKey.length > 200) throw new ImageGenerationError("INVALID_INPUT", "generationKey 不合法");
     if (!input.modelKey || !input.config?.prompt || !input.config.size || !input.config.aspectRatio) throw new ImageGenerationError("INVALID_INPUT", "图片生成参数不完整");
-    for (const reference of input.config.referenceList ?? []) {
+    const references = input.config.referenceList ?? [];
+    if (input.referenceAssets && input.referenceAssets.length !== references.length) throw new ImageGenerationError("INVALID_INPUT", "素材参考快照与有序图片引用不完整");
+    if (input.referencePaths && input.referencePaths.length !== references.length) throw new ImageGenerationError("INVALID_INPUT", "图片参考路径快照与有序图片引用不完整");
+    for (const reference of references) {
       if (reference?.type !== "image" || typeof reference.base64 !== "string" || !/^data:image\/[a-z0-9.+-]+;base64,[a-z0-9+/=\s]+$/i.test(reference.base64)) {
         throw new ImageGenerationError("INVALID_INPUT", "图片参考包含非图片媒体或无效数据");
       }

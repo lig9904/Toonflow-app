@@ -15,19 +15,22 @@ export function createImageReviewHandlers(db: Knex, service: ImageReviewService)
     }
   };
   const authorize = async (req: Request, projectId: number, scriptId?: number) => {
-    await requireProductionOwner(req, projectId, db);
+    const actor = await requireProductionOwner(req, projectId, db);
     if (scriptId != null && !(await db("o_script").where({ id: scriptId, projectId }).first())) throw new ImageReviewError("剧集不属于当前项目", 404);
+    return Number(String(actor.id).replace(/^human:/, ""));
   };
   return {
     listImageReviews: wrap(async (req, res) => {
-      const input = scope.extend({ jobId: z.number().int().positive().optional(), limit: z.number().int().min(1).max(500).optional() }).strict().parse(req.body);
+      const input = scope.extend({ jobId: z.number().int().positive().optional(), limit: z.number().int().min(1).max(500).optional(), includeCurrent: z.boolean().optional(), targetKind: z.enum(["asset", "storyboard"]).optional(), targetIds: z.array(z.number().int().positive()).max(500).optional() }).strict().parse(req.body);
       await authorize(req, input.projectId, input.scriptId);
-      return res.send(success({ reviews: await service.list(input) }));
+      const reviews = await service.list(input);
+      const current = input.includeCurrent ? await service.current(input) : undefined;
+      return res.send(success({ reviews, ...(current ? { current } : {}) }));
     }),
     reviewImage: wrap(async (req, res) => {
       const input = scope.extend({ jobId: z.number().int().positive() }).strict().parse(req.body);
-      await authorize(req, input.projectId, input.scriptId);
-      const review = await service.enqueue(input);
+      const actorId = await authorize(req, input.projectId, input.scriptId);
+      const review = await service.enqueue({ ...input, actorId });
       // The HTTP response does not wait on the model or require a human confirmation.
       return res.send(success({ review }));
     }),

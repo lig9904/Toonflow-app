@@ -60,6 +60,20 @@ describe("production image generation service", () => {
     assert.equal((await fixture.db("o_image").where({ assetsId: 1 }).orderBy("id", "desc").first()).state, "已完成");
   });
 
+  it("freezes one identity-wrapped art manual per asset type for the whole batch", async () => {
+    const mocked = runtime();
+    let manual = "MANUAL-V1";
+    let reads = 0;
+    const systems: string[] = [];
+    mocked.getArtPrompt = () => { reads += 1; return manual; };
+    mocked.generatePrompt = async ({ system, description }) => { systems.push(system); manual = "MANUAL-V2"; return `generated:${description}`; };
+    await generateDerivedAssetImages(fixture.db, { projectId: 100, scriptId: 10, assetIds: [1, 2], concurrentCount: 1, runtime: mocked });
+    assert.equal(reads, 1);
+    assert.equal(systems.length, 2);
+    assert(systems.every((system) => system.includes("MANUAL-V1") && !system.includes("MANUAL-V2")));
+    assert(systems.every((system) => system.includes("非人类幼态不等于人类儿童")));
+  });
+
   it("claims and previews before model execution; run starts the injected model", async () => {
     const mocked = runtime();
     const prepared = await prepareDerivedAssetImages(fixture.db, { projectId: 100, scriptId: 10, assetIds: [2], runtime: mocked });

@@ -1,6 +1,8 @@
 import { readFile, writeFile } from "fs/promises";
 import knex from "knex";
 import initDB from "@/lib/initDB";
+import { ensureManualExtractionSchema } from "@/services/builtinAgent/manualAssetExtraction";
+import { ensureManualPolishSchema } from "@/services/builtinAgent/manualAssetPolish";
 import type { DB } from "@/types/database";
 import crypto from "crypto";
 import fixDB from "@/lib/fixDB";
@@ -38,6 +40,8 @@ export const dbReady = (async () => {
   const version = await db.raw("SHOW server_version_num");
   requirePostgres18Version(version.rows[0].server_version_num);
   await initDB(db);
+  await ensureManualExtractionSchema(db);
+  await ensureManualPolishSchema(db);
   await ensureAgentGatewaySchema(db);
   await ensureProductionStateSchema(db);
   await ensureVideoJobsSchema(db);

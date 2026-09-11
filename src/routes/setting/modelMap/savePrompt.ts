@@ -1,31 +1,10 @@
-import express from "express";
-import { error, success } from "@/lib/responseFormat";
-import u from "@/utils";
-import { z } from "zod";
-import { validateFields } from "@/middleware/middleware";
-import fs from "fs/promises";
-import path from "path";
-
-const router = express.Router();
-
-export default router.post(
-  "/",
-  validateFields({
-    name: z.string().min(1),
-    data: z.string(),
-    type: z.enum(["image", "video"]),
-  }),
-  async (req, res) => {
-    const { name, data, type } = req.body;
-
-    const modelPromptRoot = u.getPath(["modelPrompt"]);
-    const dir = path.join(modelPromptRoot, type);
-
-    await fs.mkdir(dir, { recursive: true });
-
-    const filePath = path.join(dir, `${name}.md`);
-    await fs.writeFile(filePath, data, "utf-8");
-
-    res.status(200).send(success("保存成功"));
-  },
-);
+import express from 'express';
+import u from '@/utils';
+import {success} from '@/lib/responseFormat';
+import {PromptRegistryError} from '@/services/promptRegistry';
+import {writeModelPrompt} from '@/services/managedModelPrompts';
+import {promptPaths,promptActor,sendPromptError} from '../promptManage/_shared';
+export default express.Router().post('/',async(req,res)=>{try{
+ if(!['image','video'].includes(req.body?.type))throw new PromptRegistryError('INVALID_INPUT','模板类型无效');
+ return res.send(success(await writeModelPrompt(u.db,promptPaths(),req.body,promptActor(req),true)));
+}catch(e){return sendPromptError(res,e);}});

@@ -71,6 +71,8 @@ test("saved image queues exactly once, passes actual output then ordered referen
     assert(f.calls[0].content.some((part) => part.type === "text" && part.text.includes("参考图1：红色龙")));
     const report = (await f.reviews.list({ projectId: f.projectId }))[0];
     assert.equal(report.status, "passed"); assert.equal(report.referenceCoverage, "complete"); assert.equal(report.selected, true); assert.equal(report.stale, false); assert.equal(report.promptVersion, "prompt-v1");
+    const [current] = await f.reviews.current({ projectId: f.projectId, scriptId: f.scriptId, targetKind: "storyboard", targetIds: [f.targetId] });
+    assert.equal(current.state, "passed"); assert.equal(current.sourceCurrent, true); assert.equal(current.artifactPath, receipt.artifactPath); assert.equal(current.review?.jobId, receipt.jobId);
     const jobPayload = JSON.parse((await f.db("ext_image_jobs").first()).payload);
     assert.equal(jobPayload.config.referenceList[0].base64, undefined);
     assert.equal(typeof jobPayload.context.imageReview.references[0].sha256, "string");
@@ -89,6 +91,8 @@ test("late human edits and changed reference files remain intact and partial evi
     await f.reviews.runDue();
     const report = (await f.reviews.list({ projectId: f.projectId }))[0];
     assert.equal(report.status, "issues"); assert.equal(report.referenceCoverage, "partial"); assert.equal(report.stale, true); assert.equal(report.selected, false);
+    const [currentReview] = await f.reviews.current({ projectId: f.projectId, scriptId: f.scriptId, targetKind: "storyboard", targetIds: [f.targetId] });
+    assert.equal(currentReview.state, "stale"); assert.equal(currentReview.sourceCurrent, false); assert.equal(currentReview.artifactPath, "/human-chosen.png"); assert.equal(currentReview.review?.jobId, report.jobId);
     assert(report.findings.some((finding) => finding.code === "REFERENCE_UNAVAILABLE"));
     assert.equal(f.calls[0].content.filter((part) => part.type === "image").length, 2);
     const current = await f.db("o_storyboard").where({ id: f.targetId }).first();
@@ -108,6 +112,8 @@ test("unsupported model is skipped and a failed or timed out review never fails 
     await f.reviews.runDue();
     const failed = (await f.reviews.list({ projectId: f.projectId }))[0];
     assert.equal(failed.status, "failed"); assert(!failed.summary.includes("secret"));
+    const [currentFailed] = await f.reviews.current({ projectId: f.projectId, scriptId: f.scriptId, targetKind: "storyboard", targetIds: [f.targetId] });
+    assert.equal(currentFailed.state, "failed"); assert.equal(currentFailed.sourceCurrent, true);
     assert.equal(failed.diagnostics?.code, "REVIEW_FAILED"); assert.equal(failed.diagnostics?.errorName, "Error"); assert(!JSON.stringify(failed).includes("secret provider error"));
     assert.equal((await f.jobs.get({ projectId: f.projectId, jobId: receipt.jobId })).status, "succeeded");
     assert.equal((await f.db("o_storyboard").where({ id: f.targetId }).first()).state, "已完成");
@@ -263,6 +269,8 @@ test("selected old storyboard and root asset reviews survive over 200 newer hist
     assert.equal(reviews[1].id, root.id); assert.equal(reviews[1].selected, true);
     assert.equal(reviews[2].id, "history-0549");
     assert(!reviews.some((item) => item.id === "other-episode-newest" || item.id === board.id));
+    const [currentBoard] = await f.reviews.current({ projectId: f.projectId, scriptId: f.scriptId, targetKind: "storyboard", targetIds: [f.targetId] });
+    assert.equal(currentBoard.state, "stale"); assert.equal(currentBoard.sourceCurrent, false); assert.equal(currentBoard.review?.id, "selected-board-latest");
     hydrated = 0;
     assert.equal((await f.reviews.list({ projectId: f.projectId, scriptId: f.scriptId })).length, 500);
     assert.equal(hydrated, 500);

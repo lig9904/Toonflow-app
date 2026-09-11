@@ -7,6 +7,7 @@ import { VideoJobError } from "./videoJobs";
 import type { VideoPromptJob } from "./videoPromptJobs";
 import { parsePromptMode, validatePromptReferenceSelection, type VideoGenerationSettings } from "./videoPromptComposition";
 import { classifyVideoPromptReviewFailure } from "./videoPromptReviewRuntime";
+import { readCurrentImageReviewResults, type CurrentImageReviewResult } from "./imageReviews";
 
 export const videoPromptReviewSchema = z.object({
   findings: z.array(z.object({ code: z.string().min(1).max(100), severity: z.enum(["error", "warning", "info"]), message: z.string().min(1).max(2000), shotId: z.number().int().positive().optional(), field: z.string().max(100).optional() })).max(100),
@@ -61,13 +62,21 @@ export async function currentPromptReferences(db: Knex, projectId: number, scrip
   const storyboards = storyboardIds.length ? await db("o_storyboard").where({ projectId, scriptId }).whereIn("id", storyboardIds).select("id", "prompt", "videoDesc", "duration", "trackId", "filePath") : [];
   const assets = assetIds.length ? await db("o_assets as asset").leftJoin("o_image as image", "image.id", "asset.imageId").where("asset.projectId", projectId).whereIn("asset.id", assetIds).select("asset.id", "asset.name", "asset.describe", "asset.type", "asset.imageId", "image.filePath", "image.type as mediaType") : [];
   const linkedAssets = source.length ? await db("o_assets2Storyboard as link").join("o_assets as asset", "asset.id", "link.assetId").where("asset.projectId", projectId).whereIn("link.storyboardId", source.map((item) => Number(item.id))).orderBy("link.id").select("asset.id", "asset.name", "asset.describe", "asset.type", "asset.imageId") : [];
-  return { info, selectedStoryboards: info.filter((item: any) => item.sources === "storyboard").map((item: any) => storyboards.find((row) => Number(row.id) === Number(item.id))).filter(Boolean), selectedAssets: info.filter((item: any) => item.sources === "assets").map((item: any) => assets.find((row) => Number(row.id) === Number(item.id))).filter(Boolean), linkedAssets };
+  const referencedAssetIds = [...new Set([...assetIds, ...linkedAssets.map((row) => Number(row.id))])];
+  const [storyboardStates, assetStates] = await Promise.all([
+    storyboardIds.length ? db("ext_entity_state").where({ projectId, entityType: "storyboard" }).whereIn("entityId", storyboardIds).select("entityId", "version") : [],
+    referencedAssetIds.length ? db("ext_creative_state").where({ projectId, entityType: "asset" }).whereIn("entityId", referencedAssetIds).select("entityId", "version") : [],
+  ]);
+  const withVersion = (entityType: "storyboard" | "asset", row: any) => ({ ...row, version: Number((entityType === "storyboard" ? storyboardStates : assetStates).find((state) => Number(state.entityId) === Number(row.id))?.version ?? 0) });
+  return { info, selectedStoryboards: info.filter((item: any) => item.sources === "storyboard").map((item: any) => storyboards.find((row) => Number(row.id) === Number(item.id))).filter(Boolean).map((row: any) => withVersion("storyboard", row)), selectedAssets: info.filter((item: any) => item.sources === "assets").map((item: any) => assets.find((row) => Number(row.id) === Number(item.id))).filter(Boolean).map((row: any) => withVersion("asset", row)), linkedAssets: linkedAssets.map((row) => withVersion("asset", row)) };
 }
 
 export async function readCurrentVideoPromptReview(db: Knex, input: { projectId: number; scriptId: number; trackId: number; prompt: string; model?: string; mode?: unknown; generation?: VideoGenerationSettings; info?: Array<{ id: number; sources: string; fileType?: string }> }): Promise<VideoPromptReviewReport | null> {
   if (!(await db.schema.hasTable("ext_video_prompt_jobs")) || !(await db.schema.hasColumn("ext_video_prompt_jobs", "reviewReport"))) return null;
   const jobs = await db("ext_video_prompt_jobs").where({ projectId: input.projectId, scriptId: input.scriptId, trackId: input.trackId, state: "succeeded", resultPrompt: input.prompt }).whereNotNull("reviewReport").orderBy("createdAt", "desc").limit(10);
-  const source = await db("o_storyboard").where({ projectId: input.projectId, scriptId: input.scriptId, trackId: input.trackId }).orderBy("index").orderBy("id").select("id", "prompt", "videoDesc", "duration");
+  const sourceRows = await db("o_storyboard").where({ projectId: input.projectId, scriptId: input.scriptId, trackId: input.trackId }).orderBy("index").orderBy("id").select("id", "prompt", "videoDesc", "duration");
+  const sourceStates = sourceRows.length ? await db("ext_entity_state").where({ projectId: input.projectId, entityType: "storyboard" }).whereIn("entityId", sourceRows.map((row) => Number(row.id))).select("entityId", "version") : [];
+  const source = sourceRows.map((row) => ({ ...row, version: Number(sourceStates.find((state) => Number(state.entityId) === Number(row.id))?.version ?? 0) }));
   for (const row of jobs) {
     const compositionSnapshot = json(row.compositionSnapshot);
     const referenceSnapshot = json(row.referenceSnapshot);
@@ -82,13 +91,39 @@ export async function readCurrentVideoPromptReview(db: Knex, input: { projectId:
   return null;
 }
 
+function imageReviewBoundaryFinding(item: CurrentImageReviewResult): VideoPromptFinding[] {
+  const label = `${item.targetKind === "storyboard" ? "分镜" : "素材"} ${item.targetId}`;
+  if (item.state === "passed") return [];
+  if (item.state === "issues" && item.review) return item.review.findings.map((finding) => ({ ...finding, code: `IMAGE_REFERENCE_${finding.code}`, field: "references", message: `参考图片 ${label}：${finding.message}` }));
+  const boundary = {
+    pending: ["info", "图片核验仍在进行；本次没有等待或自动重画"],
+    stale: ["warning", "现有图片核验与当前选中图片或其来源版本不匹配"],
+    failed: ["warning", "图片核验未完成；当前图片保持不变"],
+    unreviewed: ["info", "当前选中图片尚无核验结果"],
+    missing: ["warning", "当前参考对象没有已选中的图片"],
+    issues: ["warning", "图片核验发现需要关注的问题"],
+  }[item.state] as ["info" | "warning", string] | undefined;
+  return boundary ? [{ code: `IMAGE_REFERENCE_${item.state.toUpperCase()}`, severity: boundary[0], field: "references", message: `参考图片 ${label}：${boundary[1]}` }] : [];
+}
+
+async function currentImageReferenceFindings(db: Knex, input: { projectId: number; scriptId: number; info: Array<{ id: number; sources: string; fileType?: string }>; referenceTypes?: Array<"image" | "video" | "audio"> }): Promise<VideoPromptFinding[]> {
+  const imageInputs = input.info.filter((item, index) => (input.referenceTypes?.[index] ?? item.fileType ?? "image") === "image");
+  const storyboardIds = [...new Set(imageInputs.filter((item) => item.sources === "storyboard").map((item) => Number(item.id)))];
+  const assetIds = [...new Set(imageInputs.filter((item) => item.sources === "assets").map((item) => Number(item.id)))];
+  const [storyboards, assets] = await Promise.all([
+    storyboardIds.length ? readCurrentImageReviewResults(db, { projectId: input.projectId, scriptId: input.scriptId, targetKind: "storyboard", targetIds: storyboardIds }).catch(() => []) : [],
+    assetIds.length ? readCurrentImageReviewResults(db, { projectId: input.projectId, scriptId: input.scriptId, targetKind: "asset", targetIds: assetIds }).catch(() => []) : [],
+  ]);
+  return [...storyboards, ...assets].flatMap(imageReviewBoundaryFinding);
+}
+
 /** Pre-submission is read-only and never rewrites a manually edited prompt or calls a paid model. */
 export async function preflightVideoPrompt(db: Knex, input: { projectId: number; scriptId: number; trackId: number; prompt: string; model: string; mode: unknown; generation: VideoGenerationSettings; info: Array<{ id: number; sources: string; fileType?: string }>; referenceTypes?: Array<"image" | "video" | "audio"> }): Promise<VideoPromptReviewReport> {
   const source = await db("o_storyboard").where({ projectId: input.projectId, scriptId: input.scriptId, trackId: input.trackId }).orderBy("index").orderBy("id").select("id", "prompt", "videoDesc", "duration");
   const references = await currentPromptReferences(db, input.projectId, input.scriptId, source, { info: input.info });
   const counts = { image: 0, video: 0, audio: 0 };
   const labels = input.info.map((item, index) => { const type = input.referenceTypes?.[index] ?? item.fileType ?? "image"; if (!(type in counts)) throw new VideoJobError("INVALID_INPUT", "参考媒体类型无效"); const media = type as keyof typeof counts; return `@${{ image: "图片", video: "视频", audio: "音频" }[media]}${++counts[media]}`; });
-  const findings = deterministicPromptFindings({ sourceSnapshot: source, referenceSnapshot: references, referenceLabels: labels }, input.prompt);
+  const findings = [...deterministicPromptFindings({ sourceSnapshot: source, referenceSnapshot: references, referenceLabels: labels }, input.prompt), ...await currentImageReferenceFindings(db, input)];
   if (!input.prompt.trim()) throw new VideoJobError("INVALID_INPUT", "视频提示词不能为空");
   try { validatePromptReferenceSelection(input.mode, [...Array(counts.image).fill("image"), ...Array(counts.video).fill("video"), ...Array(counts.audio).fill("audio")]); }
   catch (error) { throw new VideoJobError("INVALID_INPUT", error instanceof Error ? error.message : "参考模式无效"); }

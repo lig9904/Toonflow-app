@@ -1,6 +1,6 @@
 import { assertVideoPromptDialogue, type VideoPromptReviewReport } from "@/lib/videoPromptContract";
 import { validatePromptReferenceSelection, type VideoPromptComposition, type VideoGenerationSettings } from "./videoPromptComposition";
-import { deterministicPromptFindings, promptReviewBinding } from "./videoPromptReview";
+import { currentPromptReferences, deterministicPromptFindings, promptReviewBinding } from "./videoPromptReview";
 import { resolveVideoReferenceMediaType } from "../lib/videoPromptReferences";
 import { createHash } from "node:crypto";
 import type { Knex } from "knex";
@@ -21,11 +21,13 @@ export interface VideoPromptJobInput {
   mode: string;
   info: Array<{ id: number; sources: string; fileType?: "image" | "video" | "audio" }>;
   idempotencyKey: string;
+  expectedVersion: number;
   generation?: VideoGenerationSettings;
 }
 
 export interface VideoPromptSource {
   id: number;
+  version?: number;
   prompt?: string | null;
   videoDesc?: string | null;
   duration?: number | string | null;
@@ -50,6 +52,12 @@ export interface VideoPromptJob {
   reason?: string | null;
 }
 
+export async function findVideoPromptJobByIdempotency(db: Knex, input: Pick<VideoPromptJobInput, "projectId" | "scriptId" | "trackId" | "idempotencyKey">): Promise<VideoPromptJob | null> {
+  await ensureVideoPromptJobSchema(db);
+  const row = await db(JOBS).where({ projectId: input.projectId, scriptId: input.scriptId, trackId: input.trackId, idempotencyKey: input.idempotencyKey }).first();
+  return row ? toJob(row) : null;
+}
+
 export class VideoPromptJobError extends Error {
   constructor(public readonly code: "INVALID_INPUT" | "NOT_FOUND" | "CONFLICT" | "VERSION_CONFLICT", message: string) {
     super(message);
@@ -72,6 +80,11 @@ function positive(value: unknown, name: string): number {
 function key(value: unknown): string {
   if (typeof value !== "string" || !/^[\w:.-]{8,150}$/.test(value)) throw new VideoPromptJobError("INVALID_INPUT", "缺少有效提示词任务编号");
   return value;
+}
+function version(value: unknown): number {
+  const n = Number(value);
+  if (!Number.isSafeInteger(n) || n < 0) throw new VideoPromptJobError("INVALID_INPUT", "缺少有效轨道版本");
+  return n;
 }
 
 export async function ensureVideoPromptJobSchema(db: Knex): Promise<void> {
@@ -134,20 +147,25 @@ export async function prepareVideoPromptJob(db: Knex, input: VideoPromptJobInput
   const scriptId = positive(input.scriptId, "scriptId");
   const trackId = positive(input.trackId, "trackId");
   const idempotencyKey = key(input.idempotencyKey);
+  const expectedVersion = version(input.expectedVersion);
   if (typeof input.model !== "string" || !input.model.trim() || typeof input.mode !== "string") throw new VideoPromptJobError("INVALID_INPUT", "模型或模式无效");
   return db.transaction(async (trx) => {
     await lockProjectTransaction(trx, projectId);
     if (!(await trx("o_script").where({ id: scriptId, projectId }).first())) throw new VideoPromptJobError("CONFLICT", "剧集不属于当前项目");
     const track = await trx("o_videoTrack").where({ id: trackId, projectId, scriptId }).forUpdate().first();
     if (!track) throw new VideoPromptJobError("CONFLICT", "视频轨道不属于当前项目或剧集");
-    const requestIdentityHash = hash({ projectId, scriptId, trackId, model: input.model, mode: input.mode, info: input.info, ...(input.generation === undefined ? {} : { generation: input.generation }) });
+    const requestIdentityHash = hash({ projectId, scriptId, trackId, model: input.model, mode: input.mode, info: input.info, expectedVersion, ...(input.generation === undefined ? {} : { generation: input.generation }) });
     const existingByRequest = await trx(JOBS).where({ projectId, scriptId, trackId, idempotencyKey }).first();
     if (existingByRequest) {
       if (existingByRequest.requestIdentityHash && existingByRequest.requestIdentityHash !== requestIdentityHash) throw new VideoPromptJobError("CONFLICT", "提示词任务编号已用于不同请求");
       return { job: toJob(existingByRequest), reused: true };
     }
-    const sourceSnapshot = await trx("o_storyboard").where({ projectId, scriptId, trackId }).orderBy("index").orderBy("id").select("id", "prompt", "videoDesc", "duration");
-    if (!sourceSnapshot.length) throw new VideoPromptJobError("INVALID_INPUT", "当前轨道没有可用于生成提示词的源分镜");
+    const trackState = await getCreativeState(trx, "track", trackId, projectId);
+    if (trackState.version !== expectedVersion) throw new VideoPromptJobError("VERSION_CONFLICT", "轨道已被其他成员或任务修改，请读取最新版本");
+    const sourceRows = await trx("o_storyboard").where({ projectId, scriptId, trackId }).orderBy("index").orderBy("id").select("id", "prompt", "videoDesc", "duration");
+    if (!sourceRows.length) throw new VideoPromptJobError("INVALID_INPUT", "当前轨道没有可用于生成提示词的源分镜");
+    const sourceStates = await trx("ext_entity_state").where({ projectId, entityType: "storyboard" }).whereIn("entityId", sourceRows.map((row) => Number(row.id))).select("entityId", "version");
+    const sourceSnapshot = sourceRows.map((row) => ({ ...row, version: Number(sourceStates.find((state) => Number(state.entityId) === Number(row.id))?.version ?? 0) }));
     const storyboardIds = new Set(sourceSnapshot.map((row) => Number(row.id)));
     const locked = await trx("ext_entity_state").where({ projectId, entityType: "storyboard", locked: 1 }).whereIn("entityId", [...storyboardIds]).first();
     if (locked) throw new VideoPromptJobError("CONFLICT", "当前轨道包含已锁定分镜，不能生成提示词");
@@ -170,8 +188,17 @@ export async function prepareVideoPromptJob(db: Knex, input: VideoPromptJobInput
       ? await trx("o_storyboard").where({ projectId, scriptId }).whereIn("id", [...selectedStoryboardIds]).select("id", "prompt", "videoDesc", "duration", "trackId", "filePath")
       : [];
     const selectedStoryboards = (input.info ?? []).filter((item) => item.sources === "storyboard").map((item) => selectedStoryboardRows.find((row) => Number(row.id) === Number(item.id))).filter(Boolean);
-    const selectedStoryboardById = new Map(selectedStoryboards.map((row) => [Number(row.id), row]));
-    const selectedAssetById = new Map(selectedAssets.map((row) => [Number(row.id), row]));
+    const referencedAssetIds = [...new Set([...selectedAssetIds, ...linkedAssets.map((row) => Number(row.id))])];
+    const [storyboardStates, assetStates] = await Promise.all([
+      selectedStoryboardIds.size ? trx("ext_entity_state").where({ projectId, entityType: "storyboard" }).whereIn("entityId", [...selectedStoryboardIds]).select("entityId", "version") : [],
+      referencedAssetIds.length ? trx("ext_creative_state").where({ projectId, entityType: "asset" }).whereIn("entityId", referencedAssetIds).select("entityId", "version") : [],
+    ]);
+    const referenceVersion = (entityType: "storyboard" | "asset", entityId: unknown) => Number((entityType === "storyboard" ? storyboardStates : assetStates).find((state) => Number(state.entityId) === Number(entityId))?.version ?? 0);
+    const versionedStoryboards = selectedStoryboards.map((row) => ({ ...row, version: referenceVersion("storyboard", row.id) }));
+    const versionedAssets = selectedAssets.map((row) => ({ ...row, version: referenceVersion("asset", row.id) }));
+    const versionedLinkedAssets = linkedAssets.map((row) => ({ ...row, version: referenceVersion("asset", row.id) }));
+    const selectedStoryboardById = new Map(versionedStoryboards.map((row) => [Number(row.id), row]));
+    const selectedAssetById = new Map(versionedAssets.map((row) => [Number(row.id), row]));
     const referenceCounts = { image: 0, video: 0, audio: 0 };
     const referenceLabels: string[] = [];
     const selectedVisual = (input.info ?? []).map((item, index) => {
@@ -185,7 +212,7 @@ export async function prepareVideoPromptJob(db: Knex, input: VideoPromptJobInput
       const framePosition = ["singleImage", "startEndRequired", "endFrameOptional", "startFrameOptional"].includes(input.mode) ? (index === 0 ? "，帧位置：首帧" : "，帧位置：尾帧") : "";
       return `选择顺序${index + 1}，@${label}${number}${framePosition}，来源 ${item.sources} ${Number(item.id)}：${row.name ?? "分镜参考"}；${visualText(row.describe ?? row.prompt ?? "")}`;
     }).filter(Boolean);
-    const semanticIdentity = linkedAssets.map((row) => `语义身份（仅用于理解，不代表已上传参考图）：${row.name ?? "未命名"}：${row.describe ?? ""}`).join("\n");
+    const semanticIdentity = versionedLinkedAssets.map((row) => `语义身份（仅用于理解，不代表已上传参考图）：${row.name ?? "未命名"}：${row.describe ?? ""}`).join("\n");
     validatePromptReferenceSelection(input.mode, [...Array(referenceCounts.image).fill("image"), ...Array(referenceCounts.video).fill("video"), ...Array(referenceCounts.audio).fill("audio")]);
     const compositionSnapshot = options.compose ? await options.compose({ db: trx, scriptDuration: sourceSnapshot.reduce((total, row) => total + (Number(row.duration) || 0), 0), referenceCount: referenceLabels.length }) : null;
     const promptInput = [
@@ -194,13 +221,12 @@ export async function prepareVideoPromptJob(db: Knex, input: VideoPromptJobInput
       semanticIdentity,
       selectedVisual.length ? `本次用户选择的视觉参考（仅这些素材会作为视觉输入）：\n${selectedVisual.join("\n")}` : "本次未选择视觉参考图，不能假定存在已上传参考图。",
     ].filter(Boolean).join("\n\n");
-    const referenceSnapshot = { info: input.info, selectedStoryboards, selectedAssets, linkedAssets };
-    const trackState = await getCreativeState(trx, "track", trackId, projectId);
+    const referenceSnapshot = { info: input.info, selectedStoryboards: versionedStoryboards, selectedAssets: versionedAssets, linkedAssets: versionedLinkedAssets };
     const requestHash = hash({ requestIdentityHash, sourceSnapshot, referenceSnapshot });
     const active = await trx(JOBS).where({ projectId, scriptId, trackId }).whereIn("state", ["queued", "running"]).first();
     if (active) throw new VideoPromptJobError("CONFLICT", "当前轨道已有提示词任务正在生成");
     const now = Date.now();
-    const row = { id: `vprompt-${hash({ projectId, scriptId, trackId, idempotencyKey }).slice(0, 40)}`, projectId, scriptId, trackId, model: input.model, mode: input.mode, idempotencyKey, requestHash, requestIdentityHash, state: "queued", trackVersion: trackState.version, sourceSnapshot: JSON.stringify(sourceSnapshot), referenceSnapshot: JSON.stringify(referenceSnapshot), compositionSnapshot: compositionSnapshot ? JSON.stringify(compositionSnapshot) : null, referenceLabels: JSON.stringify(referenceLabels), promptInput, resultPrompt: null, reason: null, createdAt: now, updatedAt: now };
+    const row = { id: `vprompt-${hash({ projectId, scriptId, trackId, idempotencyKey }).slice(0, 40)}`, projectId, scriptId, trackId, model: input.model, mode: input.mode, idempotencyKey, requestHash, requestIdentityHash, state: "queued", trackVersion: expectedVersion, sourceSnapshot: JSON.stringify(sourceSnapshot), referenceSnapshot: JSON.stringify(referenceSnapshot), compositionSnapshot: compositionSnapshot ? JSON.stringify(compositionSnapshot) : null, referenceLabels: JSON.stringify(referenceLabels), promptInput, resultPrompt: null, reason: null, createdAt: now, updatedAt: now };
     await trx(JOBS).insert(row);
     await trx("o_videoTrack").where({ id: trackId, projectId, scriptId }).update({ state: "生成中", reason: null });
     return { job: toJob(row), reused: false };
@@ -262,17 +288,11 @@ async function executeVideoPromptJobOnce(db: Knex, jobId: string, generate: (job
       const state = await getCreativeState(trx, "track", claimed.job.trackId, claimed.job.projectId);
       const row = await trx(JOBS).where({ id: claimed.job.id }).forUpdate().first();
       if (!current || !row) throw new VideoPromptJobError("NOT_FOUND", "提示词任务或轨道不存在");
-      const currentSources = await trx("o_storyboard").where({ projectId: claimed.job.projectId, scriptId: claimed.job.scriptId, trackId: claimed.job.trackId }).orderBy("index").orderBy("id").select("id", "prompt", "videoDesc", "duration");
+      const currentSourceRows = await trx("o_storyboard").where({ projectId: claimed.job.projectId, scriptId: claimed.job.scriptId, trackId: claimed.job.trackId }).orderBy("index").orderBy("id").select("id", "prompt", "videoDesc", "duration");
+      const currentSourceStates = currentSourceRows.length ? await trx("ext_entity_state").where({ projectId: claimed.job.projectId, entityType: "storyboard" }).whereIn("entityId", currentSourceRows.map((item) => Number(item.id))).select("entityId", "version") : [];
+      const currentSources = currentSourceRows.map((item) => ({ ...item, version: Number(currentSourceStates.find((state) => Number(state.entityId) === Number(item.id))?.version ?? 0) }));
       const savedReferences = (claimed.job.referenceSnapshot && typeof claimed.job.referenceSnapshot === "object" ? claimed.job.referenceSnapshot : {}) as { info?: Array<{ id: number; sources: string }>; selectedStoryboards?: unknown[]; selectedAssets?: unknown[]; linkedAssets?: unknown[] };
-      const selectedInfo = savedReferences.info ?? [];
-      const selectedStoryboardIds = selectedInfo.filter((item) => item.sources === "storyboard").map((item) => Number(item.id));
-      const selectedAssetIds = selectedInfo.filter((item) => item.sources === "assets").map((item) => Number(item.id));
-      const currentSelectedStoryboardRows = selectedStoryboardIds.length ? await trx("o_storyboard").where({ projectId: claimed.job.projectId, scriptId: claimed.job.scriptId }).whereIn("id", selectedStoryboardIds).select("id", "prompt", "videoDesc", "duration", "trackId", "filePath") : [];
-      const currentSelectedAssetRows = selectedAssetIds.length ? await trx("o_assets as asset").leftJoin("o_image as image", "image.id", "asset.imageId").where("asset.projectId", claimed.job.projectId).whereIn("asset.id", selectedAssetIds).select("asset.id", "asset.name", "asset.describe", "asset.type", "asset.imageId", "image.filePath", "image.type as mediaType") : [];
-      const currentSelectedStoryboards = selectedInfo.filter((item) => item.sources === "storyboard").map((item) => currentSelectedStoryboardRows.find((row) => Number(row.id) === Number(item.id))).filter(Boolean);
-      const currentSelectedAssets = selectedInfo.filter((item) => item.sources === "assets").map((item) => currentSelectedAssetRows.find((row) => Number(row.id) === Number(item.id))).filter(Boolean);
-      const currentLinkedAssets = currentSources.length ? await trx("o_assets2Storyboard as link").join("o_assets as asset", "asset.id", "link.assetId").where("asset.projectId", claimed.job.projectId).whereIn("link.storyboardId", currentSources.map((item) => Number(item.id))).orderBy("link.id").select("asset.id", "asset.name", "asset.describe", "asset.type", "asset.imageId") : [];
-      const currentReferences = { info: selectedInfo, selectedStoryboards: currentSelectedStoryboards, selectedAssets: currentSelectedAssets, linkedAssets: currentLinkedAssets };
+      const currentReferences = await currentPromptReferences(trx, claimed.job.projectId, claimed.job.scriptId, currentSources, savedReferences);
       const locked = await trx("ext_entity_state").where({ projectId: claimed.job.projectId, entityType: "storyboard", locked: 1 }).whereIn("entityId", claimed.job.sourceSnapshot.map((item) => item.id)).first();
       const sourceChanged = hash(currentSources) !== hash(claimed.job.sourceSnapshot);
       const referencesChanged = hash(currentReferences) !== hash(savedReferences);

@@ -17,6 +17,7 @@ export interface AssetExtractionHelperDependencies {
   model: StructuredScriptModel;
   /** Override for tests. Production defaults to the existing scriptAssetExtraction prompt row. */
   loadInstructions?: () => Promise<string>;
+  onSaved?: (trx: Knex.Transaction, receipt: AssetExtractionReceipt) => Promise<void>;
 }
 
 export interface ExtractScriptAssetsInput {
@@ -121,14 +122,14 @@ export function createAssetExtractionHelper(deps: AssetExtractionHelperDependenc
       receipt = await ctx.commit(
         `${prefix}.save:r${revision}`,
         { projectId: raw.projectId, expectedWorkspaceVersion: snapshot.workspaceVersion, sourceScripts: committedSources, proposal: generated.value, idempotencyKey },
-        (trx) => applyAssetExtractionInTransaction(trx, {
+        async (trx) => { const saved = await applyAssetExtractionInTransaction(trx, {
           projectId: raw.projectId,
           expectedWorkspaceVersion: snapshot.workspaceVersion,
           sourceScripts: committedSources,
           proposal: generated.value,
           idempotencyKey,
           actor: { id: `agent:${ctx.run.id}`, kind: "agent" },
-        }),
+        }); await deps.onSaved?.(trx,saved); return saved; },
       );
     } catch (error) {
       runtimeError(error);

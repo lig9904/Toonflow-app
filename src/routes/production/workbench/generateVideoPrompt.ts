@@ -13,14 +13,14 @@ const infoSchema = z.object({ id: z.number().int().positive(), sources: z.enum([
 export default router.post(
   "/",
   validateFields({
-    projectId: z.number(), scriptId: z.number(), trackId: z.number(), info: z.array(infoSchema), model: z.string(), mode: z.string(), idempotencyKey: z.string().min(8).max(150), generation: generationSchema.optional(),
+    projectId: z.number(), scriptId: z.number(), trackId: z.number(), info: z.array(infoSchema), model: z.string(), mode: z.string(), idempotencyKey: z.string().min(8).max(150), expectedVersion: z.number().int().nonnegative(), generation: generationSchema.optional(),
   }),
   async (req, res) => {
-    const { trackId, projectId, scriptId, info, model, mode, idempotencyKey, generation } = req.body;
+    const { trackId, projectId, scriptId, info, model, mode, idempotencyKey, expectedVersion, generation } = req.body;
     try {
       const project = await u.db("o_project").where({ id: projectId }).select("id", "artStyle").first();
       if (!project) return res.status(400).send(error("项目不存在"));
-      const prepared = await prepareRuntimeVideoPromptJob( { projectId, scriptId, trackId, model, mode, info, idempotencyKey, generation });
+      const prepared = await prepareRuntimeVideoPromptJob( { projectId, scriptId, trackId, model, mode, info, idempotencyKey, expectedVersion, generation });
       if (prepared.job.state === "failed") return res.status(400).send(error(prepared.job.reason ?? "提示词生成失败"));
       if (prepared.job.state === "succeeded") {
         const current = await u.db("o_videoTrack as track").leftJoin("ext_creative_state as state", function () {
@@ -34,8 +34,8 @@ export default router.post(
       res.status(202).send(success({ state: prepared.job.state, jobId: prepared.job.id }));
       void executeVideoPromptJob(u.db, prepared.job.id, generateRuntimeVideoPrompt).catch(() => undefined); // The job records its failure for polling.
     } catch (e) {
-      await markVideoPromptPreparationFailed(u.db, { projectId, scriptId, trackId }, u.error(e).message).catch(() => undefined);
-      return res.status(400).send(error(u.error(e).message));
+      if ((e as { code?: unknown })?.code !== "VERSION_CONFLICT") await markVideoPromptPreparationFailed(u.db, { projectId, scriptId, trackId }, u.error(e).message).catch(() => undefined);
+      return res.status((e as { code?: unknown })?.code === "VERSION_CONFLICT" ? 409 : 400).send(error(u.error(e).message));
     }
   },
 );

@@ -53,10 +53,24 @@ export function referenceLabelFindings(prompt: string, labels: readonly string[]
 export function speakerFindings(source: string, result: string, speakerNames: string[] = []): VideoPromptFinding[] {
   const findings: VideoPromptFinding[] = [];
   const normalized = normalize(result);
+  const namedResult: Array<{ name: string; speech: string; offscreen: boolean }> = [];
+  for (const name of [...new Set(speakerNames)].filter(Boolean)) {
+    const pattern = new RegExp(`${escaped(name)}(?:[（(]([^）)\\n]{0,30})[）)])?(?:在画外)?(?:说|说道|问|回答)?[：:]\\s*(?:[『「“\"]([^』」”\"\\n]+)[』」”\"]|([^\\n]+))`, "gu");
+    for (const match of result.matchAll(pattern)) {
+      const prefix = match[0].split(/[：:]/u)[0];
+      namedResult.push({ name, speech: normalize(match[2] ?? match[3] ?? ""), offscreen: /画外|旁白|VO|OS/iu.test(`${match[1] ?? ""}${prefix}`) });
+    }
+  }
   const check = (name: string, text: string, offscreen: boolean) => {
     const speech = normalize(text);
     const index = normalized.indexOf(speech);
     if (!speech || index < 0) return; // Missing speech is reported separately.
+    const attributed = namedResult.find((item) => item.speech === speech);
+    if (attributed) {
+      if (attributed.name !== name) findings.push({ code: "SPEAKER_CHANGED", severity: "warning", field: "speaker", message: `源说话人 ${name} 的对白被标给了 ${attributed.name}` });
+      else if (offscreen && !attributed.offscreen) findings.push({ code: "OFFSCREEN_SPEECH_CHANGED", severity: "warning", field: "speaker", message: `${name} 的画外对白缺少画外标记` });
+      return;
+    }
     const vicinity = normalized.slice(Math.max(0, index - 70), index + speech.length + 30);
     if (!vicinity.includes(normalize(name))) findings.push({ code: "SPEAKER_CHANGED", severity: "warning", field: "speaker", message: `对白缺少源说话人 ${name} 的对应标注` });
     if (offscreen && !/画外|旁白|vo|os/iu.test(vicinity)) findings.push({ code: "OFFSCREEN_SPEECH_CHANGED", severity: "warning", field: "speaker", message: `${name} 的画外对白缺少画外标记` });

@@ -13,6 +13,9 @@ import { reconcileStoredStoryboardReferences } from "../storyboardVisuals";
 import { snapshotImageReference, type ImageReferenceSnapshot } from "../imageJobs/referenceSnapshot";
 import { matchVideoGenerationDuration, videoTailHoldInstruction } from "../../lib/videoGenerationTiming";
 import { preflightVideoPrompt } from "../videoPromptReview";
+import { loadVideoReferenceInventory, selectVideoPromptReferences } from "../videoPromptComposition";
+import { getCreativeState } from "../creativeWorkspace";
+import type { prepareRuntimeVideoPromptForGeneration } from "../videoPromptCompositionRuntime";
 
 export interface MediaModelCapabilities {
   type?: string;
@@ -31,6 +34,7 @@ interface Dependencies {
   visualStyleGuide?(styleName: string): string;
   mediaRootDir?: string;
   pollMs?: number;
+  prepareVideoPrompt?: typeof prepareRuntimeVideoPromptForGeneration;
 }
 
 /** Match the existing Web's 480p/audio-off defaults when the model supports them. */
@@ -48,27 +52,6 @@ export function validateVideoParameters(model: MediaModelCapabilities, params: R
   const audio = params.audio === true;
   if ((model.audio === false && audio) || (model.audio === true && !audio)) throw new BuiltinRuntimeError("INVALID_INPUT", "音频开关与当前模型能力不一致");
   return { mode, duration, resolution, audio };
-}
-
-function selectReferences(mode: unknown, storyboardIds: number[], assets: Array<{ id: number; type: string }>): VideoReferenceInput[] {
-  if (mode === "text") return [];
-  if (["singleImage", "endFrameOptional", "startFrameOptional"].includes(String(mode))) {
-    if (!storyboardIds.length) throw new BuiltinRuntimeError("INVALID_INPUT", "该视频模式需要已选定的分镜图片");
-    return [{ sources: "storyboard", id: storyboardIds[0] }];
-  }
-  if (mode === "startEndRequired") {
-    if (storyboardIds.length < 2) throw new BuiltinRuntimeError("INVALID_INPUT", "首尾帧模式需要两张分镜图片");
-    return [storyboardIds[0], storyboardIds[storyboardIds.length - 1]].map((id) => ({ sources: "storyboard", id }));
-  }
-  if (!Array.isArray(mode)) throw new BuiltinRuntimeError("INVALID_INPUT", "视频参考模式无法识别");
-  const references: VideoReferenceInput[] = storyboardIds.map((id) => ({ sources: "storyboard", id, fileType: "image" }));
-  for (const asset of assets) references.push({ sources: "assets", id: asset.id, fileType: asset.type === "audio" ? "audio" : asset.type === "video" ? "video" : "image" });
-  for (const type of ["image", "video", "audio"] as const) {
-    const declared = mode.find((item) => typeof item === "string" && item.startsWith(`${type}Reference:`));
-    const max = declared ? Number(String(declared).split(":")[1]) : 0;
-    if (references.filter((item) => (item.fileType ?? "image") === type).length > max) throw new BuiltinRuntimeError("INVALID_INPUT", `视频 ${type} 参考数量超过模型能力；请明确调整参考素材`);
-  }
-  return references;
 }
 
 export function createProductionMediaCapabilities(deps: Dependencies): ProductionMediaCapability {
@@ -101,7 +84,7 @@ export function createProductionMediaCapabilities(deps: Dependencies): Productio
           // storyboard back automatically would reinforce its wrong identity.
           storyboardIds = [];
           prompt = buildStoryboardImagePrompt({ ...board, assets,
-            style: visualStyleHint(project?.artStyle ?? "", deps.visualStyleGuide?.(project?.artStyle ?? "") ?? ""),
+            style: visualStyleHint(project?.artStyle ?? "", typeof request.params.visualStyleGuide === "string" ? request.params.visualStyleGuide : deps.visualStyleGuide?.(project?.artStyle ?? "") ?? ""),
             instruction: typeof request.params.imageInstruction === "string" ? request.params.imageInstruction : undefined,
           });
         }
@@ -163,18 +146,30 @@ export function createProductionMediaCapabilities(deps: Dependencies): Productio
         const storyboardIds = Array.isArray(request.params.storyboardIds) ? [...new Set(request.params.storyboardIds.map(Number))] : [];
         const rows = await deps.db("o_storyboard").where({ projectId: request.projectId, scriptId: request.scriptId, trackId: request.targetId }).orderBy("index").orderBy("id");
         if (!storyboardIds.length || rows.length !== storyboardIds.length || rows.some((row) => !storyboardIds.includes(Number(row.id)))) throw new BuiltinRuntimeError("INVALID_INPUT", "视频生成必须包含当前轨道的完整分镜，请重新读取轨道");
-        const imageIds = rows.filter((row) => row.filePath).map((row) => Number(row.id));
-        const readLinkedAssets = (db: Knex | Knex.Transaction) => db("o_assets2Storyboard as link").join("o_assets as asset", "asset.id", "link.assetId").leftJoin("o_image as image", "image.id", "asset.imageId")
-          .where("asset.projectId", request.projectId).whereIn("link.storyboardId", storyboardIds)
-          .select("link.storyboardId", "asset.id", "asset.imageId", "asset.name", "asset.describe", "asset.assetsId", "image.type", "image.filePath").orderBy("link.id");
-        const linkedAssets = await readLinkedAssets(deps.db);
-        const assets = [...new Map(linkedAssets.map((row) => [Number(row.id), { id: Number(row.id), type: row.type }])).values()];
-        const referenceInputs = selectReferences(settings.mode, imageIds, assets);
+
+        const inventory = await loadVideoReferenceInventory(deps.db,{projectId:request.projectId,scriptId:request.scriptId,trackIds:[request.targetId]});
+        const referenceInputs = selectVideoPromptReferences(settings.mode,inventory,request.targetId);
         const provider = await deps.videoProviderFor(request.modelKey);
         const referenceList = await loadOwnedVideoReferences(deps.db, request.projectId, request.scriptId, referenceInputs, deps.toBase64,
           videoReferenceOptionsForProvider(provider, deps.mediaRootDir ?? ""));
         const project = await deps.db("o_project").where({ id: request.projectId }).first();
-        const config = { ...settings, prompt: [String(request.params.prompt ?? ""), videoTailHoldInstruction(plannedDuration, duration)].filter(Boolean).join("\n"), referenceList, aspectRatio: project?.videoRatio };
+        const expectedTrackVersion = Number.isSafeInteger(request.params.expectedTrackVersion) ? Number(request.params.expectedTrackVersion) : (await getCreativeState(deps.db,"track",request.targetId,request.projectId)).version;
+        const input = {projectId:request.projectId,scriptId:request.scriptId,trackId:request.targetId,model:request.modelKey,mode:typeof settings.mode === "string"?settings.mode:JSON.stringify(settings.mode),info:referenceInputs,generation:{duration:settings.duration,resolution:settings.resolution,audio:settings.audio},expectedVersion:expectedTrackVersion,idempotencyKey:`${request.generationKey}:prompt`};
+        let prepared;
+        if (deps.prepareVideoPrompt) {
+          prepared = await deps.prepareVideoPrompt(input, {
+            generateDraft: (job,invoke) => request.ctx.step(`video.prompt.draft:${request.targetId}`,{jobId:job.id},invoke,{modelCall:true}),
+            reviewDraft: (job,draft,invoke) => request.ctx.step(`video.prompt.review:${request.targetId}`,{jobId:job.id,draftHash:createHash("sha256").update(draft).digest("hex")},invoke,{modelCall:true}),
+          }, {db:deps.db,capabilities:model,visualManual:typeof request.params.visualStyleGuide === "string"?request.params.visualStyleGuide:undefined});
+        } else {
+          const track=await deps.db("o_videoTrack").where({id:request.targetId,projectId:request.projectId,scriptId:request.scriptId}).first();
+          const version=(await getCreativeState(deps.db,"track",request.targetId,request.projectId)).version;
+          if(version!==expectedTrackVersion)throw new BuiltinRuntimeError("CONFLICT","轨道提示词已变化，请重新读取");
+          if(!track?.prompt?.trim())throw new BuiltinRuntimeError("INVALID_INPUT","当前视频提示词为空，未配置统一提示词准备服务");
+          prepared={prompt:track.prompt,trackVersion:version,stale:false};
+        }
+        if(prepared.stale)throw new BuiltinRuntimeError("CONFLICT","源分镜已更新，已保留人工提示词；请在画布核对并保存提示词后重新发起生成");
+        const config = { ...settings, prompt: [prepared.prompt,String(request.params.instructions??""),videoTailHoldInstruction(plannedDuration, duration)].filter(Boolean).join("\n"), referenceList, aspectRatio: project?.videoRatio };
         if (!config.prompt || !config.aspectRatio) throw new BuiltinRuntimeError("INVALID_INPUT", "视频提示词或画幅缺失");
         const promptReview = await preflightVideoPrompt(deps.db, { projectId: request.projectId, scriptId: request.scriptId,
           trackId: request.targetId, prompt: config.prompt, model: request.modelKey, mode: settings.mode,
@@ -185,7 +180,9 @@ export function createProductionMediaCapabilities(deps: Dependencies): Productio
         const reserved = await request.ctx.commit(`video.reserve:${request.targetId}`, { generationKey: request.generationKey, requestHash }, async (trx) => {
           await lockProjectTransaction(trx, request.projectId);
           await assertTrackUnchanged(trx, request, rows);
-          if (JSON.stringify(await readLinkedAssets(trx)) !== JSON.stringify(linkedAssets)) throw new BuiltinRuntimeError("CONFLICT", "视频参考素材或绑定关系已修改，本次旧请求未提交");
+          const currentTrack=await trx("o_videoTrack").where({id:request.targetId,projectId:request.projectId,scriptId:request.scriptId}).first();
+          if((await getCreativeState(trx,"track",request.targetId,request.projectId)).version!==prepared.trackVersion||currentTrack?.prompt!==prepared.prompt)throw new BuiltinRuntimeError("CONFLICT","人工视频提示词已修改，本次旧请求未提交");
+          if(JSON.stringify(await loadVideoReferenceInventory(trx,{projectId:request.projectId,scriptId:request.scriptId,trackIds:[request.targetId]}))!==JSON.stringify(inventory))throw new BuiltinRuntimeError("CONFLICT","视频参考或绑定音色已变化，本次旧请求未提交");
           return deps.videos.reserveNewVideos([{ idempotencyKey: request.generationKey, request: { modelKey: request.modelKey, providerFingerprint: provider.fingerprint,
             projectId: request.projectId, scriptId: request.scriptId, trackId: request.targetId, config, outputPath: `/${request.projectId}/video/${pathKey}.mp4` }, requestHash }], trx).then((results) => results[0]);
         });

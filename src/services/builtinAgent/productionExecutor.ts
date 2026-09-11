@@ -13,7 +13,7 @@ import { getCreativeState } from "../creativeWorkspace";
 import pLimit from "p-limit";
 import { builtinThinkLevelFromIntent, hasIndependentProductionOutput, hasUnlimitedMediaBudget } from "./contracts";
 import { productionActionLabels, productionDecisionPrompt, productionStageContract, explicitProductionTextScope } from "./productionPrompts";
-import { reconcileStoryboardAssetIds, buildStoryboardVideoPrompt } from "../../lib/storyboardVisualContract";
+import { reconcileStoryboardAssetIds } from "../../lib/storyboardVisualContract";
 
 export interface ProductionMediaRequest {
   ctx: BuiltinExecutionContext;
@@ -36,6 +36,7 @@ export interface ProductionExecutorDependencies {
   db: Knex;
   model: StructuredScriptModel;
   loadSkill(name: string): Promise<string>;
+  imageReviewContext?(projectId: number, scriptId: number): Promise<unknown>;
   visualStyleGuide?(styleName: string): string;
   directorGuide?(name: string): string;
   media?: ProductionMediaCapability;
@@ -140,7 +141,11 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
       const episode = await deps.db("o_script").where({ id: scriptId, projectId }).first();
       if (!row || !episode) throw new BuiltinRuntimeError("FORBIDDEN", "项目或剧集不属于当前任务");
       const scriptVersion = await getCreativeState(deps.db, "script", scriptId, projectId);
-      return { id: projectId, scriptId, scriptVersion: scriptVersion.version, name: row.name ?? "", directorManual: row.directorManual ?? "", directorGuide: deps.directorGuide?.(row.directorManual ?? "") ?? "", artStyle: row.artStyle ?? "", visualStyleGuide: deps.visualStyleGuide?.(row.artStyle ?? "") ?? "", imageModel: row.imageModel ?? "", videoModel: row.videoModel ?? row.videoModelKey ?? "", imageQuality: row.imageQuality ?? "1K", videoRatio: row.videoRatio ?? "16:9", videoMode: row.mode ?? row.videoMode, videoResolution: row.videoResolution ?? row.resolution, audio: row.generateAudio ?? row.audio, script: episode.content ?? "" };
+      return { id: projectId, scriptId, scriptVersion: scriptVersion.version, name: row.name ?? "", directorManual: row.directorManual ?? "", directorGuide: deps.directorGuide?.(row.directorManual ?? "") ?? "", artStyle: row.artStyle ?? "", visualStyleGuide: deps.visualStyleGuide?.(row.artStyle ?? "") ?? "", visualStyleGuideConfigured: Boolean(deps.visualStyleGuide), imageModel: row.imageModel ?? "", videoModel: row.videoModel ?? row.videoModelKey ?? "", imageQuality: row.imageQuality ?? "1K", videoRatio: row.videoRatio ?? "16:9", videoMode: row.mode ?? row.videoMode, videoResolution: row.videoResolution ?? row.resolution, audio: row.generateAudio ?? row.audio, script: episode.content ?? "" };
+    });
+    const initialTracks = await ctx.step(`production.tracks:r${revision}`, {projectId,scriptId}, async () => {
+      const tracks = await deps.db("o_videoTrack").where({projectId,scriptId}).select("id","prompt");
+      return Promise.all(tracks.map(async track => ({ id:Number(track.id),prompt:String(track.prompt??""),version:(await getCreativeState(deps.db,"track",Number(track.id),projectId)).version })));
     });
     const assertSourceCurrent = async (db: Knex | Knex.Transaction, checkMedia = false) => {
       const currentScript = await db("o_script").where({ id: scriptId, projectId }).first();
@@ -182,6 +187,10 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
     const model = async <T>(key: string, role: StructuredModelRequest<T>["role"], skillName: string, schema: z.ZodType<T>, input: unknown, budget: number, reserveTokens = 0): Promise<T> => {
       if (!independentOutput && budget < 128) throw new BuiltinRuntimeError("BUDGET_EXCEEDED", "输出额度不足以执行制作阶段");
       await ctx.assertActive();
+      if (deps.imageReviewContext && (role === "productionAgent:decisionAgent" || role === "productionAgent:supervisionAgent")) {
+        const imageReviews = await ctx.step(`production.imageReviews.${key}:r${revision}`, {projectId,scriptId}, () => deps.imageReviewContext!(projectId,scriptId));
+        input = input && typeof input === "object" ? {...input, imageReviews} : {input, imageReviews};
+      }
       const system = role === "productionAgent:decisionAgent" ? `${productionDecisionPrompt}\n${scopedMediaInstructionPrompt}`
         : `${await skill(skillName)}\n\n当前服务器执行契约：${productionStageContract(role)} 所有项目、剧集、素材、分镜 ID 必须来自输入。`;
       const result = await ctx.step(`production.${key}:r${revision}`, { input, role, systemHash: hash(system), ...(independentOutput ? { outputBudgetMode: "model_per_call" } : { budget, reserveTokens }) }, async () => {
@@ -379,7 +388,8 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
           const generationKey = `builtin:${run.id}:${action}:${target.targetKind}:${target.targetId}`;
           const videoMetadata = action === "generateVideos" && deps.videoModelMetadata ? await deps.videoModelMetadata(project.videoModel) : {};
           const videoSources = action === "generateVideos" ? target.storyboardIds.map((id) => knownStoryboards.get(id)).filter(Boolean) as any[] : [];
-          const storedVideoPrompt = buildStoryboardVideoPrompt(videoSources);
+          const frozenTrack = action === "generateVideos" ? initialTracks.find(track => track.id === target.targetId) : undefined;
+          const expectedTrackVersion = action === "generateVideos" ? frozenTrack?.version ?? (await getCreativeState(deps.db,"track",target.targetId,projectId)).version : undefined;
           const storedImagePrompt = target.targetKind === "asset" && selected.has("deriveAssets") ? source.desc || source.prompt || source.name || "" : source.prompt || source.desc || source.name || "";
           const scopedInstructions = scopedMediaInstructions(target, globalMediaInstructions, localMediaInstructions, requestText, targets.length);
           const imageRequest = scopedInstructions;
@@ -389,14 +399,17 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
             resolution: plan.videoSettings?.resolution ?? project.videoResolution ?? videoMetadata.resolution,
             duration: videoSources.reduce((total, item) => total + Number(item.duration || 0), 0),
             audio: plan.videoSettings?.audio ?? project.audio ?? videoMetadata.audio ?? false,
-            prompt: [storedVideoPrompt, videoInstruction].filter(Boolean).join("\n"),
+            prompt: [frozenTrack?.prompt ?? "",videoInstruction].filter(Boolean).join("\n"),
+            instructions: videoInstruction,
+            expectedTrackVersion,
+            ...(project.visualStyleGuideConfigured ? {visualStyleGuide:project.visualStyleGuide} : {}),
             storyboardIds: target.storyboardIds,
             expectedVersions: Object.fromEntries(videoSources.map((item) => [Number(item.id), Number(item.collaboration?.version ?? 0)])),
-          } : { prompt: [storedImagePrompt, project.artStyle ? `画风：${project.artStyle}` : "", imageRequest ? `本目标画面要求：${imageRequest}` : ""].filter(Boolean).join("\n"), imageInstruction: imageRequest, size: project.imageQuality, aspectRatio: project.videoRatio,
+          } : { ...(project.visualStyleGuideConfigured ? {visualStyleGuide:project.visualStyleGuide} : {}), prompt: [storedImagePrompt, project.artStyle ? `画风：${project.artStyle}` : "", imageRequest ? `本目标画面要求：${imageRequest}` : ""].filter(Boolean).join("\n"), imageInstruction: imageRequest, size: project.imageQuality, aspectRatio: project.videoRatio,
             expectedVersion: target.targetKind === "storyboard" ? Number(source.collaboration?.version ?? 0) : Number(source.imageId ?? 0),
             referenceAssetIds: target.targetKind === "storyboard" ? source.associateAssetsIds ?? [] : source.assetsId != null ? [Number(source.assetsId)] : Number(source.imageId ?? 0) > 0 ? [target.targetId] : [],
             referenceStoryboardIds: [] };
-          if (action === "generateVideos" && (videoParams.mode === undefined || videoParams.resolution === undefined || Number(videoParams.duration) <= 0 || !videoParams.prompt)) throw new BuiltinRuntimeError("INVALID_INPUT", "视频生成缺少已验证的模式、分辨率、时长或提示词");
+          if (action === "generateVideos" && (videoParams.mode === undefined || videoParams.resolution === undefined || Number(videoParams.duration) <= 0)) throw new BuiltinRuntimeError("INVALID_INPUT", "视频生成缺少已验证的模式、分辨率、时长或提示词");
           const result = await ctx.step(`production.${action}:${target.targetKind}:${target.targetId}`, { projectId, scriptId, targetKind: target.targetKind, targetId: target.targetId, generationKey }, () => action === "generateImages" ? deps.media!.generateImage!({ ctx, projectId, scriptId, targetKind: target.targetKind, targetId: target.targetId, storyboardId: target.targetKind === "storyboard" ? target.targetId : undefined, modelKey: project.imageModel, generationKey, params: videoParams }) : deps.media!.generateVideo!({ ctx, projectId, scriptId, targetKind: "track", targetId: target.targetId, modelKey: project.videoModel, generationKey, params: videoParams }), { imageGeneration: action === "generateImages", videoGeneration: action === "generateVideos" });
           const status = mediaResultStatus(result);
           if (status === "pending") throw new BuiltinRuntimeError("INVALID_INPUT", `${action} callback must wait for final status before returning`);

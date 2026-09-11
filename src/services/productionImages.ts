@@ -7,6 +7,7 @@ import { ImageGenerationError, type ImageGenerationReceipt, type ImageGeneration
 import { buildStoryboardImagePrompt, visualStyleHint, StoryboardVisualError } from "../lib/storyboardVisualContract";
 import { reconcileStoredStoryboardReferences } from "./storyboardVisuals";
 import { snapshotImageReference } from "./imageJobs/referenceSnapshot";
+import { assetPromptSystem } from "../lib/creativePromptPolicy";
 
 export class ProductionImageError extends Error {
   constructor(message: string, public readonly status = 400) {
@@ -98,6 +99,7 @@ export async function prepareDerivedAssetImages(db: Knex, args: {
   }
   const parentBase64 = new Map<number, string>();
   for (const [parentId, filePath] of parentPath) parentBase64.set(parentId, await args.runtime.getImageBase64(filePath));
+  const promptSystems = freezeAssetPromptSystems(args.runtime, String(settings.artStyle || "无"), prepared.assets);
 
   const imageIdByAsset = new Map<number, number>();
   await withProjectTransaction(db, args.projectId, async (trx) => {
@@ -121,7 +123,7 @@ export async function prepareDerivedAssetImages(db: Knex, args: {
     try {
       const type = String(asset.type || "role");
       const prompt = await args.runtime.generatePrompt({
-        system: args.runtime.getArtPrompt(String(settings.artStyle || "无"), "art_skills", promptFileByType[type] || promptFileByType.role),
+        system: promptSystems.get(type) ?? promptSystems.get("role")!,
         parentDescription: String(asset.assetsId ? prepared.parents.find((parent) => parent.id === asset.assetsId)?.describe || "无详细描述" : "无详细描述"),
         description: String(asset.describe || "无详细描述"),
       });
@@ -189,6 +191,7 @@ export async function prepareStoryboardImages(db: Knex, args: {
   });
   const imageBase64 = new Map<number, string>();
   for (const image of prepared.images) imageBase64.set(Number(image.id), await args.runtime.getImageBase64(String(image.filePath)));
+  const storyboardStyle = visualStyleHint(settings.artStyle, args.runtime.getArtPrompt(settings.artStyle, "art_skills", "art_storyboard_video"));
   const assetMap = new Map(prepared.assets.map((asset) => [Number(asset.id), asset]));
   const imageIdsByStoryboard = new Map<number, number[]>();
   for (const link of prepared.links) {
@@ -261,7 +264,7 @@ export async function prepareStoryboardImages(db: Knex, args: {
     try {
       const references = (imageIdsByStoryboard.get(Number(row.id)) || []).map((id) => ({ type: "image" as const, base64: imageBase64.get(id)! }));
       const assets = prepared.links.filter((link) => Number(link.storyboardId) === Number(row.id)).map((link) => assetMap.get(Number(link.assetId))!);
-      const prompt = buildStoryboardImagePrompt({ ...row, assets, style: visualStyleHint(settings.artStyle, args.runtime.getArtPrompt(settings.artStyle, "art_skills", "art_storyboard_video")) });
+      const prompt = buildStoryboardImagePrompt({ ...row, assets, style: storyboardStyle });
       const image = await args.runtime.generateImage!({ model: String(settings.imageModel), prompt, size: settings.imageQuality as "1K" | "2K" | "4K", aspectRatio: (settings.videoRatio || "16:9") as `${number}:${number}`, referenceList: references, projectId: args.projectId, scriptId: args.scriptId, kind: "storyboard" });
       const savePath = `/${args.projectId}/assets/${args.scriptId}/${args.runtime.uuid()}.jpg`;
       await image.save(savePath);
@@ -312,6 +315,12 @@ async function prepareDurableDerivedAssetImages(db: Knex, args: {
   for (const parent of prepared.parents) if (parent.filePath) parentBase64.set(Number(parent.id), await args.runtime.getImageBase64(String(parent.filePath)));
   const prefix = args.generationKeyPrefix ?? `web-derived:${args.projectId}:${args.scriptId}:${args.runtime.uuid()}`;
   const keys = new Map(ids.map((id) => [id, `${prefix}:asset:${id}`]));
+  const existingByAsset = new Map<number, ImageGenerationReceipt>();
+  await Promise.all(prepared.assets.map(async (asset) => {
+    const existing = await findGeneration(args.runtime.imageJobs, args.projectId, keys.get(Number(asset.id))!);
+    if (existing) existingByAsset.set(Number(asset.id), existing);
+  }));
+  const promptSystems = freezeAssetPromptSystems(args.runtime, String(settings.artStyle || "无"), prepared.assets.filter((asset) => !existingByAsset.has(Number(asset.id))));
   const receipts = new Map<number, ImageGenerationReceipt>();
   const preparationFailures = new Map<number, string>();
   await bounded(prepared.assets, args.concurrentCount ?? 5, async (asset) => {
@@ -320,22 +329,17 @@ async function prepareDurableDerivedAssetImages(db: Knex, args: {
       const referenceList = asset.assetsId != null && parentBase64.has(Number(asset.assetsId)) ? [{ type: "image" as const, base64: parentBase64.get(Number(asset.assetsId))! }] : [];
       const parent = prepared.parents.find((row) => Number(row.id) === Number(asset.assetsId));
       const referenceAssets = parent?.filePath && referenceList.length ? [snapshotImageReference(parent, String(parent.filePath))] : [];
-      const existing = await findGeneration(args.runtime.imageJobs, args.projectId, keys.get(id)!);
+      const existing = existingByAsset.get(id);
       if (existing) {
-        const current = await db("o_assets").where({ id, projectId: args.projectId }).first();
-        if (!current) throw new ProductionImageError("资产已被删除", 404);
-        receipts.set(id, await args.runtime.imageJobs.prepare({
-          generationKey: keys.get(id)!, projectId: args.projectId, modelKey: String(settings.imageModel), referenceAssets,
-          config: { prompt: String(current.prompt ?? ""), referenceList, size: String(settings.imageQuality), aspectRatio: "16:9" },
-          target: { kind: "asset", id, scriptId: args.scriptId, expectedVersion: existing.target.expectedVersion },
-        }));
+        if (existing.target.kind !== "asset" || Number(existing.target.id) !== id || Number(existing.target.scriptId) !== args.scriptId) throw new ProductionImageError("图片批次键已绑定其他资产", 409);
+        receipts.set(id, existing);
         return;
       }
       const current = await db("o_assets").where({ id, projectId: args.projectId }).first();
       if (!current || String(current.describe ?? "") !== String(asset.describe ?? "") || Number(current.imageId ?? 0) !== Number(asset.imageId ?? 0)) throw new ProductionImageError("资产已被其他操作修改，已停止图片生成", 409);
       const type = String(asset.type || "role");
       const prompt = await args.runtime.generatePrompt({
-        system: args.runtime.getArtPrompt(String(settings.artStyle || "无"), "art_skills", promptFileByType[type] || promptFileByType.role),
+        system: promptSystems.get(type) ?? promptSystems.get("role")!,
         parentDescription: String(asset.assetsId ? prepared.parents.find((parent) => Number(parent.id) === Number(asset.assetsId))?.describe || "无详细描述" : "无详细描述"),
         description: String(asset.describe || "无详细描述"),
       });
@@ -416,12 +420,24 @@ async function prepareDurableStoryboardImages(db: Knex, args: {
   const assetById = new Map(prepared.assets.map((asset) => [Number(asset.id), asset]));
   const prefix = args.generationKeyPrefix ?? `web-storyboard:${args.projectId}:${args.scriptId}:${args.runtime.uuid()}`;
   const generateList = args.compulsory ? prepared.storyboards : prepared.storyboards.filter((row) => row.shouldGenerateImage !== 0);
+  const keys = new Map(generateList.map((row) => [Number(row.id), `${prefix}:storyboard:${row.id}`]));
+  const existingByStoryboard = new Map<number, ImageGenerationReceipt>();
+  await Promise.all(generateList.map(async (row) => {
+    const existing = await findGeneration(args.runtime.imageJobs, args.projectId, keys.get(Number(row.id))!);
+    if (existing) existingByStoryboard.set(Number(row.id), existing);
+  }));
+  const storyboardStyle = existingByStoryboard.size === generateList.length ? "" : visualStyleHint(settings.artStyle, args.runtime.getArtPrompt(settings.artStyle, "art_skills", "art_storyboard_video"));
   const receipts = new Map<number, ImageGenerationReceipt>();
   try {
   for (const row of generateList) {
+    const existing = existingByStoryboard.get(Number(row.id));
+    if (existing) {
+      if (existing.target.kind !== "storyboard" || Number(existing.target.id) !== Number(row.id) || Number(existing.target.scriptId) !== args.scriptId) throw new ProductionImageError("图片批次键已绑定其他分镜", 409);
+      receipts.set(Number(row.id), existing);
+      continue;
+    }
     const referenceList = prepared.links.filter((link) => Number(link.storyboardId) === Number(row.id)).map((link) => assetById.get(Number(link.assetId))).filter(Boolean).map((asset) => ({ type: "image" as const, base64: imageBase64.get(Number(asset!.imageId))! }));
-    const generationKey = `${prefix}:storyboard:${row.id}`;
-    const existing = await findGeneration(args.runtime.imageJobs, args.projectId, generationKey);
+    const generationKey = keys.get(Number(row.id))!;
     const receipt = await args.runtime.imageJobs.prepare({
       generationKey, projectId: args.projectId, modelKey: String(settings.imageModel),
       referenceAssets: prepared.links.filter((link) => Number(link.storyboardId) === Number(row.id)).map((link) => {
@@ -430,9 +446,9 @@ async function prepareDurableStoryboardImages(db: Knex, args: {
       }),
       config: { prompt: buildStoryboardImagePrompt({ ...row,
         assets: prepared.links.filter((link) => Number(link.storyboardId) === Number(row.id)).map((link) => assetById.get(Number(link.assetId))!),
-        style: visualStyleHint(settings.artStyle, args.runtime.getArtPrompt(settings.artStyle, "art_skills", "art_storyboard_video")),
+        style: storyboardStyle,
       }), referenceList, size: String(settings.imageQuality), aspectRatio: String(settings.videoRatio || "16:9") },
-      target: { kind: "storyboard", id: Number(row.id), scriptId: args.scriptId, expectedVersion: existing?.target.expectedVersion ?? prepared.stateVersions.get(Number(row.id)) ?? 0 },
+      target: { kind: "storyboard", id: Number(row.id), scriptId: args.scriptId, expectedVersion: prepared.stateVersions.get(Number(row.id)) ?? 0 },
     });
     receipts.set(Number(row.id), receipt);
   }
@@ -468,6 +484,14 @@ async function durableResult(runtime: ProductionImageRuntime, id: number, receip
   if (receipt.status === "succeeded" && receipt.artifactPath) return { id, state: "已完成", src: await runtime.getSmallImageUrl(receipt.artifactPath), jobId: receipt.jobId };
   if (receipt.status === "pending") return { id, state: "生成中", src: "", jobId: receipt.jobId };
   return { id, state: "生成失败", src: "", errorReason: receipt.error ?? (receipt.status === "needs_reconciliation" ? "图片任务需要人工核对" : "图片生成失败"), jobId: receipt.jobId };
+}
+
+function freezeAssetPromptSystems(runtime: ProductionImageRuntime, style: string, assets: Array<{ type?: unknown }>): Map<string, string> {
+  const types = new Set(assets.map((asset) => String(asset.type || "role")));
+  return new Map([...types].map((type) => {
+    const manual = runtime.getArtPrompt(style, "art_skills", promptFileByType[type] || promptFileByType.role);
+    return [type, assetPromptSystem(manual)];
+  }));
 }
 
 async function findGeneration(jobs: ImageGenerationService, projectId: number, generationKey: string): Promise<ImageGenerationReceipt | undefined> {

@@ -1,6 +1,7 @@
 import fs from "fs";
 import path from "path";
 import getPath from "./getPath";
+import { workflowStyleReference } from "../lib/creativePromptPolicy";
 
 /**
  * 传入一个指定路径参数（风格名称），以及一个指定文件名，递归获取该文件并返回其内容
@@ -23,11 +24,11 @@ export function getArtPrompt(styleName: string, source: string, fileName: string
   const found = findFileRecursive(baseDir, target);
 
   if (!found) {
-    return prefixContent;
+    return workflowStyleReference(prefixContent);
   }
 
   const fileContent = fs.readFileSync(found, "utf-8");
-  return prefixContent ? `${prefixContent}\n${fileContent}` : fileContent;
+  return workflowStyleReference(prefixContent ? `${prefixContent}\n${fileContent}` : fileContent);
 }
 /**
  * 传入风格目录名，获取该风格下所有 .md 文件内容，按文件名映射返回

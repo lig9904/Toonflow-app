@@ -1,4 +1,3 @@
-import { readCurrentVideoPromptReview } from "@/services/videoPromptReview";
 import type { VideoPromptReviewReport } from "@/lib/videoPromptContract";
 import express from "express";
 import u from "@/utils";
@@ -7,7 +6,7 @@ import { success } from "@/lib/responseFormat";
 import { validateFields } from "@/middleware/middleware";
 import { resolveVideoReferenceMediaType } from "@/lib/videoPromptReferences";
 import { getCreativeState } from "@/services/creativeWorkspace";
-import { readBoundAudioReferences } from "@/services/roleAudioWorkspace";
+import { loadVideoReferenceInventory } from "@/services/videoPromptComposition";
 import { sortTracksByStoryboardIndex } from "@/services/trackOrdering";
 const router = express.Router();
 
@@ -103,16 +102,9 @@ export default router.post(
     if (isRef) {
       const storyIds = storyboardList.map((s) => s.id);
 
-      const assetDatas = await u
-        .db("o_assets2Storyboard")
-        .leftJoin("o_assets", "o_assets2Storyboard.assetId", "o_assets.id")
-        .leftJoin("o_image", "o_image.id", "o_assets.imageId")
-        .whereIn("o_assets2Storyboard.storyboardId", storyIds as number[])
-        .select("o_assets.*", "o_image.filePath", "o_image.type as storedFileType", "o_assets2Storyboard.storyboardId");
-
-      const queryAudioIds = [...new Set([...assetDatas.filter((item) => item.type === "role").map((item) => Number(item.id)), ...assetDatas.filter((item) => item.type === "role" && item.assetsId).map((item) => Number(item.assetsId))])];
-      const ownedRoles = queryAudioIds.length ? await u.db("o_assets").where({ projectId, type: "role" }).whereIn("id", queryAudioIds).select("id") : [];
-      const assets2AudioData = ownedRoles.length ? await readBoundAudioReferences(u.db, projectId, ownedRoles.map((item) => Number(item.id))) : [];
+      const inventory = await loadVideoReferenceInventory(u.db, { projectId, scriptId });
+      const assetDatas = inventory.linkedAssets.filter((item) => storyIds.includes(Number(item.storyboardId)));
+      const assets2AudioData = inventory.boundAudio;
       const audioRecord: Record<string, any> = {};
       await Promise.all(
         assets2AudioData.map(async (i) => {
@@ -169,7 +161,9 @@ export default router.post(
         version: (await getCreativeState(u.db, "track", trackId, projectId)).version,
         duration: item?.duration ?? 0,
         prompt: item?.prompt || "",
-        promptReview: await readCurrentVideoPromptReview(u.db, { projectId, scriptId, trackId, prompt: item?.prompt || "" }),
+        // The browser supplies the actual current model/mode/parameters/refs to checkVideoPrompt.
+        // Returning a prompt-only match here could revive a stale report.
+        promptReview: null,
         state: (item?.state as "未生成" | "生成中" | "已完成" | "生成失败") ?? "未生成",
         reason: item?.reason ?? "",
         selectVideoId: Number(item?.videoId)!,

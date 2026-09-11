@@ -12,6 +12,8 @@ import { defaultBuiltinRunLimits } from "../src/services/builtinAgent/contracts"
 import type { StructuredScriptModel } from "../src/services/builtinAgent/scriptExecutor";
 import { ensureCreativeWorkspaceSchema } from "../src/services/creativeWorkspace";
 
+import { prepareVideoPromptForGeneration } from "../src/services/videoPromptCompositionService";
+import { prepareVideoPromptJob } from "../src/services/videoPromptJobs";
 const options = { skip: !process.env.TOONFLOW_TEST_DATABASE_URL };
 async function fixture() {
   const f = await createPostgresFixture();
@@ -25,14 +27,16 @@ async function fixture() {
   await f.db("team_users").insert({ user_id: 1, enabled: true, role: "editor" });
   const [projectId] = await insertRowsReturningIds(f.db, "o_project", { userId: 1, name: "Media runtime", imageModel: "mock:image", videoModel: "mock:video", imageQuality: "1K", videoRatio: "16:9", mode: "endFrameOptional" });
   const [scriptId] = await insertRowsReturningIds(f.db, "o_script", { projectId, name: "Episode", content: "Scene" });
-  const [trackId] = await insertRowsReturningIds(f.db, "o_videoTrack", { projectId, scriptId, duration: 5 });
+  const [trackId] = await insertRowsReturningIds(f.db, "o_videoTrack", { projectId, scriptId, duration: 5, prompt: "人工保存：Wind moves the trees，保持逆光。" });
   const [storyboardId] = await insertRowsReturningIds(f.db, "o_storyboard", { projectId, scriptId, trackId, index: 0, prompt: "A landscape", videoDesc: "Wind moves the trees", duration: "5", shouldGenerateImage: 1, state: "未生成" });
   return { ...f, projectId, scriptId, trackId, storyboardId };
 }
 const videoModel = { type: "video", mode: ["endFrameOptional"], audio: "optional" as const, durationResolutionMap: [{ duration: [4, 5], resolution: ["480p", "720p"] }] };
 
-test("production runtime really creates image then video, records durable IDs and uses the saved image reference", options, async () => {
+for (const withSavedPrompt of [true,false]) test(`production runtime creates image then video using ${withSavedPrompt ? "saved human" : "shared generated"} prompt with counted hooks`, options, async () => {
   const f = await fixture();
+  if(!withSavedPrompt)await f.db("o_videoTrack").where({id:f.trackId}).update({prompt:null});
+  let promptCalls=0,reviewCalls=0;
   const saved: string[] = [];
   const imagesSubmitted: any[] = [], videosSubmitted: any[] = [];
   const imageProvider = { fingerprint: "image-fixture", submit: async (config: unknown) => { imagesSubmitted.push(config); return { taskId: "image-task" }; }, query: async () => ({ status: "succeeded" as const, outputUrl: "https://fixture.invalid/image.png" }) };
@@ -46,13 +50,17 @@ test("production runtime really creates image then video, records durable IDs an
       if (input.role === "productionAgent:supervisionAgent") reviewSource = input.input;
       return { value: input.schema.parse(value), outputTokens: 5 };
     } };
-    const media = createProductionMediaCapabilities({ db: f.db, images, videos, imageModelFor: async (key) => ({ key, modelName: key.split(/:(.+)/)[1], type: "image", mode: ["text"] }), modelFor: async (_, type) => type === "video" ? videoModel : { type: "image", mode: ["text"] }, videoProviderFor: async () => videoProvider, toBase64: async (path) => { assert(saved.includes(path)); return `data:image/png;base64,${Buffer.from(path).toString("base64")}`; }, pollMs: 20 });
+    const media = createProductionMediaCapabilities({ db: f.db, images, videos,
+      prepareVideoPrompt: (input,hooks)=>prepareVideoPromptForGeneration(f.db,input,{prepare: value=>prepareVideoPromptJob(f.db,value),generateDraft:async()=>{promptCalls++;return "统一生成：Wind moves the trees，保持逆光。";},reviewDraft:async(_job,draft)=>{reviewCalls++;return {prompt:draft,review:{status:"passed",findings:[],summary:"fixture",revised:false,reviewedAt:Date.now()}};}},hooks), imageModelFor: async (key) => ({ key, modelName: key.split(/:(.+)/)[1], type: "image", mode: ["text"] }), modelFor: async (_, type) => type === "video" ? videoModel : { type: "image", mode: ["text"] }, videoProviderFor: async () => videoProvider, toBase64: async (path) => { assert(saved.includes(path)); return `data:image/png;base64,${Buffer.from(path).toString("base64")}`; }, pollMs: 20 });
     const runtime = new BuiltinAgentRuntime({ db: f.db, authorize: async () => undefined, execute: createProductionAgentExecutor({ db: f.db, model, media, loadSkill: async () => "fixture", videoModelMetadata: async () => defaultVideoSettings(videoModel) }) });
     const created = await runtime.create({ agentType: "productionAgent", projectId: f.projectId, scriptId: f.scriptId, requestedBy: 1, prompt: "generate", idempotencyKey: "production-media-full", limits: { ...defaultBuiltinRunLimits, maxImageGenerations: 1, maxVideoGenerations: 1 } });
     await runtime.runOnce();
     const run = await runtime.get(created.run.id);
     assert.equal(run.status, "succeeded", run.errorMessage ?? "");
     assert.equal(imagesSubmitted.length, 1); assert.equal(videosSubmitted.length, 1);
+    assert.match(videosSubmitted[0].prompt,withSavedPrompt?/人工保存：Wind moves the trees，保持逆光。/:/统一生成：Wind moves the trees，保持逆光。/);
+    assert.equal(promptCalls,withSavedPrompt?0:1);assert.equal(reviewCalls,withSavedPrompt?0:1);
+    assert.equal(run.modelCalls,withSavedPrompt?2:4);
     assert.equal(videosSubmitted[0].referenceList.length, 1); assert.equal(videosSubmitted[0].audio, false); assert.equal(videosSubmitted[0].resolution, "480p");
     const board = await f.db("o_storyboard").where({ id: f.storyboardId }).first();
     assert.equal(reviewSource.flow.storyboard[0].src, board.filePath);

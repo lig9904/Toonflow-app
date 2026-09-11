@@ -16,7 +16,7 @@ export default router.post(
   validateFields({
     projectId: z.number(),
     scriptId: z.number(),
-    trackData: z.array(z.object({ trackId: z.number().int().positive(), info: z.array(infoSchema), idempotencyKey: z.string().min(8).max(150), generation: generationSchema.optional() })).min(1).max(100),
+    trackData: z.array(z.object({ trackId: z.number().int().positive(), expectedVersion: z.number().int().nonnegative(), info: z.array(infoSchema), idempotencyKey: z.string().min(8).max(150), generation: generationSchema.optional() })).min(1).max(100),
     mode: z.string(),
     model: z.string().min(1),
     concurrentCount: z.number().int().min(1).max(20).optional(),
@@ -27,12 +27,12 @@ export default router.post(
       const projectData = await u.db("o_project").where({ id: projectId }).first();
       if (!projectData) return res.status(400).send(error("项目不存在"));
       const limit = pLimit(concurrentCount);
-      const prepared = await Promise.all(trackData.map(async (track: { trackId: number; info: Array<{ id: number; sources: "storyboard" | "assets"; fileType?: "image" | "video" | "audio" }>; idempotencyKey: string; generation?: { duration?: number; resolution?: string; audio?: boolean } }) => {
+      const prepared = await Promise.all(trackData.map(async (track: { trackId: number; expectedVersion: number; info: Array<{ id: number; sources: "storyboard" | "assets"; fileType?: "image" | "video" | "audio" }>; idempotencyKey: string; generation?: { duration?: number; resolution?: string; audio?: boolean } }) => {
         try {
-          const result = await prepareRuntimeVideoPromptJob( { projectId, scriptId, trackId: track.trackId, model, mode, info: track.info, idempotencyKey: track.idempotencyKey, generation: track.generation });
+          const result = await prepareRuntimeVideoPromptJob( { projectId, scriptId, trackId: track.trackId, model, mode, info: track.info, idempotencyKey: track.idempotencyKey, expectedVersion: track.expectedVersion, generation: track.generation });
           return { trackId: track.trackId, job: result.job, reused: result.reused };
         } catch (e) {
-          await markVideoPromptPreparationFailed(u.db, { projectId, scriptId, trackId: track.trackId }, u.error(e).message).catch(() => undefined);
+          if ((e as { code?: unknown })?.code !== "VERSION_CONFLICT") await markVideoPromptPreparationFailed(u.db, { projectId, scriptId, trackId: track.trackId }, u.error(e).message).catch(() => undefined);
           return { trackId: track.trackId, job: undefined, reused: false, failure: u.error(e).message };
         }
       }));

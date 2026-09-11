@@ -6,6 +6,9 @@ import { success } from "@/lib/responseFormat";
 import { validateFields } from "@/middleware/middleware";
 import { ensureVideoPromptJobSchema } from "@/services/videoPromptJobs";
 const router = express.Router();
+const infoSchema = z.object({ id: z.number().int().positive(), sources: z.enum(["storyboard", "assets"]), fileType: z.enum(["image", "video", "audio"]).optional() });
+const reviewInputSchema = z.object({ trackId: z.number().int().positive(), model: z.string().min(1), mode: z.union([z.string(), z.array(z.unknown())]),
+  generation: z.object({ duration: z.number().finite().positive().optional(), resolution: z.string().min(1).optional(), audio: z.boolean().optional() }), info: z.array(infoSchema) });
 
 export default router.post(
   "/",
@@ -14,9 +17,10 @@ export default router.post(
     scriptId: z.number(),
     trackIds: z.array(z.number()),
     jobIds: z.array(z.string()).optional(),
+    reviewInputs: z.array(reviewInputSchema).optional(),
   }),
   async (req, res) => {
-    const { projectId, scriptId, trackIds, jobIds = [] } = req.body;
+    const { projectId, scriptId, trackIds, jobIds = [], reviewInputs = [] } = req.body;
     await ensureVideoPromptJobSchema(u.db);
     const tracks = await u
       .db("o_videoTrack")
@@ -32,7 +36,8 @@ export default router.post(
     for (const job of selectedJobs) if (!jobsByTrack.has(Number(job.trackId))) jobsByTrack.set(Number(job.trackId), job);
     const state = (value: string): string => value === "succeeded" ? "已完成" : value === "failed" ? "生成失败" : value === "queued" || value === "running" ? "生成中" : value;
     const promptList = await Promise.all(tracks.map(async (track) => {
-      const promptReview = await readCurrentVideoPromptReview(u.db, { projectId, scriptId, trackId: Number(track.id), prompt: track.prompt ?? "" });
+      const reviewInput = reviewInputs.find((item: { trackId: number }) => Number(item.trackId) === Number(track.id));
+      const promptReview = reviewInput ? await readCurrentVideoPromptReview(u.db, { projectId, scriptId, trackId: Number(track.id), prompt: track.prompt ?? "", model: reviewInput.model, mode: reviewInput.mode, generation: reviewInput.generation, info: reviewInput.info }) : null;
       const job = jobsByTrack.get(Number(track.id));
       return job
         ? { promptReview, id: Number(track.id), jobId: String(job.id), idempotencyKey: String(job.idempotencyKey), state: state(String(job.state)), reason: job.reason ?? "", prompt: track.prompt ?? "", version: versionByTrack.get(Number(track.id)) ?? 0 }

@@ -5,6 +5,8 @@ import { createScriptAgentExecutor } from "./scriptExecutor";
 import { configuredScriptModel, loadBuiltinSkill, builtinVisualStyleGuide, builtinDirectorGuide } from "./model";
 import type { BuiltinRunView } from "./contracts";
 import { createProductionAgentExecutor } from "./productionExecutor";
+import { prepareRuntimeVideoPromptForGeneration } from "../videoPromptCompositionRuntime";
+import { getProductionImageReviewService } from "../imageReviews/runtime";
 import { createProductionMediaCapabilities, defaultVideoSettings } from "./media";
 import { getConfiguredMediaModel, getPersistentVideoTaskProvider, resolveConfiguredImageModel } from "../../utils/ai";
 import { getProductionImageGenerationService } from "../productionImageJobRuntime";
@@ -14,6 +16,10 @@ import { configureAudioMatchRunStarter } from "../roleAudioWorkspace";
 import { createAudioMatchExecutor, initializeAudioMatchRun } from "./audioExecutor";
 import { configureNovelEventRunStarter, initializeNovelEventRun } from "../novelEventWorkspace";
 import { createNovelEventExecutor } from "../novelEventWorkspace/executor";
+
+import { createManualAssetExtractionExecutor, initializeManualExtraction } from "./manualAssetExtraction";
+
+import { createManualPolishExecutor, initializeManualPolish } from "./manualAssetPolish";
 
 let singleton: BuiltinAgentRuntime | undefined;
 
@@ -37,12 +43,16 @@ async function authorizeRun(run: BuiltinRunView, transaction?: Knex.Transaction)
 export function getBuiltinAgentRuntime(): BuiltinAgentRuntime {
   if (!singleton) {
     const script = createScriptAgentExecutor({ db: u.db, model: configuredScriptModel, loadSkill: loadBuiltinSkill, directorGuide: builtinDirectorGuide });
+    const manualPolish = createManualPolishExecutor({ db:u.db,model:configuredScriptModel });
+    const manualAssets = createManualAssetExtractionExecutor({ db: u.db, model: configuredScriptModel });
     const audio = createAudioMatchExecutor({ db: u.db, model: configuredScriptModel });
     const novelEvents = createNovelEventExecutor({ db: u.db, model: configuredScriptModel, fallbackPrompt: async () => String(await u.getPrompts("event") ?? "") });
     const production = createProductionAgentExecutor({ db: u.db, model: configuredScriptModel, loadSkill: loadBuiltinSkill,
       visualStyleGuide: builtinVisualStyleGuide, directorGuide: builtinDirectorGuide,
+      imageReviewContext: (projectId, scriptId) => getProductionImageReviewService().current({projectId, scriptId}),
       videoModelMetadata: async (key) => defaultVideoSettings(await getConfiguredMediaModel(key, "video")),
       media: createProductionMediaCapabilities({ db: u.db, images: getProductionImageGenerationService(), videos: getRuntimeVideoJobService(),
+        prepareVideoPrompt: prepareRuntimeVideoPromptForGeneration,
         visualStyleGuide: builtinVisualStyleGuide, mediaRootDir: u.getPath("oss"),
         imageModelFor: resolveConfiguredImageModel, modelFor: getConfiguredMediaModel, videoProviderFor: (key) => getPersistentVideoTaskProvider(key as `${string}:${string}`), toBase64: (path) => u.oss.getImageBase64(path) }),
     });
@@ -51,10 +61,14 @@ export function getBuiltinAgentRuntime(): BuiltinAgentRuntime {
       authorize: authorizeRun,
       beforeCreate: async (run, trx) => {
         const intent = run.intent as { phase?: string; context?: any };
+        if (intent?.phase === "polishAssets") await initializeManualPolish(trx,run);
+        if (intent?.phase === "extractAssets") await initializeManualExtraction(trx, run);
         if (intent?.phase === "matchAudio") await initializeAudioMatchRun(trx, intent.context);
         if (intent?.phase === "novelEvents") await initializeNovelEventRun(trx, intent.context);
       },
       execute: async (ctx) => {
+        if ((ctx.run.intent as { phase?: string })?.phase === "polishAssets") return await manualPolish(ctx);
+        if ((ctx.run.intent as { phase?: string })?.phase === "extractAssets") return await manualAssets(ctx);
         if ((ctx.run.intent as { phase?: string })?.phase === "matchAudio") return await audio(ctx);
         if ((ctx.run.intent as { phase?: string })?.phase === "novelEvents") return await novelEvents(ctx);
         // Conflicts are terminal for this snapshot. The executor records the

@@ -7,6 +7,7 @@ import { imageReferencesMatch, type ImageReferenceSnapshot } from "../imageJobs/
 import type { PrepareImageGenerationInput } from "../imageJobs/runtime";
 import { encodeReviewImage, imageDigest, inlineReferenceHash, MAX_REVIEW_REFERENCES, MAX_REVIEW_TOTAL_BYTES } from "./media";
 import { diagnoseImageReviewFailure, imageReviewFailureSummary, ImageReviewDiagnosticError, parseImageReviewOutput, type ImageReviewDiagnostics } from "./output";
+import { reserveAttachedModelCall, type AttachedModelCallDecision } from "../attachedModelBudget";
 
 const TABLE = "ext_image_reviews";
 export const imageReviewResultSchema = z.object({
@@ -33,6 +34,14 @@ export interface ImageReviewReport {
   reviewedAt: number | null; selected: boolean; stale: boolean; referenceCoverage: "complete" | "partial" | "none";
   promptVersion: string | number; modelName: string | null; createdAt: number; updatedAt: number;
   diagnostics?: ImageReviewDiagnostics | null;
+  originRunId: string | null; actorId: number | null; billingOwnerType: "builtin_run" | "request_actor" | "project"; billingOwnerId: string;
+  modelCallChargedAt: number | null;
+}
+export type CurrentImageReviewState = "missing" | "unreviewed" | "pending" | "passed" | "issues" | "failed" | "stale";
+export interface CurrentImageReviewResult {
+  projectId: number; scriptId: number | null; targetKind: "asset" | "storyboard"; targetId: string;
+  artifactPath: string | null; state: CurrentImageReviewState; sourceCurrent: boolean;
+  sourceFingerprint: string | null; artifactHash: string | null; review: ImageReviewReport | null;
 }
 export interface ImageReviewOptions {
   db: Knex;
@@ -68,6 +77,8 @@ export async function ensureImageReviewSchema(db: Knex): Promise<void> {
       fingerprint text NOT NULL, snapshot text NOT NULL, model text, diagnostics text, status text NOT NULL,
       summary text NOT NULL DEFAULT '', findings text NOT NULL DEFAULT '[]', "referenceCoverage" text NOT NULL DEFAULT 'none',
       attempts integer NOT NULL DEFAULT 0, "leaseToken" text, "leaseUntil" bigint, "invocationStartedAt" bigint,
+      "nextAttemptAt" bigint, "runId" text, "runInputRevision" bigint, "actorId" bigint,
+      "billingOwnerType" text NOT NULL DEFAULT 'project', "billingOwnerId" text NOT NULL DEFAULT '', "modelCallChargedAt" bigint,
       "reviewedAt" bigint, "createdAt" bigint NOT NULL, "updatedAt" bigint NOT NULL
     )`);
     await db.raw(`CREATE INDEX IF NOT EXISTS ext_image_reviews_due_idx ON "${TABLE}" (status, "leaseUntil", "createdAt")`);
@@ -75,18 +86,29 @@ export async function ensureImageReviewSchema(db: Knex): Promise<void> {
     await db.raw(`CREATE INDEX IF NOT EXISTS ext_image_reviews_artifact_idx ON "${TABLE}" ("projectId", "targetKind", "targetId", "artifactPath", "createdAt")`);
     await db.raw(`ALTER TABLE "${TABLE}" ADD COLUMN IF NOT EXISTS "invocationStartedAt" bigint`);
     await db.raw(`ALTER TABLE "${TABLE}" ADD COLUMN IF NOT EXISTS diagnostics text`);
+    await db.raw(`ALTER TABLE "${TABLE}" ADD COLUMN IF NOT EXISTS "nextAttemptAt" bigint`);
+    await db.raw(`ALTER TABLE "${TABLE}" ADD COLUMN IF NOT EXISTS "runId" text`);
+    await db.raw(`ALTER TABLE "${TABLE}" ADD COLUMN IF NOT EXISTS "runInputRevision" bigint`);
+    await db.raw(`ALTER TABLE "${TABLE}" ADD COLUMN IF NOT EXISTS "actorId" bigint`);
+    await db.raw(`ALTER TABLE "${TABLE}" ADD COLUMN IF NOT EXISTS "billingOwnerType" text NOT NULL DEFAULT 'project'`);
+    await db.raw(`ALTER TABLE "${TABLE}" ADD COLUMN IF NOT EXISTS "billingOwnerId" text NOT NULL DEFAULT ''`);
+    await db.raw(`ALTER TABLE "${TABLE}" ADD COLUMN IF NOT EXISTS "modelCallChargedAt" bigint`);
   } else if (!(await db.schema.hasTable(TABLE))) {
     await db.schema.createTable(TABLE, (t) => {
       t.text("id").primary(); t.integer("jobId").notNullable().unique(); t.integer("projectId").notNullable(); t.integer("scriptId");
       for (const column of ["targetKind", "targetId", "artifactPath", "fingerprint", "snapshot", "status"]) t.text(column).notNullable();
       t.text("artifactHash"); t.text("model"); t.text("diagnostics"); t.text("summary").notNullable().defaultTo(""); t.text("findings").notNullable().defaultTo("[]"); t.text("referenceCoverage").notNullable().defaultTo("none");
-      t.integer("attempts").notNullable().defaultTo(0); t.text("leaseToken"); t.bigInteger("leaseUntil"); t.bigInteger("invocationStartedAt"); t.bigInteger("reviewedAt"); t.bigInteger("createdAt").notNullable(); t.bigInteger("updatedAt").notNullable();
+      t.integer("attempts").notNullable().defaultTo(0); t.text("leaseToken"); t.bigInteger("leaseUntil"); t.bigInteger("invocationStartedAt"); t.bigInteger("nextAttemptAt");
+      t.text("runId"); t.bigInteger("runInputRevision"); t.bigInteger("actorId"); t.text("billingOwnerType").notNullable().defaultTo("project"); t.text("billingOwnerId").notNullable().defaultTo(""); t.bigInteger("modelCallChargedAt");
+      t.bigInteger("reviewedAt"); t.bigInteger("createdAt").notNullable(); t.bigInteger("updatedAt").notNullable();
       t.index(["projectId", "scriptId", "createdAt"]);
       t.index(["projectId", "targetKind", "targetId", "artifactPath", "createdAt"]);
     });
   }
   if (!isPostgres(db) && !(await db.schema.hasColumn(TABLE, "invocationStartedAt"))) await db.schema.alterTable(TABLE, (t) => { t.bigInteger("invocationStartedAt"); });
   if (!isPostgres(db) && !(await db.schema.hasColumn(TABLE, "diagnostics"))) await db.schema.alterTable(TABLE, (t) => { t.text("diagnostics"); });
+  for (const column of ["nextAttemptAt", "runInputRevision", "actorId", "modelCallChargedAt"] as const) if (!isPostgres(db) && !(await db.schema.hasColumn(TABLE, column))) await db.schema.alterTable(TABLE, (t) => { t.bigInteger(column); });
+  for (const column of ["runId", "billingOwnerType", "billingOwnerId"] as const) if (!isPostgres(db) && !(await db.schema.hasColumn(TABLE, column))) await db.schema.alterTable(TABLE, (t) => { t.text(column); });
 }
 
 export class ImageReviewService {
@@ -129,7 +151,7 @@ export class ImageReviewService {
   }
 
   /** Idempotent post-commit enqueue. A persisted prepare marker lets recovery repair a crash between save and enqueue. */
-  async enqueue(input: { projectId: number; scriptId?: number; jobId: number; automatic?: boolean }): Promise<ImageReviewReport | undefined> {
+  async enqueue(input: { projectId: number; scriptId?: number; jobId: number; automatic?: boolean; actorId?: number }): Promise<ImageReviewReport | undefined> {
     await this.ensure();
     const { db } = this.options;
     // Recovery checks many completed jobs; an already durable automatic review needs no media or canvas reads.
@@ -163,9 +185,14 @@ export class ImageReviewService {
     } catch { unavailable = "生成图片缺失、超过限制或无法确认项目归属，未进行视觉核验"; }
     const now = this.now();
     const immutable = { ...snapshot, ...(unavailable ? { unavailable } : {}) };
+    const run = binding.runId ? await db("ext_builtin_runs").where({ id: binding.runId, projectId: input.projectId }).first() : undefined;
+    const actorId = run ? Number(run.executionUserId ?? run.requestedBy) : Number.isSafeInteger(input.actorId) && Number(input.actorId) > 0 ? Number(input.actorId) : null;
+    const billingOwnerType = binding.runId ? "builtin_run" : actorId != null ? "request_actor" : "project";
+    const billingOwnerId = binding.runId ? String(binding.runId) : actorId != null ? `user:${actorId}` : `project:${input.projectId}`;
     const row = { id: randomUUID(), jobId: input.jobId, projectId: input.projectId, scriptId: binding.scriptId, targetKind: binding.targetKind, targetId: String(binding.targetId), artifactPath: binding.artifactPath, artifactHash,
-      fingerprint: imageDigest(JSON.stringify({ jobId: input.jobId, artifactPath: binding.artifactPath, artifactHash, references: snapshot.references })),
+      fingerprint: imageDigest(JSON.stringify({ jobId: input.jobId, artifactPath: binding.artifactPath, artifactHash, source: immutable })),
       snapshot: JSON.stringify(immutable), status: unavailable ? "skipped" : "queued", summary: unavailable ?? "", findings: JSON.stringify(unavailable ? [{ code: "REVIEW_UNAVAILABLE", severity: "warning", message: unavailable }] : []),
+      runId: binding.runId ?? null, runInputRevision: binding.runInputRevision ?? null, actorId, billingOwnerType, billingOwnerId,
       reviewedAt: unavailable ? now : null, createdAt: now, updatedAt: now };
     await db(TABLE).insert(row).onConflict("jobId").ignore();
     return this.report(await db(TABLE).where({ jobId: input.jobId, projectId: input.projectId }).first());
@@ -207,6 +234,13 @@ export class ImageReviewService {
     return Promise.all(rows.map((row) => this.report(row)));
   }
 
+  /** Resolve review state against the image selected right now, including an
+   * explicit stale result when only an older artifact/source was reviewed. */
+  async current(input: { projectId: number; scriptId?: number; targetKind?: "asset" | "storyboard"; targetIds?: number[] }): Promise<CurrentImageReviewResult[]> {
+    await this.ensure();
+    return readCurrentImageReviewResults(this.options.db, input);
+  }
+
   start(): void {
     if (this.timer) return;
     void this.runDue().catch(() => console.error("[imageReviews] queue processing failed"));
@@ -220,7 +254,8 @@ export class ImageReviewService {
     await this.ensure();
     // One call per worker; DB leases coordinate multiple server instances.
     const row = await this.options.db.transaction(async (trx) => {
-      const query = trx(TABLE).where((q) => q.where({ status: "queued" }).orWhere((q) => q.where({ status: "running" }).where("leaseUntil", "<=", this.now()))).orderBy("createdAt").first();
+      const query = trx(TABLE).where((q) => q.where((queued) => queued.where({ status: "queued" }).where((due) => due.whereNull("nextAttemptAt").orWhere("nextAttemptAt", "<=", this.now())))
+        .orWhere((running) => running.where({ status: "running" }).where("leaseUntil", "<=", this.now()))).orderBy("createdAt").first();
       if (isPostgres(trx)) query.forUpdate().skipLocked();
       const candidate = await query;
       if (!candidate) return undefined;
@@ -304,8 +339,8 @@ export class ImageReviewService {
     // Persist the uncertain-outcome boundary before sending a potentially paid request.
     // A crashed invocation is never automatically sent twice, even after its lease expires.
     if (signal.aborted) throw new Error("aborted");
-    const canInvoke = await this.options.db(TABLE).where({ id: row.id, status: "running", leaseToken: row.leaseToken }).whereNull("invocationStartedAt").update({ invocationStartedAt: this.now(), updatedAt: this.now() });
-    if (!canInvoke) return;
+    const invocation = await this.beginInvocation(row);
+    if (invocation !== "allow") return;
     const raw = await abortable(this.options.generate({ model, system: snapshot.prompt.content + "\n仅返回 JSON，使用本次调用 schema；不重画、不调用工具、不修改选中图片、不等待人工。\nOUTPUT_JSON_SCHEMA\n" + JSON.stringify(z.toJSONSchema(imageReviewResultSchema)), content, signal }), signal);
     if (signal.aborted) throw new Error("aborted");
     const parsed = parseImageReviewOutput(raw, imageReviewResultSchema);
@@ -324,23 +359,108 @@ export class ImageReviewService {
   }
 
   private async report(row: any): Promise<ImageReviewReport> {
+    return hydrateImageReviewReport(this.options.db, row);
+  }
+
+  private async beginInvocation(row: any): Promise<"allow" | "defer" | "skip"> {
+    const outcome = await this.options.db.transaction(async (trx) => {
+      const currentQuery = trx(TABLE).where({ id: row.id, status: "running", leaseToken: row.leaseToken }).whereNull("invocationStartedAt");
+      if (isPostgres(trx)) currentQuery.forUpdate();
+      const current = await currentQuery.first();
+      if (!current) return "skip";
+      let decision: AttachedModelCallDecision = { action: "allow", actorId: Number(current.actorId ?? 0) };
+      if (current.runId) decision = await reserveAttachedModelCall(trx, {
+        runId: String(current.runId), projectId: Number(current.projectId), scriptId: current.scriptId == null ? null : Number(current.scriptId),
+        expectedInputRevision: current.runInputRevision == null ? null : Number(current.runInputRevision), expectedActorId: current.actorId == null ? null : Number(current.actorId), now: this.now(),
+      });
+      if (decision.action === "defer") {
+        await trx(TABLE).where({ id: current.id, status: "running", leaseToken: current.leaseToken }).update({ status: "queued", leaseToken: null, leaseUntil: null, nextAttemptAt: this.now() + 5_000, updatedAt: this.now() });
+        return "defer";
+      }
+      if (decision.action === "skip") {
+        const result = attachedReviewSkip(decision.reason);
+        await trx(TABLE).where({ id: current.id, status: "running", leaseToken: current.leaseToken }).update({ status: "skipped", summary: result.summary, findings: JSON.stringify(result.findings), leaseToken: null, leaseUntil: null, reviewedAt: this.now(), updatedAt: this.now() });
+        return "skip";
+      }
+      const changed = await trx(TABLE).where({ id: current.id, status: "running", leaseToken: current.leaseToken }).whereNull("invocationStartedAt")
+        .update({ invocationStartedAt: this.now(), modelCallChargedAt: current.runId ? this.now() : null, nextAttemptAt: null, updatedAt: this.now() });
+      return changed === 1 ? "allow" : "skip";
+    });
+    if (outcome === "skip") this.options.onChanged?.({ projectId: Number(row.projectId), ...(row.scriptId == null ? {} : { scriptId: Number(row.scriptId) }), ...(row.targetKind === "storyboard" ? { storyboardId: Number(row.targetId) } : {}) });
+    return outcome;
+  }
+}
+
+async function hydrateImageReviewReport(db: Knex, row: any): Promise<ImageReviewReport> {
     const snapshot = JSON.parse(row.snapshot) as PreparedImageReview;
     let selected = false;
     let current: any;
     if (row.targetKind === "asset") {
-      current = await this.options.db("o_assets as asset").leftJoin("o_image as image", "image.id", "asset.imageId").where({ "asset.id": Number(row.targetId), "asset.projectId": Number(row.projectId) }).select("asset.*", "image.filePath").first();
+      current = await db("o_assets as asset").leftJoin("o_image as image", "image.id", "asset.imageId").where({ "asset.id": Number(row.targetId), "asset.projectId": Number(row.projectId) }).select("asset.*", "image.filePath").first();
     } else if (row.targetKind === "storyboard") {
-      current = await this.options.db("o_storyboard").where({ id: Number(row.targetId), projectId: Number(row.projectId), scriptId: row.scriptId }).first();
+      current = await db("o_storyboard").where({ id: Number(row.targetId), projectId: Number(row.projectId), scriptId: row.scriptId }).first();
     }
     if (current?.filePath) { try { selected = canonicalMediaPath(current.filePath) === canonicalMediaPath(row.artifactPath); } catch {} }
     // Flow candidates have no canonical selected pointer. Do not claim they are selected.
     const targetChanged = Object.keys(snapshot.targetContext).length > 0 && JSON.stringify(targetContext(current)) !== JSON.stringify(snapshot.targetContext);
     const references = snapshot.references.flatMap((item) => item.asset ? [item.asset] : []);
-    const referencesCurrent = await imageReferencesMatch(this.options.db, Number(row.projectId), references).catch(() => false);
+    const referencesCurrent = await imageReferencesMatch(db, Number(row.projectId), references).catch(() => false);
     return { id: row.id, jobId: Number(row.jobId), projectId: Number(row.projectId), scriptId: row.scriptId == null ? null : Number(row.scriptId), targetKind: row.targetKind, targetId: row.targetId, artifactPath: row.artifactPath, artifactHash: row.artifactHash,
       status: row.status, summary: row.summary, findings: JSON.parse(row.findings), reviewedAt: row.reviewedAt == null ? null : Number(row.reviewedAt), selected, stale: !selected || targetChanged || !referencesCurrent,
-      referenceCoverage: row.referenceCoverage, promptVersion: snapshot.prompt.version, modelName: row.model ? JSON.parse(row.model).modelName : null, createdAt: Number(row.createdAt), updatedAt: Number(row.updatedAt), diagnostics: row.diagnostics ? JSON.parse(row.diagnostics) : null };
+      referenceCoverage: row.referenceCoverage, promptVersion: snapshot.prompt.version, modelName: row.model ? JSON.parse(row.model).modelName : null, createdAt: Number(row.createdAt), updatedAt: Number(row.updatedAt), diagnostics: row.diagnostics ? JSON.parse(row.diagnostics) : null,
+      originRunId: row.runId ?? null, actorId: row.actorId == null ? null : Number(row.actorId), billingOwnerType: row.billingOwnerType || "project", billingOwnerId: row.billingOwnerId || `project:${row.projectId}`,
+      modelCallChargedAt: row.modelCallChargedAt == null ? null : Number(row.modelCallChargedAt) };
+}
+
+/** Read-only bridge for production review and video preflight. It never starts
+ * a review, calls a model, changes selection, or waits for a human. */
+export async function readCurrentImageReviewResults(db: Knex, input: { projectId: number; scriptId?: number; targetKind?: "asset" | "storyboard"; targetIds?: number[] }): Promise<CurrentImageReviewResult[]> {
+  const ids = input.targetIds ? [...new Set(input.targetIds.map(Number))] : undefined;
+  if (ids?.some((id) => !Number.isSafeInteger(id) || id <= 0) || (ids && ids.length > 500)) throw new ImageReviewError("核验目标编号无效或过多");
+  const targets: Array<{ projectId: number; scriptId: number | null; targetKind: "asset" | "storyboard"; targetId: string; artifactPath: string | null }> = [];
+  const reviewTableExists = await db.schema.hasTable(TABLE);
+  if (!input.targetKind || input.targetKind === "storyboard") {
+    let query = db("o_storyboard").where({ projectId: input.projectId });
+    if (input.scriptId != null) query = query.where({ scriptId: input.scriptId });
+    if (ids) query = query.whereIn("id", ids);
+    const rows = await query.select("id", "scriptId", "filePath").limit(500);
+    targets.push(...rows.map((row) => ({ projectId: input.projectId, scriptId: Number(row.scriptId), targetKind: "storyboard" as const, targetId: String(row.id), artifactPath: row.filePath ? String(row.filePath) : null })));
   }
+  if (!input.targetKind || input.targetKind === "asset") {
+    let query = input.scriptId == null ? db("o_assets as review_asset").where("review_asset.projectId", input.projectId) : episodeAssetQuery(db, input.projectId, input.scriptId);
+    if (ids) query = query.whereIn("review_asset.id", ids);
+    const rows = await query.leftJoin("o_image as selected_image", "selected_image.id", "review_asset.imageId").distinct("review_asset.id", "selected_image.filePath").limit(500);
+    targets.push(...rows.map((row) => ({ projectId: input.projectId, scriptId: input.scriptId ?? null, targetKind: "asset" as const, targetId: String(row.id), artifactPath: row.filePath ? String(row.filePath) : null })));
+  }
+  if (!reviewTableExists) return targets.map((target) => ({ ...target, state: target.artifactPath ? "unreviewed" : "missing", sourceCurrent: false, sourceFingerprint: null, artifactHash: null, review: null }));
+  return Promise.all(targets.map((target) => readCurrentTarget(db, target)));
+}
+
+async function readCurrentTarget(db: Knex, target: { projectId: number; scriptId: number | null; targetKind: "asset" | "storyboard"; targetId: string; artifactPath: string | null }): Promise<CurrentImageReviewResult> {
+  if (!target.artifactPath) return { ...target, artifactPath: null, state: "missing", sourceCurrent: false, sourceFingerprint: null, artifactHash: null, review: null };
+  const scope = () => {
+    let query = db(TABLE).where({ projectId: target.projectId, targetKind: target.targetKind, targetId: target.targetId });
+    if (target.targetKind === "storyboard") query = query.where({ scriptId: target.scriptId });
+    return query;
+  };
+  const canonical = canonicalMediaPath(target.artifactPath);
+  const aliases = [...new Set([target.artifactPath, canonical, canonical.slice(1), `/oss${canonical}`, `oss${canonical}`])];
+  const matching = await scope().whereIn("artifactPath", aliases).orderBy("createdAt", "desc").orderBy("id", "desc").first();
+  const row = matching ?? await scope().orderBy("createdAt", "desc").orderBy("id", "desc").first();
+  if (!row) return { ...target, state: "unreviewed", sourceCurrent: false, sourceFingerprint: null, artifactHash: null, review: null };
+  const review = await hydrateImageReviewReport(db, row);
+  const sourceCurrent = Boolean(matching && !review.stale);
+  const state: CurrentImageReviewState = !matching || review.stale ? "stale" : review.status === "queued" || review.status === "running" ? "pending" : review.status === "passed" ? "passed" : review.status === "issues" ? "issues" : "failed";
+  return { ...target, state, sourceCurrent, sourceFingerprint: row.fingerprint ?? null, artifactHash: matching ? row.artifactHash ?? null : null, review };
+}
+
+function attachedReviewSkip(reason: Exclude<AttachedModelCallDecision, { action: "allow" } | { action: "defer" }>["reason"]): { summary: string; findings: ImageReviewFinding[] } {
+  const summary = reason === "budget_exceeded" ? "原内置任务的模型调用额度已用尽，图片已保留且未调用附属核验模型"
+    : reason === "permission_revoked" ? "原操作者权限已撤销，图片已保留且未调用附属核验模型"
+    : reason === "run_changed" ? "原内置任务的操作者或输入版本已变化，图片已保留且未调用旧核验请求"
+    : reason === "run_missing" ? "原内置任务已不存在，图片已保留且未调用附属核验模型"
+    : "原内置任务已取消或结束，图片已保留且未调用附属核验模型";
+  return { summary, findings: [{ code: `ORIGIN_${reason.toUpperCase()}`, severity: "warning", message: summary }] };
 }
 
 function targetContext(target: any): Record<string, unknown> {

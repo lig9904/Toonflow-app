@@ -1,5 +1,6 @@
 import type { Knex } from "knex";
 import type { ImageGenerationReceipt, ImageGenerationService } from "./imageJobs/runtime";
+import { snapshotImageReference } from "./imageJobs/referenceSnapshot";
 
 export type RootAssetType = "role" | "scene" | "tool";
 
@@ -24,10 +25,16 @@ const labels: Record<RootAssetType, { label: string; title: string; ending: stri
 export async function prepareRootAssetImage(db: Knex, jobs: ImageGenerationService, input: RootAssetImageInput): Promise<ImageGenerationReceipt> {
   const project = await db("o_project").where({ id: input.projectId }).select("id", "artStyle").first();
   if (!project) throw Object.assign(new Error("项目为空"), { status: 404 });
-  const asset = await db("o_assets").where({ id: input.assetId, projectId: input.projectId }).first();
+  const asset = await db("o_assets as asset").leftJoin("o_image as selected_image", "selected_image.id", "asset.imageId")
+    .where({ "asset.id": input.assetId, "asset.projectId": input.projectId })
+    .select("asset.*", "selected_image.filePath as selectedImagePath", "selected_image.state as selectedImageState").first();
   if (!asset) throw Object.assign(new Error("资产不属于当前项目"), { status: 404 });
   if (String(asset.type) !== input.type) throw Object.assign(new Error("资产类型与请求不一致"), { status: 409 });
   const cfg = labels[input.type];
+  if (input.base64 && asset.imageId != null && (!asset.selectedImagePath || asset.selectedImageState === "生成中")) {
+    throw Object.assign(new Error("当前素材参考图片不可用，请重新载入"), { status: 409 });
+  }
+  const selfReference = input.base64 && asset.selectedImagePath ? snapshotImageReference(asset, String(asset.selectedImagePath)) : undefined;
   const prompt = `
     请根据以下参数生成${cfg.title}：
 
@@ -44,6 +51,8 @@ export async function prepareRootAssetImage(db: Knex, jobs: ImageGenerationServi
     generationKey: input.generationKey,
     projectId: input.projectId,
     modelKey: input.model,
+    referenceAssets: selfReference ? [selfReference] : undefined,
+    referencePaths: input.base64 ? [selfReference?.filePath] : undefined,
     config: {
       prompt,
       referenceList: input.base64 ? [{ type: "image", base64: input.base64 }] : [],

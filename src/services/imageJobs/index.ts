@@ -45,6 +45,9 @@ export interface ImageJob {
   submissionOutcome: "submitted" | "not_submitted" | "rejected" | "unknown" | null;
   submissionOwner: string | null;
   submissionLeaseUntil: number | null;
+  workOwner: string | null;
+  workLeaseUntil: number | null;
+  workEpoch: number;
 }
 
 export interface ImageJobDependencies {
@@ -56,6 +59,7 @@ export interface ImageJobDependencies {
   maxQueryFailures?: number;
   maxDownloadFailures?: number;
   submissionLeaseMs?: number;
+  processingLeaseMs?: number;
   initialPollDelayMs?: number;
   schedule?: boolean;
 }
@@ -91,6 +95,9 @@ interface JobRow {
   submissionOwner: string | null;
   submissionLeaseUntil: number | string | null;
   submissionOutcome: "submitted" | "not_submitted" | "rejected" | "unknown" | null;
+  workOwner: string | null;
+  workLeaseUntil: number | string | null;
+  workEpoch: number | string;
 }
 
 const TABLE = "ext_image_jobs";
@@ -123,6 +130,9 @@ export async function ensureImageJobsSchema(db: Knex): Promise<void> {
         "submissionOwner" text,
         "submissionLeaseUntil" bigint,
         "submissionOutcome" text,
+        "workOwner" text,
+        "workLeaseUntil" bigint,
+        "workEpoch" bigint NOT NULL DEFAULT 0,
         UNIQUE ("projectId", "idempotencyKey")
       )
     `);
@@ -132,6 +142,9 @@ export async function ensureImageJobsSchema(db: Knex): Promise<void> {
     await db.raw(`ALTER TABLE "${TABLE}" ADD COLUMN IF NOT EXISTS "submissionOwner" text`);
     await db.raw(`ALTER TABLE "${TABLE}" ADD COLUMN IF NOT EXISTS "submissionLeaseUntil" bigint`);
     await db.raw(`ALTER TABLE "${TABLE}" ADD COLUMN IF NOT EXISTS "submissionOutcome" text`);
+    await db.raw(`ALTER TABLE "${TABLE}" ADD COLUMN IF NOT EXISTS "workOwner" text`);
+    await db.raw(`ALTER TABLE "${TABLE}" ADD COLUMN IF NOT EXISTS "workLeaseUntil" bigint`);
+    await db.raw(`ALTER TABLE "${TABLE}" ADD COLUMN IF NOT EXISTS "workEpoch" bigint NOT NULL DEFAULT 0`);
     return;
   }
   if (!(await db.schema.hasTable(TABLE))) {
@@ -157,6 +170,9 @@ export async function ensureImageJobsSchema(db: Knex): Promise<void> {
       table.text("submissionOwner");
       table.integer("submissionLeaseUntil");
       table.text("submissionOutcome");
+      table.text("workOwner");
+      table.integer("workLeaseUntil");
+      table.integer("workEpoch").notNullable().defaultTo(0);
       table.index(["status", "nextPollAt"]);
       table.index(["projectId", "createdAt"]);
       table.unique(["projectId", "idempotencyKey"]);
@@ -166,6 +182,9 @@ export async function ensureImageJobsSchema(db: Knex): Promise<void> {
     if (!(await db.schema.hasColumn(TABLE, "submissionOwner"))) await db.schema.alterTable(TABLE, (table) => table.text("submissionOwner"));
     if (!(await db.schema.hasColumn(TABLE, "submissionLeaseUntil"))) await db.schema.alterTable(TABLE, (table) => table.integer("submissionLeaseUntil"));
     if (!(await db.schema.hasColumn(TABLE, "submissionOutcome"))) await db.schema.alterTable(TABLE, (table) => table.text("submissionOutcome"));
+    if (!(await db.schema.hasColumn(TABLE, "workOwner"))) await db.schema.alterTable(TABLE, (table) => table.text("workOwner"));
+    if (!(await db.schema.hasColumn(TABLE, "workLeaseUntil"))) await db.schema.alterTable(TABLE, (table) => table.integer("workLeaseUntil"));
+    if (!(await db.schema.hasColumn(TABLE, "workEpoch"))) await db.schema.alterTable(TABLE, (table) => table.integer("workEpoch").notNullable().defaultTo(0));
   }
 }
 
@@ -193,6 +212,7 @@ export class ImageJobService {
   private readonly maxDownloadFailures: number;
   private readonly initialPollDelayMs: number;
   private readonly submissionLeaseMs: number;
+  private readonly processingLeaseMs: number;
   private readonly workerId: string;
   private readonly scheduleEnabled: boolean;
   private readonly active = new Map<number, Promise<ImageJob>>();
@@ -220,6 +240,7 @@ export class ImageJobService {
     this.maxDownloadFailures = this.dependencies.maxDownloadFailures ?? 5;
     this.initialPollDelayMs = this.dependencies.initialPollDelayMs ?? 5_000;
     this.submissionLeaseMs = this.dependencies.submissionLeaseMs ?? 60_000;
+    this.processingLeaseMs = Math.max(100, this.dependencies.processingLeaseMs ?? 305_000);
     this.workerId = randomUUID();
     this.scheduleEnabled = this.dependencies.schedule ?? true;
     if (!Number.isInteger(this.maxConcurrent) || this.maxConcurrent < 1 || this.maxConcurrent > 20) throw new ImageJobError("INVALID_INPUT", "maxConcurrent 必须在 1 到 20 之间");
@@ -329,7 +350,7 @@ export class ImageJobService {
     if (!job.upstreamTaskId) {
       // A sync provider has no upstream task ID by design. Once its result is
       // durably stored, restart/retry must continue the download only.
-      if ((job.executionMode === "sync" || job.payload.executionMode === "sync") && job.status === "DOWNLOADING" && job.resultUrl) return this.download(job, job.resultUrl);
+      if ((job.executionMode === "sync" || job.payload.executionMode === "sync") && job.status === "DOWNLOADING" && job.resultUrl) return this.pollOrDownload(job);
       if (job.status === "SUBMITTING") {
         const leaseUntil = job.submissionLeaseUntil ?? job.updatedAt + (job.executionMode === "sync" ? SYNC_SUBMISSION_LEASE_MS : this.submissionLeaseMs);
         if (leaseUntil > this.now()) return job;
@@ -381,12 +402,15 @@ export class ImageJobService {
   }
 
   private async pollOrDownload(job: ImageJob): Promise<ImageJob> {
+    const claimed = await this.claimWork(job.id);
+    if (!claimed) return this.get(job.id);
+    job = claimed;
     if (job.status === "DOWNLOADING" && job.resultUrl) return this.download(job, job.resultUrl);
     let provider: PersistentImageTaskProvider;
     try { provider = await this.provider(job.modelKey); }
-    catch (error) { await this.db.transaction((trx) => this.markReconciliation(trx, rowFromJob(job), `供应商不可恢复：${errorMessage(error)}`)); return this.get(job.id); }
+    catch (error) { await this.db.transaction((trx) => this.markReconciliation(trx, rowFromJob(job), `供应商不可恢复：${errorMessage(error)}`, { status: job.status, workOwner: this.workerId, workEpoch: job.workEpoch })); return this.get(job.id); }
     if (provider.fingerprint !== job.payload.providerFingerprint) {
-      await this.db.transaction((trx) => this.markReconciliation(trx, rowFromJob(job), "当前供应商端点或模型绑定已变化，不能查询旧任务"));
+      await this.db.transaction((trx) => this.markReconciliation(trx, rowFromJob(job), "当前供应商端点或模型绑定已变化，不能查询旧任务", { status: job.status, workOwner: this.workerId, workEpoch: job.workEpoch }));
       return this.get(job.id);
     }
     let result: Awaited<ReturnType<PersistentImageTaskProvider["query"]>>;
@@ -395,31 +419,38 @@ export class ImageJobService {
     if (result.status === "pending") return this.deferPoll(job);
     if (result.status === "failed") return this.fail(job, result.error ?? "上游图片任务失败");
     if (!result.outputUrl) return this.deferQuery(job, "上游任务成功但未返回图片地址");
-    await this.db(TABLE).where({ id: job.id }).update({ status: "DOWNLOADING", resultUrl: result.outputUrl, nextPollAt: this.now(), updatedAt: this.now(), lastError: null });
-    return this.download(await this.get(job.id), result.outputUrl);
+    // Query may consume most of its lease. Renew before the worker writes the
+    // shared artifact path so another instance cannot take over mid-download.
+    const workLeaseUntil = this.now() + this.processingLeaseMs;
+    const changed = await this.workQuery(this.db, job, "POLLING").update({ status: "DOWNLOADING", resultUrl: result.outputUrl, nextPollAt: this.now(), workLeaseUntil, updatedAt: this.now(), lastError: null });
+    if (changed !== 1) return this.get(job.id);
+    return this.download({ ...job, status: "DOWNLOADING", resultUrl: result.outputUrl, workLeaseUntil }, result.outputUrl);
   }
 
   private async download(job: ImageJob, url: string): Promise<ImageJob> {
     try {
       await this.dependencies.download(url, job.outputPath);
       await this.db.transaction(async (trx) => {
+        const currentQuery = this.workQuery(trx, job, "DOWNLOADING");
+        if (isPostgres(trx)) currentQuery.forUpdate();
+        if (!(await currentQuery.first())) return;
         const completed: ImageJob = { ...job, status: "SUCCEEDED", resultUrl: url, updatedAt: this.now(), lastError: null, nextPollAt: null };
         if (this.dependencies.onSaved) await this.dependencies.onSaved(completed, trx);
-        await trx(TABLE).where({ id: job.id, status: "DOWNLOADING" }).update({ status: "SUCCEEDED", resultUrl: isInlineImageData(url) ? null : url, payload: JSON.stringify(compactImagePayload(job.payload)), nextPollAt: null, updatedAt: this.now(), lastError: null });
+        await this.workQuery(trx, job, "DOWNLOADING").update({ status: "SUCCEEDED", resultUrl: isInlineImageData(url) ? null : url, payload: JSON.stringify(compactImagePayload(job.payload)), nextPollAt: null, updatedAt: this.now(), lastError: null, workOwner: null, workLeaseUntil: null });
       });
     } catch (error) {
       if (this.dependencies.onSaved && isPermanentSaveConflict(error)) {
-        await this.db.transaction((trx) => this.markReconciliation(trx, rowFromJob(job), `保存图片结果被拒绝：${errorMessage(error)}`));
+        await this.db.transaction((trx) => this.markReconciliation(trx, rowFromJob(job), `保存图片结果被拒绝：${errorMessage(error)}`, { status: "DOWNLOADING", workOwner: this.workerId, workEpoch: job.workEpoch }));
         return this.get(job.id);
       }
       const failures = job.downloadFailures + 1;
       const message = `下载图片失败：${errorMessage(error)}`;
       if (failures >= this.maxDownloadFailures) {
-        await this.db.transaction((trx) => this.markReconciliation(trx, rowFromJob(job), `下载图片连续失败：${message}`));
+        await this.db.transaction((trx) => this.markReconciliation(trx, rowFromJob(job), `下载图片连续失败：${message}`, { status: "DOWNLOADING", workOwner: this.workerId, workEpoch: job.workEpoch }));
         return this.get(job.id);
       }
       const nextPollAt = this.now() + this.backoff(failures);
-      await this.db(TABLE).where({ id: job.id }).update({ status: "DOWNLOADING", downloadFailures: failures, nextPollAt, lastError: message, updatedAt: this.now() });
+      await this.workQuery(this.db, job, "DOWNLOADING").update({ status: "DOWNLOADING", downloadFailures: failures, nextPollAt, lastError: message, updatedAt: this.now(), workOwner: null, workLeaseUntil: null });
       this.schedule(job.id, nextPollAt);
     }
     return this.get(job.id);
@@ -428,7 +459,7 @@ export class ImageJobService {
   private async deferPoll(job: ImageJob): Promise<ImageJob> {
     const attempts = job.pollAttempts + 1;
     const nextPollAt = this.now() + this.backoff(attempts);
-    await this.db(TABLE).where({ id: job.id }).update({ status: "POLLING", pollAttempts: attempts, nextPollAt, updatedAt: this.now(), lastError: null });
+    await this.workQuery(this.db, job, "POLLING").update({ status: "POLLING", pollAttempts: attempts, nextPollAt, updatedAt: this.now(), lastError: null, workOwner: null, workLeaseUntil: null });
     this.schedule(job.id, nextPollAt);
     return this.get(job.id);
   }
@@ -436,11 +467,11 @@ export class ImageJobService {
   private async deferQuery(job: ImageJob, message: string): Promise<ImageJob> {
     const failures = job.queryFailures + 1;
     if (failures >= this.maxQueryFailures) {
-      await this.db.transaction((trx) => this.markReconciliation(trx, rowFromJob(job), `查询图片任务连续失败：${message}`));
+      await this.db.transaction((trx) => this.markReconciliation(trx, rowFromJob(job), `查询图片任务连续失败：${message}`, { status: "POLLING", workOwner: this.workerId, workEpoch: job.workEpoch }));
       return this.get(job.id);
     }
     const nextPollAt = this.now() + this.backoff(failures);
-    await this.db(TABLE).where({ id: job.id }).update({ status: "POLLING", queryFailures: failures, nextPollAt, updatedAt: this.now(), lastError: `查询图片任务失败：${message}` });
+    await this.workQuery(this.db, job, "POLLING").update({ status: "POLLING", queryFailures: failures, nextPollAt, updatedAt: this.now(), lastError: `查询图片任务失败：${message}`, workOwner: null, workLeaseUntil: null });
     this.schedule(job.id, nextPollAt);
     return this.get(job.id);
   }
@@ -455,11 +486,11 @@ export class ImageJobService {
   }
 
   private async fail(job: ImageJob, message: string): Promise<ImageJob> {
-    await this.db.transaction((trx) => trx(TABLE).where({ id: job.id }).update({ status: "FAILED", payload: JSON.stringify(compactImagePayload(job.payload)), nextPollAt: null, lastError: message, updatedAt: this.now() }));
+    await this.db.transaction((trx) => this.workQuery(trx, job, "POLLING").update({ status: "FAILED", payload: JSON.stringify(compactImagePayload(job.payload)), nextPollAt: null, lastError: message, updatedAt: this.now(), workOwner: null, workLeaseUntil: null }));
     return this.get(job.id);
   }
 
-  private async markReconciliation(trx: Knex.Transaction, row: JobRow, message: string, guard: { status?: ImageJobStatus; owner?: string | null; submissionLeaseUntil?: number | null; upstreamTaskId?: string | null; onlyWithoutUpstream?: boolean } = {}): Promise<void> {
+  private async markReconciliation(trx: Knex.Transaction, row: JobRow, message: string, guard: { status?: ImageJobStatus; owner?: string | null; submissionLeaseUntil?: number | null; upstreamTaskId?: string | null; onlyWithoutUpstream?: boolean; workOwner?: string; workEpoch?: number } = {}): Promise<void> {
     let query = trx(TABLE).where({ id: row.id });
     query = query.where({ status: guard.status ?? row.status });
     if (guard.owner === null) query = query.whereNull("submissionOwner");
@@ -469,8 +500,30 @@ export class ImageJobService {
     else if (guard.submissionLeaseUntil !== undefined) query = query.where({ submissionLeaseUntil: guard.submissionLeaseUntil });
     if (guard.upstreamTaskId === null) query = query.whereNull("upstreamTaskId");
     else if (guard.upstreamTaskId !== undefined) query = query.where({ upstreamTaskId: guard.upstreamTaskId });
+    if (guard.workOwner !== undefined) query = query.where({ workOwner: guard.workOwner });
+    if (guard.workEpoch !== undefined) query = query.where({ workEpoch: guard.workEpoch });
     const hasAcceptedResult = Boolean(row.upstreamTaskId || row.resultUrl || row.submissionOutcome === "submitted");
-    await query.update({ status: "RECONCILIATION_REQUIRED", submissionOutcome: hasAcceptedResult ? "submitted" : "unknown", submissionLeaseUntil: null, submissionOwner: null, payload: compactPayloadText(row.payload), nextPollAt: null, lastError: message, updatedAt: this.now() });
+    await query.update({ status: "RECONCILIATION_REQUIRED", submissionOutcome: hasAcceptedResult ? "submitted" : "unknown", submissionLeaseUntil: null, submissionOwner: null, workOwner: null, workLeaseUntil: null, payload: compactPayloadText(row.payload), nextPollAt: null, lastError: message, updatedAt: this.now() });
+  }
+
+  private async claimWork(jobId: number): Promise<ImageJob | undefined> {
+    return this.db.transaction(async (trx) => {
+      const query = trx<JobRow>(TABLE).where({ id: jobId });
+      if (isPostgres(trx)) query.forUpdate();
+      const row = await query.first();
+      if (!row || (row.status !== "POLLING" && row.status !== "DOWNLOADING")) return undefined;
+      const leaseUntil = row.workLeaseUntil == null ? null : Number(row.workLeaseUntil);
+      if (leaseUntil != null && leaseUntil > this.now() && row.workOwner !== this.workerId) return undefined;
+      const workEpoch = Number(row.workEpoch ?? 0) + 1;
+      const workLeaseUntil = this.now() + this.processingLeaseMs;
+      const changed = await trx(TABLE).where({ id: jobId, status: row.status, workEpoch: row.workEpoch ?? 0 }).update({ workOwner: this.workerId, workLeaseUntil, workEpoch, updatedAt: this.now() });
+      if (changed !== 1) return undefined;
+      return this.toJob({ ...row, workOwner: this.workerId, workLeaseUntil, workEpoch });
+    });
+  }
+
+  private workQuery(db: Knex | Knex.Transaction, job: ImageJob, status: "POLLING" | "DOWNLOADING") {
+    return db(TABLE).where({ id: job.id, status, workOwner: this.workerId, workEpoch: job.workEpoch });
   }
 
   private async provider(modelKey: string): Promise<PersistentImageTaskProvider> {
@@ -512,7 +565,7 @@ export class ImageJobService {
   private toJob(row: JobRow): ImageJob {
     let payload: ImageJobPayload;
     try { payload = JSON.parse(row.payload) as ImageJobPayload; } catch { throw new ImageJobError("INVALID_INPUT", "持久化图片任务内容损坏"); }
-    return { ...row, id: Number(row.id), projectId: Number(row.projectId), pollAttempts: Number(row.pollAttempts), queryFailures: Number(row.queryFailures), downloadFailures: Number(row.downloadFailures), nextPollAt: row.nextPollAt == null ? null : Number(row.nextPollAt), createdAt: Number(row.createdAt), updatedAt: Number(row.updatedAt), executionMode: row.executionMode === "sync" || payload.executionMode === "sync" ? "sync" : "async", submissionOutcome: row.submissionOutcome ?? null, submissionOwner: row.submissionOwner ?? null, submissionLeaseUntil: row.submissionLeaseUntil == null ? null : Number(row.submissionLeaseUntil), payload };
+    return { ...row, id: Number(row.id), projectId: Number(row.projectId), pollAttempts: Number(row.pollAttempts), queryFailures: Number(row.queryFailures), downloadFailures: Number(row.downloadFailures), nextPollAt: row.nextPollAt == null ? null : Number(row.nextPollAt), createdAt: Number(row.createdAt), updatedAt: Number(row.updatedAt), executionMode: row.executionMode === "sync" || payload.executionMode === "sync" ? "sync" : "async", submissionOutcome: row.submissionOutcome ?? null, submissionOwner: row.submissionOwner ?? null, submissionLeaseUntil: row.submissionLeaseUntil == null ? null : Number(row.submissionLeaseUntil), workOwner: row.workOwner ?? null, workLeaseUntil: row.workLeaseUntil == null ? null : Number(row.workLeaseUntil), workEpoch: Number(row.workEpoch ?? 0), payload };
   }
 
   private assertRequest(input: ImageJobRequest): void {

@@ -5,6 +5,7 @@ import { textModelOutputLimit } from "../src/lib/textModelOutputLimit";
 test("official DeepSeek output capability is independent of the run or context window", () => {
   assert.equal(textModelOutputLimit({ modelName: "deepseek-v4-pro", baseUrl: "https://api.deepseek.com", configuredMaxOutputTokens: 0 }), 384000);
   assert.equal(textModelOutputLimit({ modelName: "deepseek-v4-flash", baseUrl: "https://api.deepseek.com/v1" }), 384000);
+  assert.equal(textModelOutputLimit({ modelName: "deepseek-flash", baseUrl: "https://api.deepseek.com/v1" }), 384000);
   assert.equal(textModelOutputLimit({ modelName: "deepseek-v4-pro", baseUrl: "https://api.deepseek.com", configuredMaxOutputTokens: 8192 }), 8192);
   assert.equal(textModelOutputLimit({ modelName: "deepseek-v4-pro", baseUrl: "https://api.deepseek.com", declaredMaxOutputTokens: 1000000 }), 384000);
 });

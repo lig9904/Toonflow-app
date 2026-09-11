@@ -20,6 +20,7 @@ interface TextModel {
   modelName: string;
   type: "text";
   think: boolean;
+  maxOutputTokens?: number;
 }
 
 interface ImageModel {
@@ -127,11 +128,11 @@ declare const exports: {
 
 const vendor: VendorConfig = {
   id: "deepseek",
-  version: "2.1",
+  version: "2.2",
   author: "Toonflow",
   name: "DeepSeek",
   description:
-    "DeepSeek 官方接口适配，支持 V4 系列模型与思考模式（思维链输出）。\n\n[前往平台](https://platform.deepseek.com/)",
+    "DeepSeek 官方接口适配，支持 V4.1 Flash 模型与思考模式（思维链输出）。\n\n[前往平台](https://platform.deepseek.com/)",
   icon: "",
   inputs: [
     { key: "apiKey", label: "API密钥", type: "password", required: true },
@@ -142,8 +143,7 @@ const vendor: VendorConfig = {
     baseUrl: "https://api.deepseek.com/v1",
   },
   models: [
-    { name: "DeepSeek V4 Pro", modelName: "deepseek-v4-pro", type: "text", think: true },
-    { name: "DeepSeek V4 Flash", modelName: "deepseek-v4-flash", type: "text", think: true },
+    { name: "DeepSeek V4.1 Flash", modelName: "deepseek-flash", type: "text", think: true, maxOutputTokens: 384000 },
   ],
 };
 
@@ -155,11 +155,10 @@ const textRequest = (model: TextModel, think: boolean, thinkLevel: 0 | 1 | 2 | 3
   if (!vendor.inputValues.apiKey) throw new Error("缺少API Key");
   const apiKey = vendor.inputValues.apiKey.replace(/^Bearer\s+/i, "");
 
-  // DeepSeek 思考强度仅支持 high / max（low、medium 会被映射为 high，xhigh 会被映射为 max）
-  // thinkLevel: 0/1/2 → high, 3 → max
-  const effortMap: Record<0 | 1 | 2 | 3, "high" | "max"> = {
+  // V4.1 支持 low / high / max。默认保持 high，轻度/深度/极限对应 low/high/max。
+  const effortMap: Record<0 | 1 | 2 | 3, "low" | "high" | "max"> = {
     0: "high",
-    1: "high",
+    1: "low",
     2: "high",
     3: "max",
   };
@@ -202,7 +201,7 @@ const ttsRequest = async (config: TTSConfig, model: TTSModel): Promise<string> =
 };
 
 const checkForUpdates = async (): Promise<{ hasUpdate: boolean; latestVersion: string; notice: string }> => {
-  return { hasUpdate: false, latestVersion: "2.0", notice: "" };
+  return { hasUpdate: false, latestVersion: "2.2", notice: "" };
 };
 
 const updateVendor = async (): Promise<string> => {

@@ -40,3 +40,27 @@ test("query receives the task ID object and timeout is bounded", async () => {
   assert.deepEqual(request, { taskId: "task-context" });
   await assert.rejects(good({ timeoutMs: 5, queryImageTask: async () => new Promise(() => {}) }).query("task"), PersistentImageAdapterError);
 });
+
+test("sync image adapter returns URL or validated base64 without inventing a task ID", async () => {
+  let calls = 0;
+  const syncUrl = createPersistentImageTaskProvider({
+    vendorId: "agentsYun", modelName: "sync-image", endpoint: "https://agent.example", model, enabled: true,
+    synchronousImageRequestVersion: 1,
+    synchronousImageRequest: async () => { calls += 1; return { outputUrl: "https://cdn.example/image.png" }; },
+  });
+  assert.equal(syncUrl.executionMode, "sync");
+  assert.deepEqual(await syncUrl.submit({ prompt: "scene" }), { outputUrl: "https://cdn.example/image.png" });
+  await assert.rejects(syncUrl.query("never-created"), /禁止 query/);
+  const syncBase64 = createPersistentImageTaskProvider({
+    vendorId: "agentsYun", modelName: "sync-image", endpoint: "https://agent.example", model, enabled: true,
+    synchronousImageRequestVersion: 1,
+    synchronousImageRequest: async () => ({ outputBase64: "iVBORw0KGgo=", mimeType: "image/png" }),
+  });
+  assert.deepEqual(await syncBase64.submit({}), { outputBase64: "iVBORw0KGgo=", mimeType: "image/png" });
+  assert.equal(calls, 1);
+  await assert.rejects(createPersistentImageTaskProvider({
+    vendorId: "agentsYun", modelName: "sync-image", endpoint: "https://agent.example", model, enabled: true,
+    synchronousImageRequestVersion: 1,
+    synchronousImageRequest: async () => ({ outputBase64: "bad!", mimeType: "image/png" }),
+  }).submit({}), /base64/);
+});

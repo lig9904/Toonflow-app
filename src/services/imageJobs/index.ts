@@ -1,6 +1,6 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { Knex } from "knex";
-import type { PersistentImageTaskProvider } from "../../lib/persistentImageAdapter";
+import type { PersistentImageTaskProvider, PersistentImageResult, ImageSubmissionOutcome } from "../../lib/persistentImageAdapter";
 
 export type ImageJobStatus = "RESERVED" | "SUBMITTING" | "POLLING" | "DOWNLOADING" | "SUCCEEDED" | "FAILED" | "RECONCILIATION_REQUIRED";
 
@@ -11,6 +11,7 @@ export interface ImageJobPayload {
   outputPath: string;
   config: unknown;
   context?: unknown;
+  executionMode?: "sync" | "async";
 }
 
 export interface ImageJobRequest {
@@ -40,6 +41,10 @@ export interface ImageJob {
   lastError: string | null;
   createdAt: number;
   updatedAt: number;
+  executionMode: "sync" | "async";
+  submissionOutcome: "submitted" | "not_submitted" | "rejected" | "unknown" | null;
+  submissionOwner: string | null;
+  submissionLeaseUntil: number | null;
 }
 
 export interface ImageJobDependencies {
@@ -82,9 +87,16 @@ interface JobRow {
   lastError: string | null;
   createdAt: number | string;
   updatedAt: number | string;
+  executionMode: "sync" | "async" | null;
+  submissionOwner: string | null;
+  submissionLeaseUntil: number | string | null;
+  submissionOutcome: "submitted" | "not_submitted" | "rejected" | "unknown" | null;
 }
 
 const TABLE = "ext_image_jobs";
+// Keep a small recovery margin beyond the adapter's 300s request deadline so
+// another worker cannot reconcile a still-finishing request at the boundary.
+const SYNC_SUBMISSION_LEASE_MS = 305_000;
 
 export async function ensureImageJobsSchema(db: Knex): Promise<void> {
   if (isPostgres(db)) {
@@ -107,11 +119,19 @@ export async function ensureImageJobsSchema(db: Knex): Promise<void> {
         "lastError" text,
         "createdAt" bigint NOT NULL,
         "updatedAt" bigint NOT NULL,
+        "executionMode" text NOT NULL DEFAULT 'async',
+        "submissionOwner" text,
+        "submissionLeaseUntil" bigint,
+        "submissionOutcome" text,
         UNIQUE ("projectId", "idempotencyKey")
       )
     `);
     await db.raw(`CREATE INDEX IF NOT EXISTS "ext_image_jobs_status_poll_idx" ON "${TABLE}" (status, "nextPollAt")`);
     await db.raw(`CREATE INDEX IF NOT EXISTS "ext_image_jobs_project_idx" ON "${TABLE}" ("projectId", "createdAt")`);
+    await db.raw(`ALTER TABLE "${TABLE}" ADD COLUMN IF NOT EXISTS "executionMode" text NOT NULL DEFAULT 'async'`);
+    await db.raw(`ALTER TABLE "${TABLE}" ADD COLUMN IF NOT EXISTS "submissionOwner" text`);
+    await db.raw(`ALTER TABLE "${TABLE}" ADD COLUMN IF NOT EXISTS "submissionLeaseUntil" bigint`);
+    await db.raw(`ALTER TABLE "${TABLE}" ADD COLUMN IF NOT EXISTS "submissionOutcome" text`);
     return;
   }
   if (!(await db.schema.hasTable(TABLE))) {
@@ -133,10 +153,19 @@ export async function ensureImageJobsSchema(db: Knex): Promise<void> {
       table.text("lastError");
       table.integer("createdAt").notNullable();
       table.integer("updatedAt").notNullable();
+      table.text("executionMode").notNullable().defaultTo("async");
+      table.text("submissionOwner");
+      table.integer("submissionLeaseUntil");
+      table.text("submissionOutcome");
       table.index(["status", "nextPollAt"]);
       table.index(["projectId", "createdAt"]);
       table.unique(["projectId", "idempotencyKey"]);
     });
+  } else {
+    if (!(await db.schema.hasColumn(TABLE, "executionMode"))) await db.schema.alterTable(TABLE, (table) => table.text("executionMode").notNullable().defaultTo("async"));
+    if (!(await db.schema.hasColumn(TABLE, "submissionOwner"))) await db.schema.alterTable(TABLE, (table) => table.text("submissionOwner"));
+    if (!(await db.schema.hasColumn(TABLE, "submissionLeaseUntil"))) await db.schema.alterTable(TABLE, (table) => table.integer("submissionLeaseUntil"));
+    if (!(await db.schema.hasColumn(TABLE, "submissionOutcome"))) await db.schema.alterTable(TABLE, (table) => table.text("submissionOutcome"));
   }
 }
 
@@ -164,6 +193,7 @@ export class ImageJobService {
   private readonly maxDownloadFailures: number;
   private readonly initialPollDelayMs: number;
   private readonly submissionLeaseMs: number;
+  private readonly workerId: string;
   private readonly scheduleEnabled: boolean;
   private readonly active = new Map<number, Promise<ImageJob>>();
   private readonly localSubmitting = new Set<number>();
@@ -190,6 +220,7 @@ export class ImageJobService {
     this.maxDownloadFailures = this.dependencies.maxDownloadFailures ?? 5;
     this.initialPollDelayMs = this.dependencies.initialPollDelayMs ?? 5_000;
     this.submissionLeaseMs = this.dependencies.submissionLeaseMs ?? 60_000;
+    this.workerId = randomUUID();
     this.scheduleEnabled = this.dependencies.schedule ?? true;
     if (!Number.isInteger(this.maxConcurrent) || this.maxConcurrent < 1 || this.maxConcurrent > 20) throw new ImageJobError("INVALID_INPUT", "maxConcurrent 必须在 1 到 20 之间");
   }
@@ -200,7 +231,12 @@ export class ImageJobService {
     const input: ImageJobRequest = typeof inputOrKey === "string" ? { ...request!, idempotencyKey: inputOrKey } : inputOrKey;
     this.assertRequest(input);
     const provider = await this.provider(input.modelKey);
-    const payload: ImageJobPayload = { projectId: input.projectId, modelKey: input.modelKey, providerFingerprint: provider.fingerprint, outputPath: input.outputPath, config: input.config, context: input.context };
+    const executionMode = provider.executionMode === "sync" ? "sync" : "async";
+    // Keep legacy async payload bytes/hash unchanged. The mode marker is only
+    // persisted for sync providers, where it is required to avoid a fake
+    // task-id/query lifecycle.
+    const basePayload: ImageJobPayload = { projectId: input.projectId, modelKey: input.modelKey, providerFingerprint: provider.fingerprint, outputPath: input.outputPath, config: input.config, context: input.context };
+    const payload: ImageJobPayload = executionMode === "sync" ? { ...basePayload, executionMode: "sync" } : basePayload;
     const payloadHash = hashImageJobRequest(payload);
     return this.db.transaction(async (trx) => {
       const existing = await trx<JobRow>(TABLE).where({ projectId: input.projectId, idempotencyKey: input.idempotencyKey }).first();
@@ -210,7 +246,7 @@ export class ImageJobService {
       }
       const now = this.now();
       let id: number | null;
-      id = await insertId(trx, { idempotencyKey: input.idempotencyKey, payloadHash, modelKey: input.modelKey, projectId: input.projectId, outputPath: input.outputPath, payload: JSON.stringify(payload), status: "RESERVED", createdAt: now, updatedAt: now });
+      id = await insertId(trx, { idempotencyKey: input.idempotencyKey, payloadHash, modelKey: input.modelKey, projectId: input.projectId, outputPath: input.outputPath, payload: JSON.stringify(payload), status: "RESERVED", executionMode, submissionOwner: null, submissionLeaseUntil: null, submissionOutcome: null, createdAt: now, updatedAt: now });
       if (id === null) {
         const raced = await trx<JobRow>(TABLE).where({ projectId: input.projectId, idempotencyKey: input.idempotencyKey }).first();
         if (!raced) throw new ImageJobError("CONFLICT", "幂等图片任务在创建时消失");
@@ -242,8 +278,11 @@ export class ImageJobService {
       const stranded = await trx<JobRow>(TABLE).where({ status: "SUBMITTING" }).whereNull("upstreamTaskId");
       for (const row of stranded) {
         if (this.localSubmitting.has(Number(row.id))) continue;
-        if (Number(row.updatedAt) + this.submissionLeaseMs > now) continue;
-        await this.markReconciliation(trx, row, "提交前进程中断，未记录上游任务 ID");
+        const leaseUntil = row.submissionLeaseUntil == null
+          ? Number(row.updatedAt) + (row.executionMode === "sync" ? SYNC_SUBMISSION_LEASE_MS : this.submissionLeaseMs)
+          : Number(row.submissionLeaseUntil);
+        if (leaseUntil > now) continue;
+        await this.markReconciliation(trx, row, row.executionMode === "sync" ? "同步图片请求租约已到期，结果未知，禁止重复提交" : "提交前进程中断，未记录上游任务 ID", { status: "SUBMITTING", owner: row.submissionOwner, submissionLeaseUntil: row.submissionLeaseUntil == null ? null : Number(row.submissionLeaseUntil), upstreamTaskId: row.upstreamTaskId });
       }
     });
     const rows = await this.db<JobRow>(TABLE).whereIn("status", ["POLLING", "DOWNLOADING"]);
@@ -288,24 +327,50 @@ export class ImageJobService {
     let job = await this.get(jobId);
     if (["SUCCEEDED", "FAILED", "RECONCILIATION_REQUIRED"].includes(job.status)) return job;
     if (!job.upstreamTaskId) {
+      // A sync provider has no upstream task ID by design. Once its result is
+      // durably stored, restart/retry must continue the download only.
+      if ((job.executionMode === "sync" || job.payload.executionMode === "sync") && job.status === "DOWNLOADING" && job.resultUrl) return this.download(job, job.resultUrl);
+      if (job.status === "SUBMITTING") {
+        const leaseUntil = job.submissionLeaseUntil ?? job.updatedAt + (job.executionMode === "sync" ? SYNC_SUBMISSION_LEASE_MS : this.submissionLeaseMs);
+        if (leaseUntil > this.now()) return job;
+        await this.db.transaction((trx) => this.markReconciliation(trx, rowFromJob(job), job.executionMode === "sync" ? "同步图片请求租约已到期，结果未知，禁止重复提交" : "提交前进程中断，未记录上游任务 ID", { status: "SUBMITTING", owner: job.submissionOwner, submissionLeaseUntil: job.submissionLeaseUntil, upstreamTaskId: job.upstreamTaskId }));
+        return this.get(jobId);
+      }
       if (!maySubmit || job.status !== "RESERVED") {
         await this.db.transaction((trx) => this.markReconciliation(trx, rowFromJob(job), "没有可恢复的上游图片任务 ID"));
         return this.get(jobId);
       }
-      const claimed = await this.db(TABLE).where({ id: job.id, status: "RESERVED" }).update({ status: "SUBMITTING", updatedAt: this.now(), lastError: null });
+      const executionMode = job.executionMode === "sync" || job.payload.executionMode === "sync" ? "sync" : "async";
+      const now = this.now();
+      const claimed = await this.db(TABLE).where({ id: job.id, status: "RESERVED" }).update({ status: "SUBMITTING", executionMode, submissionOwner: this.workerId, submissionLeaseUntil: now + (executionMode === "sync" ? SYNC_SUBMISSION_LEASE_MS : this.submissionLeaseMs), updatedAt: now, lastError: null });
       if (claimed !== 1) return this.get(jobId);
+      job = await this.get(job.id);
       this.localSubmitting.add(job.id);
       try {
         const provider = await this.provider(job.modelKey);
         if (provider.fingerprint !== job.payload.providerFingerprint) {
-          await this.db.transaction((trx) => this.markReconciliation(trx, rowFromJob(job), "当前供应商端点或模型绑定已变化，不能提交旧保留任务"));
+          await this.db.transaction((trx) => this.markReconciliation(trx, rowFromJob(job), "当前供应商端点或模型绑定已变化，不能提交旧保留任务", { status: "SUBMITTING", owner: this.workerId, submissionLeaseUntil: job.submissionLeaseUntil, upstreamTaskId: job.upstreamTaskId, onlyWithoutUpstream: true }));
           return this.get(jobId);
         }
         const submitted = await provider.submit(job.payload.config);
-        if (!submitted?.taskId) throw new Error("上游未返回任务 ID");
-        await this.db(TABLE).where({ id: job.id, status: "SUBMITTING" }).update({ upstreamTaskId: submitted.taskId, status: "POLLING", payload: JSON.stringify(compactImagePayload(job.payload)), nextPollAt: this.now(), updatedAt: this.now(), lastError: null });
+        if (provider.executionMode === "sync") {
+          const result = normalizeSyncResult(submitted);
+          const resultUrl = result.outputUrl ?? `data:${result.mimeType};base64,${result.outputBase64}`;
+          const changed = await this.db(TABLE).where({ id: job.id, status: "SUBMITTING", submissionOwner: this.workerId }).whereNull("upstreamTaskId").update({ status: "DOWNLOADING", resultUrl, executionMode: "sync", submissionOutcome: "submitted", submissionLeaseUntil: null, submissionOwner: null, payload: JSON.stringify(compactImagePayload(job.payload)), nextPollAt: this.now(), updatedAt: this.now(), lastError: null });
+          if (changed !== 1) throw new ImageJobError("CONFLICT", "同步图片结果无法安全写入当前任务状态");
+        } else {
+          const asyncResult = submitted as { taskId?: unknown };
+          if (typeof asyncResult?.taskId !== "string" || !asyncResult.taskId.trim()) throw new Error("上游未返回任务 ID");
+          const changed = await this.db(TABLE).where({ id: job.id, status: "SUBMITTING", submissionOwner: this.workerId }).whereNull("upstreamTaskId").update({ upstreamTaskId: asyncResult.taskId.trim(), status: "POLLING", executionMode: "async", submissionOutcome: "submitted", submissionLeaseUntil: null, submissionOwner: null, payload: JSON.stringify(compactImagePayload(job.payload)), nextPollAt: this.now(), updatedAt: this.now(), lastError: null });
+          if (changed !== 1) throw new ImageJobError("CONFLICT", "图片结果无法安全写入当前任务状态");
+        }
       } catch (error) {
-        await this.db.transaction((trx) => this.markReconciliation(trx, rowFromJob(job), `提交结果不确定：${errorMessage(error)}`));
+        const outcome = submissionOutcome(error);
+        if (outcome === "not_submitted" || outcome === "rejected") await this.failUnsubmitted(job, `${outcome === "rejected" ? "上游拒绝图片任务" : "图片任务未提交到上游"}：${errorMessage(error)}`, outcome);
+        else await this.db.transaction(async (trx) => {
+          const current = await trx<JobRow>(TABLE).where({ id: job.id }).forUpdate().first();
+          if (current?.status === "SUBMITTING" && current.submissionOwner === this.workerId && !current.upstreamTaskId) await this.markReconciliation(trx, current, `提交结果不确定：${errorMessage(error)}`, { status: "SUBMITTING", owner: this.workerId, submissionLeaseUntil: current.submissionLeaseUntil == null ? null : Number(current.submissionLeaseUntil), upstreamTaskId: current.upstreamTaskId, onlyWithoutUpstream: true });
+        });
         return this.get(jobId);
       } finally {
         this.localSubmitting.delete(job.id);
@@ -340,7 +405,7 @@ export class ImageJobService {
       await this.db.transaction(async (trx) => {
         const completed: ImageJob = { ...job, status: "SUCCEEDED", resultUrl: url, updatedAt: this.now(), lastError: null, nextPollAt: null };
         if (this.dependencies.onSaved) await this.dependencies.onSaved(completed, trx);
-        await trx(TABLE).where({ id: job.id, status: "DOWNLOADING" }).update({ status: "SUCCEEDED", payload: JSON.stringify(compactImagePayload(job.payload)), nextPollAt: null, updatedAt: this.now(), lastError: null });
+        await trx(TABLE).where({ id: job.id, status: "DOWNLOADING" }).update({ status: "SUCCEEDED", resultUrl: isInlineImageData(url) ? null : url, payload: JSON.stringify(compactImagePayload(job.payload)), nextPollAt: null, updatedAt: this.now(), lastError: null });
       });
     } catch (error) {
       if (this.dependencies.onSaved && isPermanentSaveConflict(error)) {
@@ -380,19 +445,38 @@ export class ImageJobService {
     return this.get(job.id);
   }
 
+  private async failUnsubmitted(job: ImageJob, message: string, outcome: ImageSubmissionOutcome): Promise<ImageJob> {
+    await this.db.transaction(async (trx) => {
+      let query = trx(TABLE).where({ id: job.id, status: "SUBMITTING", submissionOwner: this.workerId }).whereNull("upstreamTaskId");
+      query = job.submissionLeaseUntil == null ? query.whereNull("submissionLeaseUntil") : query.where({ submissionLeaseUntil: job.submissionLeaseUntil });
+      await query.update({ status: "FAILED", submissionOutcome: outcome, submissionLeaseUntil: null, submissionOwner: null, payload: JSON.stringify(compactImagePayload(job.payload)), nextPollAt: null, lastError: message, updatedAt: this.now() });
+    });
+    return this.get(job.id);
+  }
+
   private async fail(job: ImageJob, message: string): Promise<ImageJob> {
     await this.db.transaction((trx) => trx(TABLE).where({ id: job.id }).update({ status: "FAILED", payload: JSON.stringify(compactImagePayload(job.payload)), nextPollAt: null, lastError: message, updatedAt: this.now() }));
     return this.get(job.id);
   }
 
-  private async markReconciliation(trx: Knex.Transaction, row: JobRow, message: string): Promise<void> {
-    await trx(TABLE).where({ id: row.id }).update({ status: "RECONCILIATION_REQUIRED", payload: compactPayloadText(row.payload), nextPollAt: null, lastError: message, updatedAt: this.now() });
+  private async markReconciliation(trx: Knex.Transaction, row: JobRow, message: string, guard: { status?: ImageJobStatus; owner?: string | null; submissionLeaseUntil?: number | null; upstreamTaskId?: string | null; onlyWithoutUpstream?: boolean } = {}): Promise<void> {
+    let query = trx(TABLE).where({ id: row.id });
+    query = query.where({ status: guard.status ?? row.status });
+    if (guard.owner === null) query = query.whereNull("submissionOwner");
+    else if (guard.owner !== undefined) query = query.where({ submissionOwner: guard.owner });
+    if (guard.onlyWithoutUpstream || !row.upstreamTaskId) query = query.whereNull("upstreamTaskId");
+    if (guard.submissionLeaseUntil === null) query = query.whereNull("submissionLeaseUntil");
+    else if (guard.submissionLeaseUntil !== undefined) query = query.where({ submissionLeaseUntil: guard.submissionLeaseUntil });
+    if (guard.upstreamTaskId === null) query = query.whereNull("upstreamTaskId");
+    else if (guard.upstreamTaskId !== undefined) query = query.where({ upstreamTaskId: guard.upstreamTaskId });
+    const hasAcceptedResult = Boolean(row.upstreamTaskId || row.resultUrl || row.submissionOutcome === "submitted");
+    await query.update({ status: "RECONCILIATION_REQUIRED", submissionOutcome: hasAcceptedResult ? "submitted" : "unknown", submissionLeaseUntil: null, submissionOwner: null, payload: compactPayloadText(row.payload), nextPollAt: null, lastError: message, updatedAt: this.now() });
   }
 
   private async provider(modelKey: string): Promise<PersistentImageTaskProvider> {
     try {
       const provider = await this.dependencies.providerFor(modelKey);
-      if (!provider || typeof provider.fingerprint !== "string" || !provider.fingerprint.trim() || typeof provider.submit !== "function" || typeof provider.query !== "function") throw new Error("图片 provider 契约不完整");
+      if (!provider || typeof provider.fingerprint !== "string" || !provider.fingerprint.trim() || typeof provider.submit !== "function" || (provider.executionMode !== "sync" && typeof provider.query !== "function")) throw new Error("图片 provider 契约不完整");
       return provider;
     } catch (error) {
       if (error instanceof ImageJobError) throw error;
@@ -428,7 +512,7 @@ export class ImageJobService {
   private toJob(row: JobRow): ImageJob {
     let payload: ImageJobPayload;
     try { payload = JSON.parse(row.payload) as ImageJobPayload; } catch { throw new ImageJobError("INVALID_INPUT", "持久化图片任务内容损坏"); }
-    return { ...row, id: Number(row.id), projectId: Number(row.projectId), pollAttempts: Number(row.pollAttempts), queryFailures: Number(row.queryFailures), downloadFailures: Number(row.downloadFailures), nextPollAt: row.nextPollAt == null ? null : Number(row.nextPollAt), createdAt: Number(row.createdAt), updatedAt: Number(row.updatedAt), payload };
+    return { ...row, id: Number(row.id), projectId: Number(row.projectId), pollAttempts: Number(row.pollAttempts), queryFailures: Number(row.queryFailures), downloadFailures: Number(row.downloadFailures), nextPollAt: row.nextPollAt == null ? null : Number(row.nextPollAt), createdAt: Number(row.createdAt), updatedAt: Number(row.updatedAt), executionMode: row.executionMode === "sync" || payload.executionMode === "sync" ? "sync" : "async", submissionOutcome: row.submissionOutcome ?? null, submissionOwner: row.submissionOwner ?? null, submissionLeaseUntil: row.submissionLeaseUntil == null ? null : Number(row.submissionLeaseUntil), payload };
   }
 
   private assertRequest(input: ImageJobRequest): void {
@@ -465,6 +549,20 @@ function stableJson(value: unknown): string {
   return JSON.stringify(value);
 }
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }
+function submissionOutcome(error: unknown): ImageSubmissionOutcome | undefined {
+  const value = error && typeof error === "object" ? (error as { submissionOutcome?: unknown }).submissionOutcome : undefined;
+  return value === "not_submitted" || value === "rejected" ? value : undefined;
+}
+function normalizeSyncResult(value: unknown): PersistentImageResult {
+  if (!value || typeof value !== "object") throw new ImageJobError("INVALID_INPUT", "同步图片请求未返回结果");
+  const result = value as PersistentImageResult;
+  const hasUrl = typeof result.outputUrl === "string" && result.outputUrl.trim().length > 0;
+  const hasBase64 = typeof result.outputBase64 === "string" && result.outputBase64.length > 0 && (result.mimeType === "image/png" || result.mimeType === "image/jpeg");
+  if (hasUrl === hasBase64) throw new ImageJobError("INVALID_INPUT", "同步图片请求必须返回合法的 URL 或 base64 结果");
+  if (hasUrl) return { outputUrl: result.outputUrl!.trim() };
+  return { outputBase64: result.outputBase64, mimeType: result.mimeType };
+}
+function isInlineImageData(value: string): boolean { return /^data:image\/(?:png|jpeg);base64,/i.test(value); }
 function isPermanentSaveConflict(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
   const value = error as { code?: unknown; status?: unknown };

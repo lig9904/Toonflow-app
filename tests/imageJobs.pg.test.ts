@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import knex, { type Knex } from "knex";
 import { createPostgresFixture } from "../src/lib/postgresTest";
-import { ensureImageJobsSchema, ImageJobError, ImageJobService, type ImageJob, type ImageJobDependencies } from "../src/services/imageJobs";
-import type { PersistentImageTaskProvider } from "../src/lib/persistentImageAdapter";
+import { ensureImageJobsSchema, hashImageJobRequest, ImageJobError, ImageJobService, type ImageJob, type ImageJobDependencies } from "../src/services/imageJobs";
+import type { PersistentImageTaskProvider, PersistentAsyncImageTaskProvider } from "../src/lib/persistentImageAdapter";
 
 const options = { skip: !process.env.TOONFLOW_TEST_DATABASE_URL };
 
@@ -13,7 +13,7 @@ async function fixture() {
   return f;
 }
 
-function provider(state: { submits?: number; queries?: number; submit?: () => Promise<{ taskId: string }>; query?: (taskId: string) => Promise<{ status: "pending" | "succeeded" | "failed"; outputUrl?: string; error?: string }> } = {}): PersistentImageTaskProvider {
+function provider(state: { submits?: number; queries?: number; submit?: () => Promise<{ taskId: string }>; query?: (taskId: string) => Promise<{ status: "pending" | "succeeded" | "failed"; outputUrl?: string; error?: string }> } = {}): PersistentAsyncImageTaskProvider {
   return { fingerprint: "image-provider-v1", submit: async () => { state.submits = (state.submits ?? 0) + 1; return state.submit ? state.submit() : { taskId: `image-task-${state.submits}` }; }, query: async (taskId) => { state.queries = (state.queries ?? 0) + 1; return state.query ? state.query(taskId) : { status: "pending" }; } };
 }
 
@@ -43,6 +43,22 @@ test("image jobs reserve idempotently per project and compact references after r
     assert.equal("base64" in reference, false);
     assert.equal(typeof reference.contentHash, "string");
     assert.deepEqual(compacted.payload.context, { assetId: 10, version: 2 });
+  } finally { await f.destroy(); }
+});
+
+test("legacy async payload bytes and hash remain reusable after sync mode support", options, async () => {
+  const f = await fixture();
+  try {
+    const p = provider();
+    const input = request("legacy-payload-1");
+    const legacyPayload = { projectId: input.projectId, modelKey: input.modelKey, providerFingerprint: p.fingerprint, outputPath: input.outputPath, config: input.config, context: input.context };
+    const payloadHash = hashImageJobRequest(legacyPayload);
+    await f.db("ext_image_jobs").insert({ idempotencyKey: input.idempotencyKey, payloadHash, modelKey: input.modelKey, projectId: input.projectId, outputPath: input.outputPath, payload: JSON.stringify(legacyPayload), status: "RESERVED", createdAt: 1, updatedAt: 1 });
+    const jobs = service(f.db, p);
+    const reused = await jobs.reserve(input);
+    assert.equal(reused.reused, true);
+    assert.equal(reused.job.payload.executionMode, undefined);
+    assert.equal(reused.job.payloadHash, payloadHash);
   } finally { await f.destroy(); }
 });
 
@@ -126,6 +142,73 @@ test("unknown create result is reconciliation required and never resubmitted", o
     await restarted.resumeDueJobs();
     assert.equal(submits, 1);
     assert.equal((await restarted.get(reserved.job.id)).status, "RECONCILIATION_REQUIRED");
+  } finally { await f.destroy(); }
+});
+
+test("sync URL image completes once without an upstream task or query", options, async () => {
+  const f = await fixture();
+  try {
+    let submits = 0; let queries = 0; const downloads: string[] = [];
+    const p: PersistentImageTaskProvider = { executionMode: "sync", fingerprint: "sync-url", submit: async () => { submits += 1; return { outputUrl: "https://cdn.example/sync.png" }; }, query: async () => { queries += 1; throw new Error("sync provider must not query"); } };
+    const jobs = service(f.db, p, { download: async (url, output) => { downloads.push(`${url}:${output}`); } });
+    const reserved = await jobs.reserve({ ...request("sync-url-1"), modelKey: "agentsYun:sync" });
+    const done = await jobs.submitReserved(reserved.job.id);
+    assert.equal(done.executionMode, "sync"); assert.equal(done.status, "SUCCEEDED"); assert.equal(done.upstreamTaskId, null); assert.equal(done.submissionOutcome, "submitted");
+    assert.deepEqual(downloads, ["https://cdn.example/sync.png:/images/1/sync-url-1.jpg"]);
+    await jobs.submitReserved(reserved.job.id);
+    assert.equal(submits, 1); assert.equal(queries, 0);
+  } finally { await f.destroy(); }
+});
+
+test("sync base64 result is durably downloaded and cleared after binding", options, async () => {
+  const f = await fixture();
+  try {
+    const downloads: string[] = []; let saved = 0;
+    const p: PersistentImageTaskProvider = { executionMode: "sync", fingerprint: "sync-base64", submit: async () => ({ outputBase64: "iVBORw0KGgo=", mimeType: "image/png" }), query: async () => { throw new Error("must not query"); } };
+    const jobs = service(f.db, p, { download: async (url, output) => { downloads.push(`${url}:${output}`); }, onSaved: async () => { saved += 1; } });
+    const reserved = await jobs.reserve({ ...request("sync-base64-1"), modelKey: "agentsYun:sync" });
+    const done = await jobs.submitReserved(reserved.job.id);
+    assert.equal(done.status, "SUCCEEDED"); assert.equal(done.resultUrl, null); assert.equal(saved, 1); assert.equal(downloads[0], "data:image/png;base64,iVBORw0KGgo=:/images/1/sync-base64-1.jpg");
+  } finally { await f.destroy(); }
+});
+
+test("sync request uses a 300 second lease and restart never repeats an unknown POST", options, async () => {
+  const f = await fixture();
+  try {
+    let now = 1000; let submits = 0; let release!: () => void;
+    const waiting = new Promise<{ outputUrl: string }>((resolve) => { release = () => resolve({ outputUrl: "https://cdn.example/late.png" }); });
+    const p: PersistentImageTaskProvider = { executionMode: "sync", fingerprint: "sync-long", submit: async () => { submits += 1; return waiting; }, query: async () => { throw new Error("must not query"); } };
+    const first = new ImageJobService(f.db, { providerFor: async () => p, download: async () => undefined, schedule: false, now: () => now });
+    const reserved = await first.reserve({ ...request("sync-long-1"), modelKey: "agentsYun:sync" });
+    const submitting = first.submitReserved(reserved.job.id);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const secondDb = knex({ client: "pg", connection: process.env.TOONFLOW_TEST_DATABASE_URL!, searchPath: [f.schema], pool: { min: 0, max: 2 } });
+    const second = new ImageJobService(secondDb, { providerFor: async () => p, download: async () => undefined, schedule: false, now: () => now });
+    try {
+      await second.resumeDueJobs();
+      assert.equal((await second.get(reserved.job.id)).status, "SUBMITTING");
+      assert.equal((await second.continueKnown(reserved.job.id)).status, "SUBMITTING");
+      assert.equal((await second.submitReserved(reserved.job.id)).status, "SUBMITTING");
+      now += 305_001;
+      await second.resumeDueJobs();
+      assert.equal((await second.get(reserved.job.id)).status, "RECONCILIATION_REQUIRED");
+      release(); await submitting;
+      assert.equal(submits, 1);
+    } finally { second.stop(); await secondDb.destroy(); first.stop(); }
+  } finally { await f.destroy(); }
+});
+
+test("sync download retry does not submit a second image request", options, async () => {
+  const f = await fixture();
+  try {
+    let submits = 0; let downloads = 0; let now = 1000;
+    const p: PersistentImageTaskProvider = { executionMode: "sync", fingerprint: "sync-download", submit: async () => { submits += 1; return { outputUrl: "https://cdn.example/retry.png" }; }, query: async () => { throw new Error("must not query"); } };
+    const jobs = service(f.db, p, { now: () => now, download: async () => { downloads += 1; if (downloads === 1) throw new Error("temporary disk error"); } });
+    const reserved = await jobs.reserve({ ...request("sync-download-1"), modelKey: "agentsYun:sync" });
+    await jobs.submitReserved(reserved.job.id);
+    now += 10_000;
+    await jobs.resumeDueJobs();
+    assert.equal(submits, 1); assert.equal(downloads, 2); assert.equal((await jobs.get(reserved.job.id)).status, "SUCCEEDED");
   } finally { await f.destroy(); }
 });
 

@@ -224,6 +224,8 @@ export async function getPersistentImageTaskProvider(key: `${string}:${string}`)
     model: selectedModel,
     enabled,
     persistentImageTaskVersion: running.persistentImageTaskVersion,
+    synchronousImageRequestVersion: running.synchronousImageRequestVersion,
+    synchronousImageRequest: running.synchronousImageRequest,
     runtime: running,
     submitImageTask: running.submitImageTask,
     queryImageTask: running.queryImageTask,

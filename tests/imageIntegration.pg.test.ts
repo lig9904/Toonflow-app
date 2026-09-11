@@ -5,7 +5,7 @@ import { createPostgresFixture, migratePostgresFixture } from "../src/lib/postgr
 import { insertRowsReturningIds } from "../src/lib/insertRows";
 import { ensureProductionStateSchema, ProductionStateService } from "../src/services/productionState";
 import { createImageGenerationService, ensureProductionImageJobSchema, resolveImageArtifactProject, type ImageGenerationService } from "../src/services/imageJobs/runtime";
-import type { PersistentImageTaskProvider } from "../src/lib/persistentImageAdapter";
+import type { PersistentAsyncImageTaskProvider } from "../src/lib/persistentImageAdapter";
 import { generateRootAssetImage } from "../src/services/rootAssetImages";
 import { prepareDerivedAssetImages, prepareStoryboardImages, type ProductionImageRuntime } from "../src/services/productionImages";
 import { generateFlowImage } from "../src/services/productionEditImages";
@@ -67,7 +67,7 @@ async function fixture() {
   return { ...f, projectId, otherProjectId, scriptId };
 }
 
-function provider(log: { submits: unknown[]; queries: string[] }, status: "succeeded" | "pending" = "succeeded"): PersistentImageTaskProvider {
+function provider(log: { submits: unknown[]; queries: string[] }, status: "succeeded" | "pending" = "succeeded"): PersistentAsyncImageTaskProvider {
   return {
     fingerprint: "seedream-relay-v1",
     submit: async (config) => { log.submits.push(config); return { taskId: `upstream-${log.submits.length}` }; },
@@ -75,7 +75,7 @@ function provider(log: { submits: unknown[]; queries: string[] }, status: "succe
   };
 }
 
-function jobs(db: Knex, p: PersistentImageTaskProvider, downloads: string[] = []): ImageGenerationService {
+function jobs(db: Knex, p: PersistentAsyncImageTaskProvider, downloads: string[] = []): ImageGenerationService {
   return createImageGenerationService({ db, providerFor: async () => p, download: async (url, path) => { downloads.push(`${url}|${path}`); }, uuid: () => "fixed-output", pollMs: 10 });
 }
 
@@ -193,7 +193,7 @@ test("restart resumes by query only and a late asset result cannot replace a hum
     let upstream: "pending" | "succeeded" = "pending";
     let submits = 0;
     let queries = 0;
-    const p: PersistentImageTaskProvider = {
+    const p: PersistentAsyncImageTaskProvider = {
       fingerprint: "seedream-relay-v1",
       submit: async () => { submits += 1; return { taskId: "restart-task" }; },
       query: async () => { queries += 1; return upstream === "pending" ? { status: "pending" } : { status: "succeeded", outputUrl: "https://relay.invalid/restart.jpg" }; },
@@ -227,7 +227,7 @@ test("one failed upstream item does not discard another saved batch candidate", 
   try {
     const firstId = await asset(f, { name: "first" });
     const secondId = await asset(f, { name: "second" });
-    const p: PersistentImageTaskProvider = {
+    const p: PersistentAsyncImageTaskProvider = {
       fingerprint: "seedream-relay-v1",
       submit: async (config) => ({ taskId: String((config as { prompt: string }).prompt).includes("名称:first") ? "batch-ok" : "batch-failed" }),
       query: async (taskId) => taskId === "batch-ok" ? { status: "succeeded", outputUrl: "https://relay.invalid/one.jpg" } : { status: "failed", error: "provider rejected second" },

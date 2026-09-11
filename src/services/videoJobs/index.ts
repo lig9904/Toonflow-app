@@ -64,7 +64,7 @@ export interface VideoTaskProvider {
 
 export interface VideoJobDependencies {
   providerFor: (modelKey: string) => Promise<VideoTaskProvider>;
-  download: (url: string, outputPath: string) => Promise<void>;
+  download: (url: string, outputPath: string, job?: VideoJob) => Promise<void>;
   now?: () => number;
   maxConcurrent?: number;
   maxQueryFailures?: number;
@@ -518,7 +518,7 @@ export class VideoJobService {
 
   private async download(job: VideoJob, url: string): Promise<VideoJob> {
     try {
-      await this.dependencies.download(url, job.outputPath);
+      await this.dependencies.download(url, job.outputPath, job);
       await this.db.transaction(async (trx) => {
         await trx("ext_video_jobs").where({ id: job.id }).update({
           status: "SUCCEEDED", submissionOutcome: "submitted", payload: JSON.stringify(compactVideoPayload(job.payload)), nextPollAt: null, updatedAt: this.now(), lastError: null,

@@ -1,10 +1,10 @@
 import axios from "axios";
-import sharp from "sharp";
 import u from "@/utils";
 import { getPersistentImageTaskProvider, resolveConfiguredImageModel, getConfiguredMediaModel } from "@/utils/ai";
 import type { ProductionImageRuntime } from "./productionImages";
 import { createImageGenerationService, type ImageGenerationService } from "./imageJobs/runtime";
 import { validateImageOutputSize } from "../lib/imageRequestCapabilities";
+import { decodeAndValidateInlineImage, isInlineImageData, validateImageBytes, MAX_IMAGE_BYTES } from "./imageJobs/inlineImage";
 
 let sharedJobs: ImageGenerationService | undefined;
 
@@ -14,16 +14,18 @@ export function getProductionImageGenerationService(): ImageGenerationService {
       db: u.db,
       resolveModel: async (modelKey, referenceCount) => (await resolveConfiguredImageModel(modelKey, referenceCount)).key,
       validateConfig: async (modelKey, config) => {
-        validateImageOutputSize(modelKey, config.size);
         const model = await getConfiguredMediaModel(modelKey, "image");
+        validateImageOutputSize(modelKey, config.size, model);
         if (Array.isArray(model.resolutions) && !model.resolutions.includes(config.size)) throw new Error(`当前图片模型不支持 ${config.size}；可选质量：${model.resolutions.join("、")}`);
       },
       providerFor: (modelKey) => getPersistentImageTaskProvider(modelKey as `${string}:${string}`),
       download: async (url, outputPath) => {
-        const response = await axios.get<ArrayBuffer>(url, { responseType: "arraybuffer", timeout: 60_000, maxContentLength: 40 * 1024 * 1024 });
-        const bytes = Buffer.from(response.data);
-        const metadata = await sharp(bytes).metadata();
-        if (!metadata.width || !metadata.height || !metadata.format) throw new Error("上游返回的文件不是可解码图片");
+        const inline = isInlineImageData(url);
+        const bytes = inline
+          ? await decodeAndValidateInlineImage(url)
+          : Buffer.from((await axios.get<ArrayBuffer>(url, { responseType: "arraybuffer", timeout: 60_000, maxContentLength: MAX_IMAGE_BYTES, maxBodyLength: MAX_IMAGE_BYTES })).data);
+        if (bytes.length === 0 || bytes.length > MAX_IMAGE_BYTES) throw new Error("图片结果超过 40MB 限制");
+        if (!inline) await validateImageBytes(bytes);
         await u.oss.writeFile(outputPath, bytes);
       },
       getSmallImageUrl: (path) => u.oss.getSmallImageUrl(path),

@@ -267,7 +267,7 @@ const safeUpstreamError = (value: unknown): string => {
   for (const secret of configuredSecrets) text = text.split(secret).join("[REDACTED]");
   return text.replace(/Bearer\s+[^\s"']+/gi, "Bearer [REDACTED]")
     .replace(/([?&](?:X-Tos-[^=]+|Signature|token|access[_-]?key|secret[_-]?key)=)[^&\s"']+/gi, "$1[REDACTED]")
-    .replace(/\b(?:AK|SK)[A-Za-z0-9_\-]{8,}\b/g, "[REDACTED]").slice(0, 500);
+    .replace(/\b(?:AK|SK)[A-Za-z0-9_\-]{8,}\b/g, "[REDACTED]").replace(/https?:\/\/[^\s<>"']+/gi, "[URL REDACTED]").slice(0, 500);
 };
 const responseFailure = async (response: Response, operation: string) => {
   let code = "", message = "";

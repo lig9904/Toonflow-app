@@ -12,7 +12,7 @@ import { createAssetExtractionHelper } from "./assetExtraction";
 import { getCreativeState } from "../creativeWorkspace";
 import pLimit from "p-limit";
 import { builtinThinkLevelFromIntent, hasIndependentProductionOutput, hasUnlimitedMediaBudget } from "./contracts";
-import { productionActionLabels, productionDecisionPrompt, productionStageContract, explicitProductionTextScope } from "./productionPrompts";
+import { productionActionLabels, productionDecisionPrompt, productionStageContract, explicitProductionTextScope, isExplicitVideoOnlyRequest } from "./productionPrompts";
 import { reconcileStoryboardAssetIds } from "../../lib/storyboardVisualContract";
 
 export interface ProductionMediaRequest {
@@ -113,6 +113,7 @@ function validateMediaInstructions(
  * the frozen flow scope. */
 export function normalizeExplicitVideoTrackScope(
   generateVideosRequested: boolean,
+  explicitVideoOnlyRequest: boolean,
   storyboardIds: number[],
   mediaInstructions: Array<{ targetKind: "asset" | "storyboard" | "track"; targetId: number }>,
   knownStoryboards: Map<number, { trackId?: unknown }>,
@@ -120,7 +121,12 @@ export function normalizeExplicitVideoTrackScope(
   const selected = [...new Set(storyboardIds.map(Number))];
   if (!generateVideosRequested || selected.length) return selected;
   const tracks = [...new Set(mediaInstructions.filter((item) => item.targetKind === "track").map((item) => Number(item.targetId)))];
-  if (!tracks.length) return selected;
+  if (!tracks.length && !explicitVideoOnlyRequest) return selected;
+  if (!tracks.length) {
+    const snapshotTracks = [...new Set([...knownStoryboards.values()].map((row) => Number(row?.trackId)).filter((id) => Number.isSafeInteger(id) && id > 0))];
+    if (snapshotTracks.length !== 1) throw new BuiltinRuntimeError("INVALID_INPUT", snapshotTracks.length ? "当前剧集包含多个视频轨道，请明确选择一个轨道" : "当前剧集没有可生成视频的轨道分镜");
+    tracks.push(snapshotTracks[0]);
+  }
   for (const trackId of tracks) {
     const matches = [...knownStoryboards].filter(([, row]) => Number(row?.trackId) === trackId).map(([id]) => id);
     if (!matches.length) throw new BuiltinRuntimeError("INVALID_INPUT", `视频局部要求轨道 ${trackId} 不属于当前剧集分镜快照`);
@@ -250,7 +256,7 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
     let knownTopAssets = new Set(flow.assets.map((asset: any) => Number(asset.id)));
     let knownAssets = new Set(flow.assets.flatMap((asset: any) => [Number(asset.id), ...asset.derive.map((child: any) => Number(child.id))]));
     let knownStoryboards = new Map(flow.storyboard.map((storyboard: any) => [Number(storyboard.id), storyboard]));
-    plan.storyboardIds = normalizeExplicitVideoTrackScope(actions.includes("generateVideos"), plan.storyboardIds, plan.mediaInstructions, knownStoryboards);
+    plan.storyboardIds = normalizeExplicitVideoTrackScope(actions.includes("generateVideos"), isExplicitVideoOnlyRequest(requestText), plan.storyboardIds, plan.mediaInstructions, knownStoryboards);
     if (plan.assetIds.some((id) => !knownAssets.has(id)) || plan.storyboardIds.some((id) => !knownStoryboards.has(id))) throw new BuiltinRuntimeError("INVALID_INPUT", "制作规划引用了项目外实体");
     validateMediaInstructions(plan, knownAssets, knownStoryboards);
     if (plan.question && !actions.length) throw new BuiltinRuntimeError("INVALID_INPUT", `本次没有可执行的制作步骤：${plan.question}`);

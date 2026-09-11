@@ -73,3 +73,12 @@ test("binding is independently versioned, idempotent, source-bound and exposes o
     assert.equal(clearReplay.reused, true);
   } finally { await f.destroy(); }
 });
+
+
+test("official error envelopes remain readable without exposing keys or delivery URLs", async () => {
+  for (const status of [200, 400, 408, 503]) {
+    const client = new VolcengineTrustedAssetClient({ credentials: { accessKeyId: "AKTESTONLY123", secretAccessKey: "private-secret-value" }, fetch: async () => response({ ResponseMetadata: { Error: { Code: "AccountRequired", Message: "private-secret-value https://media.example.test/media-bridge/private-token" } } }, status) });
+    await assert.rejects(client.listGroups({ groupType: "AIGC", projectName: "default" }), (error: any) =>
+      error.code === ([200, 400].includes(status) ? "UPSTREAM_REJECTED" : "UPSTREAM_FAILED") && /AccountRequired/.test(error.message) && !/private-secret-value|private-token/.test(error.message));
+  }
+});

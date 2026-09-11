@@ -10,6 +10,7 @@ import {
   cleanupExpiredVideoReferenceLeases,
   ensureVideoReferenceBridgeSchema,
   issueVideoReferenceLease,
+  issueProjectAssetReferenceLease,
   lookupVideoReferenceLease,
   renewVideoReferenceConfigLeases,
   VideoReferenceBridgeError,
@@ -59,6 +60,23 @@ async function close(f: { db: Knex; root: string }): Promise<void> {
 describe("video reference bridge", () => {
   let current: { db: Knex; root: string } | undefined;
   afterEach(async () => { if (current) await close(current); current = undefined; });
+
+  it("uploads a project-owned asset without inventing an episode or weakening video ownership", async () => {
+    current = await fixture();
+    await current.db("o_scriptAssets").where({ assetId: 20 }).delete();
+    const options = { rootDir: current.root, publicOrigin: "https://media.example.test", secret };
+    const lease = await issueProjectAssetReferenceLease(current.db, { projectId: 100, id: 20 }, options);
+    const token = lease.url.split("/").pop()!;
+    const row = await lookupVideoReferenceLease(current.db, token, secret);
+    assert.equal(row.sourceKind, "projectAssets"); assert.equal(row.scriptId, 0);
+    assert.equal((await current.db("o_script").select()).length, 1);
+    assert.equal((await current.db("o_scriptAssets").where({ assetId: 20 }).select()).length, 0);
+    await assert.rejects(issueProjectAssetReferenceLease(current.db, { projectId: 999, id: 20 }, options), /不属于/);
+    await assert.rejects(issueVideoReferenceLease(current.db, { projectId: 100, scriptId: 10, id: 20, sources: "assets" }, options), /不属于/);
+    await assert.rejects(issueVideoReferenceLease(current.db, { projectId: 100, scriptId: 0, id: 20, sources: "projectAssets" } as any, options), /来源不合法/);
+    await current.db("o_assets").where({ id: 20 }).update({ imageId: 31 });
+    await assert.rejects(lookupVideoReferenceLease(current.db, token, secret), /已更换/);
+  });
 
   it("issues a stable project-scoped lease and renews it without changing token", async () => {
     current = await fixture();

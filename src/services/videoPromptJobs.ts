@@ -214,7 +214,7 @@ export async function prepareVideoPromptJob(db: Knex, input: VideoPromptJobInput
       const number = ++referenceCounts[mediaType];
       referenceLabels.push(`@${label}${number}`);
       const framePosition = ["singleImage", "startEndRequired", "endFrameOptional", "startFrameOptional"].includes(input.mode) ? (index === 0 ? "，帧位置：首帧" : "，帧位置：尾帧") : "";
-      return `选择顺序${index + 1}，@${label}${number}${framePosition}，来源 ${item.sources} ${Number(item.id)}：${row.name ?? "分镜参考"}；${visualText(row.describe ?? row.prompt ?? "")}${trusted ? `；实际视觉输入为已绑定火山素材 ${trusted.assetId}，本地图片仅用于关联` : ""}`;
+      return `选择顺序${index + 1}，@${label}${number}${framePosition}，来源 ${item.sources} ${Number(item.id)}：${row.name ?? "分镜参考"}；${visualText(row.describe ?? row.prompt ?? "")}${trusted ? "；实际输入为已绑定火山素材，本地图片仅用于关联；最终提示词仍使用上述引用标签，不能用素材 ID 指代" : ""}`;
     }).filter(Boolean);
     const semanticIdentity = versionedLinkedAssets.map((row) => `语义身份（仅用于理解，不代表已上传参考图）：${row.name ?? "未命名"}：${row.describe ?? ""}`).join("\n");
     validatePromptReferenceSelection(input.mode, [...Array(referenceCounts.image).fill("image"), ...Array(referenceCounts.video).fill("video"), ...Array(referenceCounts.audio).fill("audio")]);

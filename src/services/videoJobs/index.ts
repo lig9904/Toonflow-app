@@ -443,6 +443,13 @@ export class VideoJobService {
           job = { ...job, payload: { ...job.payload, config: submitConfig } };
         }
         await this.dependencies.beforeSubmit?.(job, submitConfig);
+        const finalLease = await this.db<JobRow>("ext_video_jobs").where({ id: job.id }).first();
+        if (!finalLease || finalLease.status !== "SUBMITTING" || finalLease.submissionOwner !== this.workerId || finalLease.upstreamTaskId) {
+          throw new VideoJobError("CONFLICT", "视频任务提交权已变化，未发送新的生成请求");
+        }
+        if (Number(finalLease.submissionLeaseUntil ?? 0) <= this.now()) {
+          throw Object.assign(new Error("参考素材核验期间提交租约已到期，视频未提交"), { submissionOutcome: "not_submitted" });
+        }
         const submitted = await provider.submit(submitConfig);
         if (!submitted?.taskId) throw new Error("上游未返回任务 ID");
         await this.db.transaction(async (trx) => {

@@ -14,6 +14,11 @@ export type VideoReferenceSource = {
   fileType?: VideoReferenceMediaType;
 };
 
+/** Project library uploads have no episode. Zero is reserved for this explicit
+ * internal source kind; public video reference inputs still require an episode. */
+type ProjectAssetReferenceSource = { projectId: number; scriptId: 0; id: number; sources: "projectAssets"; fileType?: VideoReferenceMediaType };
+type BridgeReferenceSource = VideoReferenceSource | ProjectAssetReferenceSource;
+
 export type VideoReferenceLeaseOptions = {
   rootDir: string;
   publicOrigin: string;
@@ -27,7 +32,7 @@ export type VideoReferenceLeaseOptions = {
 export type VideoReferenceLease = {
   type: VideoReferenceMediaType;
   url: string;
-  source: VideoReferenceSource;
+  source: BridgeReferenceSource;
   leaseId: string;
   contentHash: string;
   sizeBytes: number;
@@ -41,7 +46,7 @@ export type VideoReferenceLeaseRow = {
   resourceKey: string;
   projectId: number;
   scriptId: number;
-  sourceKind: "assets" | "storyboard";
+  sourceKind: "assets" | "storyboard" | "projectAssets";
   sourceId: number;
   filePath: string;
   mediaType: VideoReferenceMediaType;
@@ -208,10 +213,19 @@ export function verifyVideoReferenceToken(token: string, secret: string): string
   return leaseId;
 }
 
-async function resolveSource(db: Knex, source: VideoReferenceSource): Promise<{ filePath: string; mediaType: VideoReferenceMediaType }> {
+async function resolveSource(db: Knex, source: BridgeReferenceSource): Promise<{ filePath: string; mediaType: VideoReferenceMediaType }> {
   const projectId = positiveId(source.projectId, "projectId");
-  const scriptId = positiveId(source.scriptId, "scriptId");
   const id = positiveId(source.id, "引用素材 ID");
+  if (source.sources === "projectAssets") {
+    if (source.scriptId !== 0) throw new VideoReferenceBridgeError("INVALID_INPUT", "项目素材上传来源不合法");
+    const row = await db("o_assets as asset").join("o_image as image", "image.id", "asset.imageId")
+      .where({ "asset.id": id, "asset.projectId": projectId }).select("image.filePath", "image.type").first();
+    if (!row?.filePath) throw new VideoReferenceBridgeError("PROJECT_MISMATCH", "上传素材不属于当前项目或没有当前媒体");
+    const filePath = canonicalPath(row.filePath);
+    await assertProjectPathOwnership(db, projectId, filePath);
+    return { filePath, mediaType: resolveVideoReferenceMediaType(source.fileType, row.type, filePath) };
+  }
+  const scriptId = positiveId(source.scriptId, "scriptId");
   if (source.sources === "storyboard") {
     const row = await db("o_storyboard as storyboard")
       .join("o_script as script", "script.id", "storyboard.scriptId")
@@ -250,6 +264,11 @@ async function assertLeaseSourceStillOwned(db: Knex, lease: VideoReferenceLeaseR
   if (await db.schema.hasTable("o_project") && !(await db("o_project").where({ id: lease.projectId }).first())) {
     throw new VideoReferenceBridgeError("PROJECT_MISMATCH", "媒体租约所属项目已不存在");
   }
+  if (lease.sourceKind === "projectAssets") {
+    const current = await resolveSource(db, { projectId: lease.projectId, scriptId: 0, id: lease.sourceId, sources: "projectAssets" });
+    if (lease.scriptId !== 0 || current.filePath !== lease.filePath || current.mediaType !== lease.mediaType) throw new VideoReferenceBridgeError("FILE_CHANGED", "项目素材已更换，旧上传地址已失效");
+    return;
+  }
   if (!(await db("o_script").where({ id: lease.scriptId, projectId: lease.projectId }).first())) throw new VideoReferenceBridgeError("PROJECT_MISMATCH", "媒体租约所属剧本已不存在或归属已变化");
   if (lease.sourceKind === "storyboard") {
     if (!(await db("o_storyboard").where({ id: lease.sourceId, projectId: lease.projectId, scriptId: lease.scriptId }).first())) throw new VideoReferenceBridgeError("PROJECT_MISMATCH", "媒体租约所属分镜已不存在或归属已变化");
@@ -276,7 +295,7 @@ async function fileFingerprint(rootDir: string, filePath: string, mediaType: Vid
   } finally { await handle.close(); }
 }
 
-function resourceKey(source: VideoReferenceSource, filePath: string, fingerprint: { sizeBytes: number; mtimeMs: number; contentHash: string }): string {
+function resourceKey(source: BridgeReferenceSource, filePath: string, fingerprint: { sizeBytes: number; mtimeMs: number; contentHash: string }): string {
   return createHash("sha256").update(JSON.stringify([source.projectId, source.scriptId, source.sources, source.id, filePath, fingerprint.sizeBytes, fingerprint.mtimeMs, fingerprint.contentHash])).digest("hex");
 }
 
@@ -288,7 +307,7 @@ function rowFromDb(row: any): VideoReferenceLeaseRow {
   };
 }
 
-function leaseResult(row: VideoReferenceLeaseRow, source: VideoReferenceSource, origin: string, secret: string, expiresAt: number): VideoReferenceLease {
+function leaseResult(row: VideoReferenceLeaseRow, source: BridgeReferenceSource, origin: string, secret: string, expiresAt: number): VideoReferenceLease {
   return { type: row.mediaType, url: `${origin}/media-bridge/${tokenFor(row.leaseId, secret)}`, source, leaseId: row.leaseId, contentHash: row.contentHash, sizeBytes: row.sizeBytes, mtimeMs: row.mtimeMs, expiresAt };
 }
 
@@ -307,6 +326,16 @@ async function withResourceLock<T>(db: Knex, key: string, fn: (conn: Knex) => Pr
 }
 
 export async function issueVideoReferenceLease(db: Knex, source: VideoReferenceSource, options: VideoReferenceLeaseOptions): Promise<VideoReferenceLease> {
+  if (!["assets", "storyboard"].includes(source.sources)) throw new VideoReferenceBridgeError("INVALID_INPUT", "视频引用来源不合法");
+  positiveId(source.scriptId, "scriptId");
+  return issueBridgeReferenceLease(db, source, options);
+}
+
+export async function issueProjectAssetReferenceLease(db: Knex, source: { projectId: number; id: number; fileType?: VideoReferenceMediaType }, options: VideoReferenceLeaseOptions): Promise<VideoReferenceLease> {
+  return issueBridgeReferenceLease(db, { ...source, scriptId: 0, sources: "projectAssets" }, { ...options, ttlMs: options.ttlMs ?? 60 * 60 * 1000, hardTtlMs: options.hardTtlMs ?? 2 * 60 * 60 * 1000 });
+}
+
+async function issueBridgeReferenceLease(db: Knex, source: BridgeReferenceSource, options: VideoReferenceLeaseOptions): Promise<VideoReferenceLease> {
   const now = options.now ?? Date.now();
   const ttlMs = options.ttlMs ?? VIDEO_REFERENCE_BRIDGE_TTL_MS;
   const hardTtlMs = options.hardTtlMs ?? VIDEO_REFERENCE_BRIDGE_HARD_TTL_MS;

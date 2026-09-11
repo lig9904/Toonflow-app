@@ -40,10 +40,24 @@ export const productionActionLabels: Record<string, string> = {
 
 /** Common single-stage commands have an unambiguous scope independent of a
  * planner's response. A zero/unlimited budget never expands these requests. */
-export function explicitProductionTextScope(request: string): Array<"planning" | "storyboard" | "deriveAssets"> | undefined {
+export function explicitProductionTextScope(request: string): Array<"planning" | "storyboard" | "deriveAssets" | "generateVideos"> | undefined {
   const text = request.trim().replace(/[。！!\s]+$/u, "");
   if (/^(?:请|帮我)?(?:只|仅)?(?:重新)?(?:生成|制作)(?:一下)?导演(?:计划|规划)$/u.test(text)) return ["planning"];
   if (/^(?:请|帮我)?(?:只|仅)?(?:重新)?(?:生成|制作)(?:一下)?分镜表$/u.test(text)) return ["storyboard"];
   if (/^(?:请|帮我)?(?:只|仅)(?:分析|生成)衍生(?:素材|资产)(?:描述)?$/u.test(text)) return ["deriveAssets"];
+  if (isExplicitVideoOnlyRequest(text)) return ["generateVideos"];
   return undefined;
+}
+
+/** Match a direct video-only command, not prose that happens to mention video.
+ * Other clauses remain in requestText and continue to constrain generation. */
+export function isExplicitVideoOnlyRequest(request: string): boolean {
+  const text = request.trim().replace(/[。！!\s]+$/u, "");
+  if (!text || /^(?:不要|不需(?:要)?|无需|禁止|停止|取消|分析|检查|审核|查看)/u.test(text)) return false;
+  if (/(?:不要|禁止|暂不|先不|先别|别)\s*(?:执行|(?:生成|制作)\s*(?:(?:\d+|一)条)?(?:\d+秒)?视频)/u.test(text)) return false;
+  if (/先.+(?:后|再|然后)/u.test(text) || /(?:然后|并且|同时|随后|再|并)\s*(?:生成|制作|提取|分析|更新|审核)/u.test(text)) return false;
+  const output = "(?:(?:[1-9]\\d*|一)条)?(?:\\d+(?:\\.\\d+)?秒)?(?:的)?视频(?=$|[，,。；;！!\\s])(?!\\s*(?:的\\s*)?(?:提示词|描述|文案|脚本|方案|分镜|计划|大纲|字幕))";
+  const currentTrack = new RegExp(`^(?:请|帮我)?为(?:当前|该|选中(?:的)?)(?:第[一二三四五六七八九十\\d]+)?(?:视频)?轨道\\s*(?:只|仅)?\\s*(?:生成|制作)\\s*${output}`, "u");
+  const onlyVideo = new RegExp(`^(?:请|帮我)?(?:只|仅)\\s*(?:生成|制作)\\s*${output}`, "u");
+  return currentTrack.test(text) || onlyVideo.test(text);
 }

@@ -36,7 +36,7 @@ export interface VolcengineTrustedAsset {
 export interface VolcengineAssetCredentials { accessKeyId: string; secretAccessKey: string }
 export interface VolcengineAssetClientOptions { credentials: VolcengineAssetCredentials; fetch?: typeof fetch; now?: () => Date }
 
-function safe(value: unknown, max = 500): string { return String(value ?? "").replace(/Bearer\s+[^\s"']+/gi, "Bearer [REDACTED]").replace(/\b(?:AK|SK)[A-Za-z0-9_-]{8,}\b/g, "[REDACTED]").slice(0, max); }
+function safe(value: unknown, max = 500): string { return String(value ?? "").replace(/Bearer\s+[^\s"']+/gi, "Bearer [REDACTED]").replace(/\b(?:AK|SK)[A-Za-z0-9_-]{8,}\b/g, "[REDACTED]").replace(/https?:\/\/[^\s<>"']+/gi, "[URL REDACTED]").slice(0, max); }
 function sha(value: string): string { return createHash("sha256").update(value).digest("hex"); }
 function hmac(key: string | Buffer, value: string): Buffer { return createHmac("sha256", key).update(value).digest(); }
 function timestamp(now: Date): string { return now.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z"); }
@@ -61,7 +61,7 @@ export class VolcengineTrustedAssetClient {
     return safe(text, max);
   }
 
-  async call(action: "ListAssetGroups" | "ListAssets" | "GetAsset" | "GetAssetGroup", body: Record<string, unknown>): Promise<any> {
+  async call(action: "ListAssetGroups" | "ListAssets" | "GetAsset" | "GetAssetGroup" | "CreateAssetGroup" | "CreateAsset", body: Record<string, unknown>): Promise<any> {
     const bodyText = JSON.stringify(body);
     const date = timestamp(this.now()), shortDate = date.slice(0, 8), payloadHash = sha(bodyText);
     const query = `Action=${encodeURIComponent(action)}&Version=${API_VERSION}`;
@@ -82,7 +82,8 @@ export class VolcengineTrustedAssetClient {
     if (!response.ok || metadataError) {
       const code = this.redact(metadataError?.Code ?? metadataError?.code ?? "RequestRejected", 100);
       const message = this.redact(metadataError?.Message ?? metadataError?.message ?? `HTTP ${response.status}`);
-      throw new VolcengineTrustedAssetError(response.status >= 400 && response.status < 500 ? "UPSTREAM_REJECTED" : "UPSTREAM_FAILED", `火山素材库请求失败：${code}${message ? `：${message}` : ""}`, response.status >= 400 && response.status < 500 ? 409 : 502);
+      const rejected = response.status < 500 && response.status !== 408 && (response.status >= 400 || Boolean(metadataError));
+      throw new VolcengineTrustedAssetError(rejected ? "UPSTREAM_REJECTED" : "UPSTREAM_FAILED", `火山素材库请求失败：${code}${message ? `：${message}` : ""}`, rejected ? 409 : 502);
     }
     return resultOf(payload);
   }
@@ -110,6 +111,22 @@ export class VolcengineTrustedAssetClient {
     const input = z.object({ id: remoteId, projectName }).strict().parse(raw);
     const item = groupView(await this.call("GetAssetGroup", { Id: input.id, ProjectName: input.projectName }));
     if (!item) throw new VolcengineTrustedAssetError("UPSTREAM_FAILED", "火山素材组详情字段无效", 502); return item;
+  }
+  async createGroup(raw: unknown): Promise<{ id: string }> {
+    const input = z.object({ name: z.string().trim().min(1).max(64), description: z.string().trim().max(300).optional(), groupType: z.literal("AIGC"), projectName }).strict().parse(raw);
+    const result = await this.call("CreateAssetGroup", { Name: input.name, ...(input.description ? { Description: input.description } : {}), GroupType: "AIGC", ProjectName: input.projectName });
+    const id = remoteId.safeParse(result?.Id);
+    if (!id.success) throw new VolcengineTrustedAssetError("UPSTREAM_FAILED", "火山素材组创建结果未返回 ID", 502);
+    return { id: id.data };
+  }
+  async createAsset(raw: unknown): Promise<{ id: string }> {
+    const input = z.object({ groupId: remoteId, name: z.string().trim().min(1).max(64), assetType, projectName, url: z.string().url().max(4096) }).strict().parse(raw);
+    const parsed = new URL(input.url);
+    if (parsed.protocol !== "https:" || parsed.username || parsed.password) throw new VolcengineTrustedAssetError("INVALID_INPUT", "上传素材必须使用受控 HTTPS 媒体地址");
+    const result = await this.call("CreateAsset", { GroupId: input.groupId, Name: input.name, AssetType: input.assetType, ProjectName: input.projectName, URL: input.url });
+    const id = remoteId.safeParse(result?.Id);
+    if (!id.success) throw new VolcengineTrustedAssetError("UPSTREAM_FAILED", "火山素材创建结果未返回 ID", 502);
+    return { id: id.data };
   }
 }
 
@@ -148,7 +165,7 @@ export async function ensureVolcengineReferenceSchema(db: Knex): Promise<void> {
 }
 
 export interface LocalReferenceTarget { projectId: number; scriptId?: number | null; targetKind: "asset" | "storyboard"; targetId: number }
-async function localSource(db: Knex | Knex.Transaction, target: LocalReferenceTarget): Promise<{ scriptId: number | null; version: number; filePath: string; mediaType: "image" | "video" | "audio" }> {
+export async function readLocalVolcengineReferenceSource(db: Knex | Knex.Transaction, target: LocalReferenceTarget): Promise<{ scriptId: number | null; version: number; filePath: string; mediaType: "image" | "video" | "audio" }> {
   if (target.targetKind === "storyboard") {
     if (!Number.isSafeInteger(target.scriptId) || Number(target.scriptId) <= 0) throw new VolcengineTrustedAssetError("INVALID_INPUT", "分镜绑定缺少剧集 ID");
     const row = await db("o_storyboard").where({ id: target.targetId, projectId: target.projectId, scriptId: target.scriptId }).first("id", "filePath");
@@ -165,6 +182,7 @@ async function localSource(db: Knex | Knex.Transaction, target: LocalReferenceTa
   const state = await db("ext_creative_state").where({ entityType: "asset", entityId: target.targetId, projectId: target.projectId }).first("version");
   return { scriptId: target.scriptId == null ? null : Number(target.scriptId), version: Number(state?.version ?? 0), filePath: String(row.filePath ?? ""), mediaType: resolveVideoReferenceMediaType(row.storedFileType, row.type, row.filePath) };
 }
+const localSource = readLocalVolcengineReferenceSource;
 function stable(value: unknown): string { if (Array.isArray(value)) return `[${value.map(stable).join(",")}]`; if (value && typeof value === "object") return `{${Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => `${JSON.stringify(k)}:${stable(v)}`).join(",")}}`; return JSON.stringify(value); }
 
 export async function replaceVolcengineReferenceBindings(db: Knex, client: VolcengineTrustedAssetClient | undefined, raw: unknown, actorId: string, hashSource: (filePath: string) => Promise<string>): Promise<any> {

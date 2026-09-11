@@ -13,6 +13,7 @@ import fs from "fs";
 import u from "@/utils";
 import { agentGatewayConfigFromEnv, createAgentGateway } from "@/services/agentGateway";
 import { resumeVideoJobs, getRuntimeVideoJobService } from "@/services/videoJobs/runtime";
+import { getTrustedAssetUploadRecovery } from "@/services/volcengineTrustedAssetUploadRuntime";
 import { dbReady } from "@/utils/db";
 import socketInit from "@/socket/index";
 import { isEletron } from "@/utils/getPath";
@@ -73,6 +74,7 @@ export default async function startServe(randomPort: Boolean = false) {
   getProductionImageGenerationService().start();
   getProductionImageReviewService().start();
   void resumeVideoJobs().catch((error) => console.error("[videoJobs] recovery failed", error instanceof Error ? error.name : "UnknownError"));
+  getTrustedAssetUploadRecovery().start();
 
   await u.writeVersion();
   const io = new Server(server, { cors: { origin: "*" } });

@@ -410,7 +410,7 @@ test("video generation deduplicates by real track and passes full provider param
   } finally { await f.destroy(); }
 });
 
-test("an explicit current-track video instruction supplies omitted storyboard selection from only the script snapshot", options, async () => {
+test("an explicit current-track video-only request overrides a wrong planner action and uses the sole script track", options, async () => {
   const f = await fixture();
   try {
     await f.db("o_project").where({ id: f.projectId }).update({ mode: "text" });
@@ -421,15 +421,15 @@ test("an explicit current-track video instruction supplies omitted storyboard se
     ]);
     const received: any[] = [];
     const model = modelFor((request) => request.role === "productionAgent:decisionAgent" ? {
-      actions: ["generateVideos"], assetIds: [], storyboardIds: [], globalMediaInstructions: "same style",
-      mediaInstructions: [{ targetKind: "track", targetId: track, instructions: "only this track" }], question: null, summary: "video",
+      actions: ["extractAssets"], assetIds: [], storyboardIds: [], globalMediaInstructions: "",
+      mediaInstructions: [], question: null, summary: "wrong planner action",
     } : { items: [], summary: "" }, []);
-    const result = await runOnce(f, model, { generateVideo: async (input) => { received.push(input); return { status: "succeeded", jobId: "track-video" }; } }, { ...defaultBuiltinRunLimits, maxVideoGenerations: 1 }, "generate current track", async () => ({ mode: "text", resolution: "480p", audio: false }));
+    const result = await runOnce(f, model, { generateVideo: async (input) => { received.push(input); return { status: "succeeded", jobId: "track-video" }; } }, { ...defaultBuiltinRunLimits, maxVideoGenerations: 1 }, "为当前轨道生成1条4秒视频，480p，无音频。沿用已保存并人工补充的视频提示词与现有分镜参考图，不出图、不重写分镜或导演计划。", async () => ({ mode: "text", resolution: "480p", audio: false }));
     assert.equal(result.run.status, "succeeded", result.run.errorMessage ?? "");
     assert.equal(received.length, 1);
     assert.equal(received[0].targetId, track);
     assert.deepEqual(received[0].params.storyboardIds, [one, two]);
-    assert.match(received[0].params.instructions, /only this track/);
+    assert.match(received[0].params.instructions, /人工补充的视频提示词/);
   } finally { await f.destroy(); }
 });
 
@@ -456,6 +456,13 @@ test("video scope omission never expands to every track, and unknown or cross-sc
     const crossScript = await runOnce(f, modelFor((request) => request.role === "productionAgent:decisionAgent" ? { actions: ["generateVideos"], assetIds: [], storyboardIds: [], mediaInstructions: [{ targetKind: "track", targetId: otherTrack, instructions: "cross" }], question: null, summary: "cross" } : { items: [], summary: "" }, []), media, { ...defaultBuiltinRunLimits, maxVideoGenerations: 1 });
     assert.equal(crossScript.run.status, "failed");
     assert.match(crossScript.run.errorMessage ?? "", /不属于当前剧集分镜快照/);
+    assert.equal(mediaCalls, 0);
+
+    const [secondLocalTrack] = await insertRowsReturningIds(f.db, "o_videoTrack", { projectId: f.projectId, scriptId: f.scriptId, duration: 2 });
+    await insertRowsReturningIds(f.db, "o_storyboard", { projectId: f.projectId, scriptId: f.scriptId, index: 1, prompt: "two", duration: "2", track: "C", trackId: secondLocalTrack, shouldGenerateImage: 0, state: "未生成" });
+    const ambiguous = await runOnce(f, modelFor((request) => request.role === "productionAgent:decisionAgent" ? { actions: ["extractAssets"], assetIds: [], storyboardIds: [], mediaInstructions: [], question: null, summary: "wrong" } : { items: [], summary: "" }, []), media, { ...defaultBuiltinRunLimits, maxVideoGenerations: 1 }, "为当前轨道生成1条4秒视频");
+    assert.equal(ambiguous.run.status, "failed");
+    assert.match(ambiguous.run.errorMessage ?? "", /多个视频轨道/);
     assert.equal(mediaCalls, 0);
   } finally { await f.destroy(); }
 });

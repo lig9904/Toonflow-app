@@ -4,12 +4,12 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import knex, { type Knex } from "knex";
-import { ensureVideoJobsSchema, hashVideoJobRequest, VideoJobError, VideoJobService, type VideoJobPayload, type VideoTaskProvider } from "../src/services/videoJobs";
+import { ensureVideoJobsSchema, hashVideoJobRequest, VideoJobError, VideoJobService, type VideoJobPayload, type VideoTaskProvider, type VideoJobDependencies } from "../src/services/videoJobs";
 
 const fingerprint = "endpoint-and-model-v1";
 interface Fixture { db: Knex; dbPath: string; directory: string; clock: { now: number }; provider: VideoTaskProvider & { submits: number; queries: number }; downloads: string[]; service: VideoJobService; }
 
-async function fixture(options: { provider?: Partial<VideoTaskProvider>; maxConcurrent?: number; maxQueryFailures?: number; maxDownloadFailures?: number } = {}): Promise<Fixture> {
+async function fixture(options: { provider?: Partial<VideoTaskProvider>; maxConcurrent?: number; maxQueryFailures?: number; maxDownloadFailures?: number; beforeSubmit?: VideoJobDependencies["beforeSubmit"] } = {}): Promise<Fixture> {
   const directory = mkdtempSync(path.join(tmpdir(), "toonflow-video-jobs-"));
   const dbPath = path.join(directory, "jobs.sqlite");
   const db = knex({ client: "better-sqlite3", connection: { filename: dbPath }, useNullAsDefault: true });
@@ -34,7 +34,7 @@ async function fixture(options: { provider?: Partial<VideoTaskProvider>; maxConc
   const downloads: string[] = [];
   const service = new VideoJobService(db, { providerFor: async () => provider, download: async (url, output) => { downloads.push(`${url}:${output}`); },
     now: () => clock.now, schedule: false, initialPollDelayMs: 1, maxConcurrent: options.maxConcurrent ?? 2,
-    maxQueryFailures: options.maxQueryFailures, maxDownloadFailures: options.maxDownloadFailures });
+    maxQueryFailures: options.maxQueryFailures, maxDownloadFailures: options.maxDownloadFailures, beforeSubmit: options.beforeSubmit });
   return { db, dbPath, directory, clock, provider, downloads, service };
 }
 
@@ -100,6 +100,17 @@ test("stranded reservation requires reconciliation and never posts again", async
     assert.equal(f.provider.submits, 0);
     assert.equal((await f.service.get(reserved.job.id)).status, "RECONCILIATION_REQUIRED");
     assert.equal((await f.db("o_video").where({ id: 1000 }).first()).state, "需人工核对");
+  } finally { await close(f); }
+});
+
+test("reference verification cannot submit after the creator lease expires", async () => {
+  const f = await fixture({ beforeSubmit: async () => { f.clock.now += 120_001; } });
+  try {
+    const p = payload(); const reserved = await f.service.reserve("expired-after-reference-check", p, hashVideoJobRequest(p));
+    const result = await f.service.submitReserved(reserved.job.id);
+    assert.equal(f.provider.submits, 0);
+    assert.equal(result.status, "FAILED");
+    assert.equal(result.submissionOutcome, "not_submitted");
   } finally { await close(f); }
 });
 

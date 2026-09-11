@@ -110,8 +110,8 @@ describe("official Volcengine Seedream and Seedance provider", () => {
     await assert.rejects(f.provider.submitVideoTask({ prompt: "x", duration: 5, resolution: "720p", aspectRatio: "16:9", mode: ["imageReference:9", "videoReference:3", "audioReference:3"], referenceList: [{ type: "video", base64: "data:video/mp4;base64,AAAA" }] }, standard), /不支持 Base64/);
     await assert.rejects(f.provider.submitVideoTask({ prompt: "x", duration: 5, resolution: "4k", aspectRatio: "16:9", mode: "text", referenceList: [] }, fast), (error: any) => error.submissionOutcome === "not_submitted");
     assert.equal(f.calls.length, 0);
-    f.setHandler(() => new Response(JSON.stringify({ error: { code: "InvalidParameter", message: "bad sd2-test-key Bearer secret-token" } }), { status: 400 }));
-    await assert.rejects(f.provider.submitVideoTask({ prompt: "x", duration: 5, resolution: "720p", aspectRatio: "16:9", mode: "text", referenceList: [] }, fast), (error: any) => error.submissionOutcome === "rejected" && /InvalidParameter/.test(error.message) && !/sd2-test-key|secret-token/.test(error.message));
+    f.setHandler(() => new Response(JSON.stringify({ error: { code: "InvalidParameter", message: "bad sd2-test-key Bearer secret-token https://media.example.test/media-bridge/private-lease-token" } }), { status: 400 }));
+    await assert.rejects(f.provider.submitVideoTask({ prompt: "x", duration: 5, resolution: "720p", aspectRatio: "16:9", mode: "text", referenceList: [] }, fast), (error: any) => error.submissionOutcome === "rejected" && /InvalidParameter/.test(error.message) && !/sd2-test-key|secret-token|private-lease-token/.test(error.message));
     f.setHandler(() => new Response("{}", { status: 503 }));
     await assert.rejects(f.provider.submitVideoTask({ prompt: "x", duration: 5, resolution: "720p", aspectRatio: "16:9", mode: "text", referenceList: [] }, fast), (error: any) => error.submissionOutcome === undefined);
     f.setHandler(() => new Response("{}", { status: 408 }));

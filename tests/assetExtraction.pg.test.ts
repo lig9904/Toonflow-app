@@ -101,7 +101,7 @@ test("structured builtin helper uses universalAi, creates real IDs, reuses by ex
     });
     assert.equal(calls.length, 1);
     assert.equal(calls[0].role, "universalAi");
-    assert.match(calls[0].system, /Script Assets Extract/);
+    assert.match(calls[0].system, /不将非人类幼态写成人类儿童/);
     assert.match(calls[0].system, /props.*tool/);
     assert.deepEqual(calls[0].input.existingAssets.map((row: any) => row.id), [heroId]);
     assert.equal(receipt.createdAssetIds.length, 3);

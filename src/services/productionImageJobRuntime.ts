@@ -5,6 +5,7 @@ import type { ProductionImageRuntime } from "./productionImages";
 import { createImageGenerationService, type ImageGenerationService } from "./imageJobs/runtime";
 import { validateImageOutputSize } from "../lib/imageRequestCapabilities";
 import { decodeAndValidateInlineImage, isInlineImageData, validateImageBytes, MAX_IMAGE_BYTES } from "./imageJobs/inlineImage";
+import { getProductionImageReviewService } from "./imageReviews/runtime";
 
 let sharedJobs: ImageGenerationService | undefined;
 
@@ -12,6 +13,7 @@ export function getProductionImageGenerationService(): ImageGenerationService {
   if (!sharedJobs) {
     sharedJobs = createImageGenerationService({
       db: u.db,
+      imageReviews: getProductionImageReviewService(),
       resolveModel: async (modelKey, referenceCount) => (await resolveConfiguredImageModel(modelKey, referenceCount)).key,
       validateConfig: async (modelKey, config) => {
         const model = await getConfiguredMediaModel(modelKey, "image");

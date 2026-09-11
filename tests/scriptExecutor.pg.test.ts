@@ -120,3 +120,58 @@ test("human edits during model work reject the whole stale generated workspace",
     assert.equal((await runtime.events(run.id)).filter((e) => e.type === "artifact.saved").length, 0);
   } finally { await f.destroy(); }
 });
+
+test("run prompt snapshots survive pause and takeover revisions while a new run uses edited skill and common rules", options, async () => {
+  for (const control of ["pause", "takeover"] as const) {
+    const f = await fixture(); let release: (() => void) | undefined;
+    try {
+      await ensureAssetExtractionWorkspaceSchema(f.db);
+      const initial = await saveScriptWorkspace(f.db, { projectId: f.projectId, expectedVersion: 0, actor: { id: "human:1", kind: "human" }, mutationKey: `snapshot-script-${control}`, script: [{ name: "Episode", content: "A still scene" }] });
+      const scriptId = initial.script[0].id;
+      await f.db("o_prompt").where({ type: "scriptAssetExtraction" }).update({ useData: "COMMON-V1" });
+      let skillVersion = "SKILL-V1", loads = 0, skeletonCalls = 0;
+      const systems: Array<{ role: string; system: string }> = [];
+      let entered!: () => void;
+      const waiting = new Promise<void>((resolve) => { entered = resolve; });
+      const blocked = new Promise<void>((resolve) => { release = resolve; });
+      const model: StructuredScriptModel = { async generate(req) {
+        systems.push({ role: req.role, system: req.system });
+        let value: unknown;
+        if (req.role === "scriptAgent:decisionAgent") value = { actions: ["storySkeleton", "extractAssets"], chapterIds: [], targetScriptIds: [scriptId], question: null, summary: "Update skeleton and extract" };
+        else if (req.role === "scriptAgent:storySkeletonAgent") {
+          skeletonCalls += 1; if (skeletonCalls === 1) { entered(); await blocked; }
+          value = { content: "Skeleton generated with frozen rules" };
+        } else value = { roles: [], scenes: [], props: [], bindings: [{ scriptId, assets: [] }], summary: "No assets required" };
+        return { value: req.schema.parse(value), outputTokens: 5 };
+      } };
+      const runtime = new BuiltinAgentRuntime({ db: f.db, authorize: async () => undefined, execute: createScriptAgentExecutor({ db: f.db, model, loadSkill: async (name) => { loads += 1; return `${skillVersion}:${name}`; } }) });
+      const created = await runtime.create({ agentType: "scriptAgent", projectId: f.projectId, requestedBy: 1, prompt: "Update skeleton and extract existing episode", idempotencyKey: `prompt-snapshot-${control}`, limits: defaultBuiltinRunLimits });
+      const running = runtime.runOnce();
+      await Promise.race([waiting, running.then(() => { throw new Error("Stopped before the pending skeleton"); })]);
+      skillVersion = "SKILL-V2";
+      await f.db("o_prompt").where({ type: "scriptAssetExtraction" }).update({ useData: "COMMON-V2" });
+      const current = await runtime.get(created.run.id);
+      const stopped = await runtime.control(current.id, current.version, control);
+      release!(); await running;
+      const resumed = await runtime.control(current.id, stopped.version, "resume");
+      assert.equal(resumed.inputRevision, control === "takeover" ? 1 : 0);
+      await runtime.runOnce();
+      const completed = await runtime.get(created.run.id);
+      assert.equal(completed.status, "succeeded", completed.errorMessage ?? "");
+      assert.equal(loads, 5, "the resumed run must not reload any skill");
+      assert(systems.filter((item) => item.role !== "universalAi").every((item) => item.system.includes("SKILL-V1")));
+      assert(systems.filter((item) => item.role === "universalAi").every((item) => item.system.includes("COMMON-V1")));
+      const snapshotRows = await f.db("ext_builtin_run_steps").where({ runId: created.run.id, stepKey: "script.promptSnapshot" });
+      assert.equal(snapshotRows.length, 1); assert.equal(snapshotRows[0].attempt, 1); assert.equal(snapshotRows[0].modelCall, false);
+      assert.equal(completed.modelCalls, control === "takeover" ? 5 : 4);
+      assert.equal(completed.imageGenerations, 0); assert.equal(completed.videoGenerations, 0);
+      const beforeNew = systems.length;
+      const next = await runtime.create({ agentType: "scriptAgent", projectId: f.projectId, requestedBy: 1, prompt: "Update skeleton and extract existing episode", idempotencyKey: `prompt-snapshot-${control}-new`, limits: defaultBuiltinRunLimits });
+      await runtime.runOnce();
+      assert.equal((await runtime.get(next.run.id)).status, "succeeded");
+      assert.equal(loads, 10);
+      assert(systems.slice(beforeNew).filter((item) => item.role !== "universalAi").every((item) => item.system.includes("SKILL-V2")));
+      assert(systems.slice(beforeNew).filter((item) => item.role === "universalAi").every((item) => item.system.includes("COMMON-V2")));
+    } finally { release?.(); await f.destroy(); }
+  }
+});

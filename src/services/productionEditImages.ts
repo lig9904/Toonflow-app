@@ -24,12 +24,15 @@ export async function generateFlowImage(db: Knex, jobs: ImageGenerationService, 
   }
   await ensureProductionImageJobSchema(db);
   const referenceList: Array<{ type: "image"; base64: string }> = [];
+  const referencePaths: Array<string | undefined> = [];
   for (const reference of input.references) {
     if (isLocalMediaReference(reference)) {
       const path = await assertImageArtifactProject(db, input.projectId, reference);
       referenceList.push({ type: "image", base64: await loaders.local(path) });
+      referencePaths.push(path);
     } else {
       referenceList.push({ type: "image", base64: await loaders.remote(reference) });
+      referencePaths.push(undefined);
     }
   }
   const targetId = input.flowId != null ? input.flowId : input.nodeId ? input.nodeId : input.generationKey;
@@ -37,6 +40,7 @@ export async function generateFlowImage(db: Knex, jobs: ImageGenerationService, 
     generationKey: input.generationKey,
     projectId: input.projectId,
     modelKey: input.model,
+    referencePaths,
     config: { prompt: input.prompt, referenceList, size: input.quality, aspectRatio: input.ratio },
     target: { kind: "flow", id: targetId, scriptId: input.scriptId },
   });

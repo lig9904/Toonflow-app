@@ -58,7 +58,6 @@ interface ScriptInput {
 
 /** Existing professional roles now produce validated data; only commit writes creative entities. */
 export function createScriptAgentExecutor(deps: ScriptExecutorDependencies) {
-  const extractAssets = createAssetExtractionHelper({ db: deps.db, model: deps.model });
   return async (ctx: BuiltinExecutionContext): Promise<unknown> => {
     const { run } = ctx;
     if (run.agentType !== "scriptAgent" || run.projectId == null) throw new BuiltinRuntimeError("INVALID_INPUT", "剧本任务需要已创建的项目");
@@ -75,10 +74,17 @@ export function createScriptAgentExecutor(deps: ScriptExecutorDependencies) {
       const assets = await deps.db("o_assets").where({ projectId }).whereNull("assetsId").orderBy("id").select("id", "name", "type", "describe").limit(2000);
       return { project, workspace, chapters, assets };
     });
-    const skills = new Map<string, string>();
+    const frozenSkills = await ctx.step("script.promptSnapshot", {}, async () => {
+      const instructions = await deps.db("o_prompt").where({ type: "scriptAssetExtraction" }).first();
+      const skills = Object.fromEntries(await Promise.all([
+      "builtin_script_decision.md", "builtin_script_skeleton.md", "builtin_script_adaptation.md", "builtin_script_episodes.md", "builtin_script_review.md",
+    ].map(async (name) => [name, await deps.loadSkill(name)])));
+      return { ...skills, assetExtraction: String(instructions?.useData || instructions?.data || "") };
+    });
+    const extractAssets = createAssetExtractionHelper({ db: deps.db, model: deps.model, loadInstructions: async () => frozenSkills.assetExtraction });
     const skill = async (name: string) => {
-      if (!skills.has(name)) skills.set(name, await deps.loadSkill(name));
-      return skills.get(name)!;
+      if (!(name in frozenSkills)) throw new BuiltinRuntimeError("INVALID_INPUT", "当前运行未记录该提示词版本");
+      return frozenSkills[name];
     };
     const model = async <T>(key: string, role: StructuredModelRequest<T>["role"], skillName: string, schema: z.ZodType<T>, data: unknown, maxOutputTokens: number) => {
       await ctx.assertActive();

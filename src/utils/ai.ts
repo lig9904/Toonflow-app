@@ -168,6 +168,20 @@ export async function getConfiguredTextOutputLimit(key: AiType): Promise<number 
     configuredMaxOutputTokens: config?.maxOutputTokens });
 }
 
+/** Non-secret model metadata for visual review. Invocation uses the fixed model key. */
+export async function getConfiguredTextVisionModel(role: AiType) {
+  const key = await resolveModelName(role);
+  const { selectedModel, running, enabled } = await loadVendorRuntime(key);
+  let baseUrl = "";
+  try {
+    const url = new URL(String(running.vendor?.inputValues?.baseUrl ?? ""));
+    url.username = ""; url.password = ""; url.search = ""; url.hash = "";
+    baseUrl = url.toString();
+  } catch { /* An unknown endpoint never implies visual capability. */ }
+  return { key, modelName: String(selectedModel.modelName), enabled, type: selectedModel.type,
+    supportsVision: selectedModel.supportsVision === true || selectedModel.vision === true, baseUrl };
+}
+
 export type { PersistentVideoTaskProvider } from "@/lib/persistentVideoAdapter";
 
 /**

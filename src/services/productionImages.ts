@@ -301,7 +301,7 @@ async function prepareDurableDerivedAssetImages(db: Knex, args: {
     const links = await trx("o_scriptAssets").where({ scriptId: args.scriptId }).whereIn("assetId", ids);
     if (links.length !== ids.length) throw new ProductionImageError("资产不属于当前剧集", 400);
     const parentIds = [...new Set(assets.map((asset) => asset.assetsId).filter((id): id is number => id != null))];
-    const parents = parentIds.length ? await trx("o_assets").leftJoin("o_image", "o_assets.imageId", "o_image.id").whereIn("o_assets.id", parentIds).andWhere("o_assets.projectId", args.projectId).select("o_assets.id", "o_assets.imageId", "o_assets.describe", "o_image.filePath", "o_image.state") : [];
+    const parents = parentIds.length ? await trx("o_assets").leftJoin("o_image", "o_assets.imageId", "o_image.id").whereIn("o_assets.id", parentIds).andWhere("o_assets.projectId", args.projectId).select("o_assets.id", "o_assets.assetsId", "o_assets.name", "o_assets.imageId", "o_assets.describe", "o_image.filePath", "o_image.state") : [];
     if (parents.length !== parentIds.length) throw new ProductionImageError("父资产不属于当前项目", 400);
     for (const parent of parents) if (parent.imageId != null && !parent.filePath) throw new ProductionImageError("父资产图片原材料不存在", 400);
     for (const parent of parents) if (parent.imageId != null && parent.state === "生成中") throw new ProductionImageError("父资产图片正在生成中，请稍后重试", 409);
@@ -318,12 +318,14 @@ async function prepareDurableDerivedAssetImages(db: Knex, args: {
     const id = Number(asset.id);
     try {
       const referenceList = asset.assetsId != null && parentBase64.has(Number(asset.assetsId)) ? [{ type: "image" as const, base64: parentBase64.get(Number(asset.assetsId))! }] : [];
+      const parent = prepared.parents.find((row) => Number(row.id) === Number(asset.assetsId));
+      const referenceAssets = parent?.filePath && referenceList.length ? [snapshotImageReference(parent, String(parent.filePath))] : [];
       const existing = await findGeneration(args.runtime.imageJobs, args.projectId, keys.get(id)!);
       if (existing) {
         const current = await db("o_assets").where({ id, projectId: args.projectId }).first();
         if (!current) throw new ProductionImageError("资产已被删除", 404);
         receipts.set(id, await args.runtime.imageJobs.prepare({
-          generationKey: keys.get(id)!, projectId: args.projectId, modelKey: String(settings.imageModel),
+          generationKey: keys.get(id)!, projectId: args.projectId, modelKey: String(settings.imageModel), referenceAssets,
           config: { prompt: String(current.prompt ?? ""), referenceList, size: String(settings.imageQuality), aspectRatio: "16:9" },
           target: { kind: "asset", id, scriptId: args.scriptId, expectedVersion: existing.target.expectedVersion },
         }));
@@ -340,7 +342,7 @@ async function prepareDurableDerivedAssetImages(db: Knex, args: {
       const updated = await db("o_assets").where({ id, projectId: args.projectId, imageId: asset.imageId ?? null, describe: asset.describe ?? null }).update({ prompt });
       if (updated !== 1) throw new ProductionImageError("资产已被其他操作修改，已停止图片生成", 409);
       receipts.set(id, await args.runtime.imageJobs.prepare({
-        generationKey: keys.get(id)!, projectId: args.projectId, modelKey: String(settings.imageModel),
+        generationKey: keys.get(id)!, projectId: args.projectId, modelKey: String(settings.imageModel), referenceAssets,
         config: { prompt, referenceList, size: String(settings.imageQuality), aspectRatio: "16:9" },
         target: { kind: "asset", id, scriptId: args.scriptId },
       }));

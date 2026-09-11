@@ -1,20 +1,9 @@
 import express from "express";
 import u from "@/utils";
-import { z } from "zod";
-import { success, error } from "@/lib/responseFormat";
-import { validateFields } from "@/middleware/middleware";
-const router = express.Router();
-
-export default router.post(
-  "/",
-  validateFields({
-    id: z.number(),
-  }),
-  async (req, res) => {
-    const { id, data } = req.body;
-    await u.db("o_prompt").where("id", id).update({
-      useData: data,
-    });
-    res.status(200).send(success(123));
-  },
-);
+import { success } from "@/lib/responseFormat";
+import { saveManagedPrompt } from "@/services/promptRegistry";
+import { promptPaths, promptKey, sendPromptError, writeInput } from "./_shared";
+export default express.Router().post("/", async (req, res) => {
+  try { return res.send(success(await saveManagedPrompt(u.db, await promptKey(req), { ...writeInput(req), content: req.body?.content ?? req.body?.data }, promptPaths()))); }
+  catch (err) { return sendPromptError(res, err); }
+});

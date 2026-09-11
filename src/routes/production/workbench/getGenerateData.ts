@@ -1,3 +1,5 @@
+import { readCurrentVideoPromptReview } from "@/services/videoPromptReview";
+import type { VideoPromptReviewReport } from "@/lib/videoPromptContract";
 import express from "express";
 import u from "@/utils";
 import { z } from "zod";
@@ -30,6 +32,7 @@ interface TrackItem {
   prompt: string;
   state: "未生成" | "生成中" | "已完成" | "生成失败";
   reason?: string;
+  promptReview?: VideoPromptReviewReport | null;
   duration?: number;
   selectVideoId?: number;
   medias: TrackMedia[];
@@ -166,6 +169,7 @@ export default router.post(
         version: (await getCreativeState(u.db, "track", trackId, projectId)).version,
         duration: item?.duration ?? 0,
         prompt: item?.prompt || "",
+        promptReview: await readCurrentVideoPromptReview(u.db, { projectId, scriptId, trackId, prompt: item?.prompt || "" }),
         state: (item?.state as "未生成" | "生成中" | "已完成" | "生成失败") ?? "未生成",
         reason: item?.reason ?? "",
         selectVideoId: Number(item?.videoId)!,

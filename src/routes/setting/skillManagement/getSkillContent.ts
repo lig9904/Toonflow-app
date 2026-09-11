@@ -1,29 +1,19 @@
 import express from "express";
-import { success, error } from "@/lib/responseFormat";
+import { success } from "@/lib/responseFormat";
 import { validateFields } from "@/middleware/middleware";
 import { z } from "zod";
-import isPathInside from "is-path-inside";
+import fs from "node:fs/promises";
 import u from "@/utils";
-import p from "path";
-import * as fs from "fs";
-
-const router = express.Router();
-
-export default router.post(
-  "/",
-  validateFields({
-    path: z.string(),
-  }),
-  async (req, res) => {
-    const { path } = req.body;
-    const skillsRoot = u.getPath(["skills"]);
-    const filePath = p.join(skillsRoot, path);
-    if (!isPathInside(filePath, skillsRoot)) {
-      return res.status(400).send(error("无效的路径"));
+import { readManagedPrompt } from "@/services/promptRegistry";
+import { promptPaths, sendPromptError } from "../promptManage/_shared";
+import { resolveSkillTarget } from "./_managedSkill";
+export default express.Router().post("/", validateFields({ path: z.string().min(1) }), async (req, res) => {
+  try {
+    const target = await resolveSkillTarget(req.body.path, u.getPath("skills"));
+    if (target.managedKey) {
+      const entry = await readManagedPrompt(u.db, target.managedKey, promptPaths());
+      return res.send(success({ ...entry, managedKey: target.managedKey }));
     }
-
-    const raw = await fs.promises.readFile(filePath, "utf-8");
-
-    res.status(200).send(success(raw));
-  },
-);
+    return res.send(success(await fs.readFile(target.target, "utf8")));
+  } catch (err) { return sendPromptError(res, err); }
+});

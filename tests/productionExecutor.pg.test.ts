@@ -169,9 +169,13 @@ test("independent production resumes the same task without replaying its saved d
     let entered!: () => void;
     const waiting = new Promise<void>((resolve) => { entered = resolve; });
     const blocked = new Promise<void>((resolve) => { release = resolve; });
-    let storyboardCalls = 0, directorCalls = 0;
+    let storyboardCalls = 0, directorCalls = 0, skillLoads = 0;
+    let skillVersion = "PRODUCTION-SKILL-V1";
+    await f.db("o_prompt").where({ type: "scriptAssetExtraction" }).update({ useData: "PRODUCTION-COMMON-V1" });
     const model: StructuredScriptModel = { async generate(request) {
       assert.equal(request.useModelOutputLimit, true);
+      if (request.role === "universalAi") assert.match(request.system, /PRODUCTION-COMMON-V1/);
+      else if (request.role !== "productionAgent:decisionAgent") assert.match(request.system, /PRODUCTION-SKILL-V1/);
       if (request.role === "productionAgent:decisionAgent") return { value: request.schema.parse({ actions: ["extractAssets", "planning", "deriveAssets", "storyboard"], assetIds: [f.assetId], storyboardIds: [], question: null, summary: "Plan and storyboard" }), outputTokens: 100 };
       if (request.role === "universalAi") return { value: request.schema.parse({ roles: [{ action: "reuse", assetId: f.assetId, expectedVersion: 0 }], scenes: [], props: [], summary: "Reuse" }), outputTokens: 600 };
       if (request.role === "productionAgent:deriveAssetsAgent") return { value: request.schema.parse({ assets: [] }), outputTokens: 7 };
@@ -180,12 +184,14 @@ test("independent production resumes the same task without replaying its saved d
       if (storyboardCalls === 1) { entered(); await blocked; }
       return { value: request.schema.parse({ items: [{ id: null, expectedVersion: null, prompt: "Resumed shot", videoDesc: "", duration: 3, track: "A", shouldGenerateImage: 0, associateAssetsIds: [f.assetId] }], summary: "Done" }), outputTokens: 2000 };
     } };
-    const agent = runtime(f, model);
+    const agent = new BuiltinAgentRuntime({ db: f.db, authorize: async () => undefined, execute: createProductionAgentExecutor({ db: f.db, model, loadSkill: async (name) => { skillLoads += 1; return `${skillVersion}:${name}`; } }) });
     const created = await agent.create({ agentType: "productionAgent", projectId: f.projectId, scriptId: f.scriptId, requestedBy: 1, prompt: "Produce", idempotencyKey: "independent-output-resume", limits: defaultBuiltinRunLimits, intent: { outputBudgetMode: "model_per_call" } });
     const running = agent.runOnce();
     await Promise.race([waiting, running.then(() => { throw new Error("Run stopped before reaching storyboard"); })]);
     const current = await agent.get(created.run.id);
     const paused = await agent.control(current.id, current.version, "pause");
+    skillVersion = "PRODUCTION-SKILL-V2";
+    await f.db("o_prompt").where({ type: "scriptAssetExtraction" }).update({ useData: "PRODUCTION-COMMON-V2" });
     release(); await running;
     await agent.control(current.id, paused.version, "resume");
     await agent.runOnce();
@@ -193,6 +199,9 @@ test("independent production resumes the same task without replaying its saved d
     assert.equal(done.status, "succeeded", done.errorMessage ?? "");
     assert.equal(directorCalls, 1); assert.equal(storyboardCalls, 2);
     assert.equal(done.outputTokens, 16707);
+    assert.equal(skillLoads, 4);
+    const promptSnapshot = await f.db("ext_builtin_run_steps").where({ runId: current.id, stepKey: "production.promptSnapshot" }).first();
+    assert.equal(promptSnapshot.attempt, 1); assert.equal(promptSnapshot.modelCall, false);
     assert.equal((await f.db("o_storyboard").where({ scriptId: f.scriptId })).length, 1);
   } finally { release?.(); await f.destroy(); }
 });

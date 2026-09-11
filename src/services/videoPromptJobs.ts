@@ -1,4 +1,7 @@
-import { assertVideoPromptDialogue } from "@/lib/videoPromptContract";
+import { assertVideoPromptDialogue, type VideoPromptReviewReport } from "@/lib/videoPromptContract";
+import { validatePromptReferenceSelection, type VideoPromptComposition, type VideoGenerationSettings } from "./videoPromptComposition";
+import { deterministicPromptFindings, promptReviewBinding } from "./videoPromptReview";
+import { resolveVideoReferenceMediaType } from "../lib/videoPromptReferences";
 import { createHash } from "node:crypto";
 import type { Knex } from "knex";
 import { lockProjectTransaction } from "@/lib/dbTransaction";
@@ -18,6 +21,7 @@ export interface VideoPromptJobInput {
   mode: string;
   info: Array<{ id: number; sources: string; fileType?: "image" | "video" | "audio" }>;
   idempotencyKey: string;
+  generation?: VideoGenerationSettings;
 }
 
 export interface VideoPromptSource {
@@ -39,6 +43,9 @@ export interface VideoPromptJob {
   sourceSnapshot: VideoPromptSource[];
   referenceSnapshot: unknown;
   promptInput: string;
+  compositionSnapshot?: VideoPromptComposition | null;
+  referenceLabels?: string[];
+  promptReview?: VideoPromptReviewReport | null;
   resultPrompt?: string | null;
   reason?: string | null;
 }
@@ -97,6 +104,10 @@ export async function ensureVideoPromptJobSchema(db: Knex): Promise<void> {
     }
     if (!(await trx.schema.hasColumn(JOBS, "requestIdentityHash"))) await trx.schema.alterTable(JOBS, (table) => table.text("requestIdentityHash").notNullable().defaultTo(""));
     if (!(await trx.schema.hasColumn(JOBS, "referenceSnapshot"))) await trx.schema.alterTable(JOBS, (table) => table.jsonb("referenceSnapshot").notNullable().defaultTo("{}"));
+    for (const column of ["compositionSnapshot", "referenceLabels", "reviewReport"]) {
+      if (!(await trx.schema.hasColumn(JOBS, column))) await trx.schema.alterTable(JOBS, (table) => table.jsonb(column).nullable());
+    }
+    if (!(await trx.schema.hasColumn(JOBS, "reviewBinding"))) await trx.schema.alterTable(JOBS, (table) => table.text("reviewBinding").nullable());
     // A process restart cannot resume an in-memory model call. Resolve jobs
     // left active by the previous process so the UI never polls forever.
     const reason = "提示词任务因服务重启未完成，请重新生成";
@@ -112,11 +123,12 @@ export async function ensureVideoPromptJobSchema(db: Knex): Promise<void> {
 function toJob(row: any): VideoPromptJob {
   return {
     id: String(row.id), projectId: Number(row.projectId), scriptId: Number(row.scriptId), trackId: Number(row.trackId), model: String(row.model), mode: String(row.mode),
+    compositionSnapshot: json(row.compositionSnapshot ?? null), referenceLabels: json(row.referenceLabels ?? []), promptReview: json(row.reviewReport ?? null),
     state: row.state, trackVersion: Number(row.trackVersion), sourceSnapshot: json<VideoPromptSource[]>(row.sourceSnapshot), referenceSnapshot: json(row.referenceSnapshot ?? null), promptInput: String(row.promptInput), resultPrompt: row.resultPrompt ?? null, reason: row.reason ?? null,
   };
 }
 
-export async function prepareVideoPromptJob(db: Knex, input: VideoPromptJobInput): Promise<{ job: VideoPromptJob; reused: boolean }> {
+export async function prepareVideoPromptJob(db: Knex, input: VideoPromptJobInput, options: { compose?: (context: { db: Knex; scriptDuration: number; referenceCount: number }) => Promise<VideoPromptComposition> } = {}): Promise<{ job: VideoPromptJob; reused: boolean }> {
   await ensureVideoPromptJobSchema(db);
   const projectId = positive(input.projectId, "projectId");
   const scriptId = positive(input.scriptId, "scriptId");
@@ -128,7 +140,7 @@ export async function prepareVideoPromptJob(db: Knex, input: VideoPromptJobInput
     if (!(await trx("o_script").where({ id: scriptId, projectId }).first())) throw new VideoPromptJobError("CONFLICT", "剧集不属于当前项目");
     const track = await trx("o_videoTrack").where({ id: trackId, projectId, scriptId }).forUpdate().first();
     if (!track) throw new VideoPromptJobError("CONFLICT", "视频轨道不属于当前项目或剧集");
-    const requestIdentityHash = hash({ projectId, scriptId, trackId, model: input.model, mode: input.mode, info: input.info });
+    const requestIdentityHash = hash({ projectId, scriptId, trackId, model: input.model, mode: input.mode, info: input.info, ...(input.generation === undefined ? {} : { generation: input.generation }) });
     const existingByRequest = await trx(JOBS).where({ projectId, scriptId, trackId, idempotencyKey }).first();
     if (existingByRequest) {
       if (existingByRequest.requestIdentityHash && existingByRequest.requestIdentityHash !== requestIdentityHash) throw new VideoPromptJobError("CONFLICT", "提示词任务编号已用于不同请求");
@@ -161,16 +173,23 @@ export async function prepareVideoPromptJob(db: Knex, input: VideoPromptJobInput
     const selectedStoryboardById = new Map(selectedStoryboards.map((row) => [Number(row.id), row]));
     const selectedAssetById = new Map(selectedAssets.map((row) => [Number(row.id), row]));
     const referenceCounts = { image: 0, video: 0, audio: 0 };
+    const referenceLabels: string[] = [];
     const selectedVisual = (input.info ?? []).map((item, index) => {
       const row = item.sources === "storyboard" ? selectedStoryboardById.get(Number(item.id)) : selectedAssetById.get(Number(item.id));
-      if (!row) return "";
-      const mediaType = item.sources === "storyboard" ? "image" : item.fileType || (row.mediaType === "audio" || row.type === "audio" ? "audio" : row.mediaType === "video" || row.type === "video" ? "video" : "image");
+      if (!row?.filePath) throw new VideoPromptJobError("INVALID_INPUT", "所选参考尚无媒体文件，不能编造上传标签");
+      const mediaType = item.sources === "storyboard" ? "image" : resolveVideoReferenceMediaType(row.mediaType, row.type, row.filePath);
+      if (item.fileType && item.fileType !== mediaType) throw new VideoPromptJobError("INVALID_INPUT", "参考媒体类型与实际素材不一致");
       const label = { image: "图片", video: "视频", audio: "音频" }[mediaType];
       const number = ++referenceCounts[mediaType];
-      return `选择顺序${index + 1}，@${label}${number}，来源 ${item.sources} ${Number(item.id)}：${row.name ?? "分镜参考"}；${visualText(row.describe ?? row.prompt ?? "")}`;
+      referenceLabels.push(`@${label}${number}`);
+      const framePosition = ["singleImage", "startEndRequired", "endFrameOptional", "startFrameOptional"].includes(input.mode) ? (index === 0 ? "，帧位置：首帧" : "，帧位置：尾帧") : "";
+      return `选择顺序${index + 1}，@${label}${number}${framePosition}，来源 ${item.sources} ${Number(item.id)}：${row.name ?? "分镜参考"}；${visualText(row.describe ?? row.prompt ?? "")}`;
     }).filter(Boolean);
     const semanticIdentity = linkedAssets.map((row) => `语义身份（仅用于理解，不代表已上传参考图）：${row.name ?? "未命名"}：${row.describe ?? ""}`).join("\n");
+    validatePromptReferenceSelection(input.mode, [...Array(referenceCounts.image).fill("image"), ...Array(referenceCounts.video).fill("video"), ...Array(referenceCounts.audio).fill("audio")]);
+    const compositionSnapshot = options.compose ? await options.compose({ db: trx, scriptDuration: sourceSnapshot.reduce((total, row) => total + (Number(row.duration) || 0), 0), referenceCount: referenceLabels.length }) : null;
     const promptInput = [
+      compositionSnapshot ? `实际生成参数：${JSON.stringify(compositionSnapshot.context)}` : `模型：${input.model}；模式：${input.mode}；脚本总时长：${sourceSnapshot.reduce((total, row) => total + (Number(row.duration) || 0), 0)}秒；生成参数：${JSON.stringify(input.generation ?? {})}（旧调用未提供字段，不能猜测参数）`,
       `源分镜（必须覆盖当前轨道全部分镜）：\n${buildStoryboardVideoPrompt(sourceSnapshot)}`,
       semanticIdentity,
       selectedVisual.length ? `本次用户选择的视觉参考（仅这些素材会作为视觉输入）：\n${selectedVisual.join("\n")}` : "本次未选择视觉参考图，不能假定存在已上传参考图。",
@@ -181,7 +200,7 @@ export async function prepareVideoPromptJob(db: Knex, input: VideoPromptJobInput
     const active = await trx(JOBS).where({ projectId, scriptId, trackId }).whereIn("state", ["queued", "running"]).first();
     if (active) throw new VideoPromptJobError("CONFLICT", "当前轨道已有提示词任务正在生成");
     const now = Date.now();
-    const row = { id: `vprompt-${hash({ projectId, scriptId, trackId, idempotencyKey }).slice(0, 40)}`, projectId, scriptId, trackId, model: input.model, mode: input.mode, idempotencyKey, requestHash, requestIdentityHash, state: "queued", trackVersion: trackState.version, sourceSnapshot: JSON.stringify(sourceSnapshot), referenceSnapshot: JSON.stringify(referenceSnapshot), promptInput, resultPrompt: null, reason: null, createdAt: now, updatedAt: now };
+    const row = { id: `vprompt-${hash({ projectId, scriptId, trackId, idempotencyKey }).slice(0, 40)}`, projectId, scriptId, trackId, model: input.model, mode: input.mode, idempotencyKey, requestHash, requestIdentityHash, state: "queued", trackVersion: trackState.version, sourceSnapshot: JSON.stringify(sourceSnapshot), referenceSnapshot: JSON.stringify(referenceSnapshot), compositionSnapshot: compositionSnapshot ? JSON.stringify(compositionSnapshot) : null, referenceLabels: JSON.stringify(referenceLabels), promptInput, resultPrompt: null, reason: null, createdAt: now, updatedAt: now };
     await trx(JOBS).insert(row);
     await trx("o_videoTrack").where({ id: trackId, projectId, scriptId }).update({ state: "生成中", reason: null });
     return { job: toJob(row), reused: false };
@@ -206,7 +225,7 @@ export async function markVideoPromptPreparationFailed(db: Knex, input: Pick<Vid
   });
 }
 
-export async function executeVideoPromptJob(db: Knex, jobId: string, generate: (job: VideoPromptJob) => Promise<string>): Promise<VideoPromptJob> {
+export async function executeVideoPromptJob(db: Knex, jobId: string, generate: (job: VideoPromptJob) => Promise<string | { prompt: string; review: VideoPromptReviewReport }>): Promise<VideoPromptJob> {
   let active = executing.get(db);
   if (!active) { active = new Map(); executing.set(db, active); }
   const current = active.get(jobId);
@@ -216,7 +235,7 @@ export async function executeVideoPromptJob(db: Knex, jobId: string, generate: (
   try { return await promise; } finally { active.delete(jobId); }
 }
 
-async function executeVideoPromptJobOnce(db: Knex, jobId: string, generate: (job: VideoPromptJob) => Promise<string>): Promise<VideoPromptJob> {
+async function executeVideoPromptJobOnce(db: Knex, jobId: string, generate: (job: VideoPromptJob) => Promise<string | { prompt: string; review: VideoPromptReviewReport }>): Promise<VideoPromptJob> {
   await ensureVideoPromptJobSchema(db);
   const claimed = await db.transaction(async (trx) => {
     const row = await trx(JOBS).where({ id: jobId }).forUpdate().first();
@@ -227,9 +246,16 @@ async function executeVideoPromptJobOnce(db: Knex, jobId: string, generate: (job
   });
   if (!claimed.started) return claimed.job;
   try {
-    const resultPrompt = await generate(claimed.job);
+    const generated = await generate(claimed.job);
+    const resultPrompt = typeof generated === "string" ? generated : generated.prompt;
+    const promptReview = typeof generated === "string" ? null : generated.review;
     if (typeof resultPrompt !== "string" || !resultPrompt.trim()) throw new VideoPromptJobError("INVALID_INPUT", "模型未返回有效提示词");
-    assertVideoPromptDialogue(buildStoryboardVideoPrompt(claimed.job.sourceSnapshot), resultPrompt);
+    if (promptReview) await db(JOBS).where({ id: claimed.job.id, state: "running" }).update({ reviewReport: JSON.stringify(promptReview), reviewBinding: promptReviewBinding(claimed.job, resultPrompt) });
+    // Generated drafts must preserve deterministic source content; semantic uncertainty remains visible.
+    assertVideoPromptDialogue(buildStoryboardVideoPrompt(claimed.job.sourceSnapshot), resultPrompt, ((claimed.job.referenceSnapshot as any)?.linkedAssets ?? []).filter((item: any) => item.type === "role").map((item: any) => String(item.name ?? "")));
+    const invalidReference = deterministicPromptFindings(claimed.job, resultPrompt).find((finding) => ["INVALID_REFERENCE_LABEL", "SPEAKER_CHANGED", "OFFSCREEN_SPEECH_CHANGED"].includes(finding.code));
+    if (invalidReference) throw new VideoPromptJobError("INVALID_INPUT", invalidReference.message);
+
     return await db.transaction(async (trx) => {
       await lockProjectTransaction(trx, claimed.job.projectId);
       const current = await trx("o_videoTrack").where({ id: claimed.job.trackId, projectId: claimed.job.projectId, scriptId: claimed.job.scriptId }).forUpdate().first();
@@ -261,7 +287,7 @@ async function executeVideoPromptJobOnce(db: Knex, jobId: string, generate: (job
       await advanceCreativeState(trx, { entityType: "track", entityId: claimed.job.trackId, projectId: claimed.job.projectId, expectedVersion: claimed.job.trackVersion, actor: { kind: "system", id: `video-prompt:${claimed.job.id}` } });
       await trx("o_videoTrack").where({ id: claimed.job.trackId, projectId: claimed.job.projectId, scriptId: claimed.job.scriptId }).update({ prompt: resultPrompt, state: "已完成", reason: null });
       await trx(JOBS).where({ id: claimed.job.id }).update({ state: "succeeded", resultPrompt, reason: null, updatedAt: Date.now() });
-      return { ...claimed.job, state: "succeeded", resultPrompt, reason: null };
+      return { ...claimed.job, state: "succeeded", resultPrompt, promptReview, reason: null };
     });
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);

@@ -14,3 +14,12 @@ test("source dialogue cannot turn into no-dialogue output", () => {
   assert.doesNotThrow(() => assertVideoPromptDialogue("牌子写着『欢迎』，无对白。", "码头静态全景。"));
   assert.match(videoPromptSystem("旧模板"), /语义身份描述不表示额外上传/);
 });
+
+test("unquoted Chinese dialogue remains protected and quoted signs are not speech", () => {
+  for (const source of ["灵兽说：我已知道，它今天安静。", "画外音（雪璃）：别动，我会回来。", "台词：不要走！等着我！"]) {
+    assert.throws(() => assertVideoPromptDialogue(source, "平静空镜"), /遗漏或改写/);
+    assert.doesNotThrow(() => assertVideoPromptDialogue(source, source));
+  }
+  assert.throws(() => assertVideoPromptDialogue("雪璃：等着我。", "平静空镜", ["雪璃"]), /遗漏或改写/);
+  assert.doesNotThrow(() => assertVideoPromptDialogue("画面：店铺牌子写着『欢迎』。", "空镜"));
+});

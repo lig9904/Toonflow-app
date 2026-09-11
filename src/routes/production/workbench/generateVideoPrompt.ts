@@ -1,57 +1,26 @@
+import { prepareRuntimeVideoPromptJob, generateRuntimeVideoPrompt } from "@/services/videoPromptCompositionRuntime";
 import express from "express";
-import { videoPromptSystem } from "@/lib/videoPromptContract";
 import u from "@/utils";
 import { z } from "zod";
 import { success, error } from "@/lib/responseFormat";
 import { validateFields } from "@/middleware/middleware";
-import fs from "fs/promises";
-import path from "path";
-import { isSeedance2Model } from "@/lib/videoPromptReferences";
-import { executeVideoPromptJob, markVideoPromptPreparationFailed, prepareVideoPromptJob } from "@/services/videoPromptJobs";
+import { executeVideoPromptJob, markVideoPromptPreparationFailed } from "@/services/videoPromptJobs";
 
 const router = express.Router();
+const generationSchema = z.object({ duration: z.number().finite().positive().optional(), resolution: z.string().min(1).optional(), audio: z.boolean().optional() });
 const infoSchema = z.object({ id: z.number().int().positive(), sources: z.enum(["storyboard", "assets"]), fileType: z.enum(["image", "video", "audio"]).optional() });
-
-async function promptSystem(model: string, mode: string): Promise<string | undefined> {
-  const [vendorId, modelName] = model.split(/:(.+)/);
-  const bound = await u.db("o_modelPrompt").where("vendorId", vendorId).where("model", modelName).first();
-  let system: string | undefined;
-  if (bound) {
-    try { system = await fs.readFile(path.join(u.getPath(["modelPrompt"]), String(bound.path)), "utf-8"); } catch {}
-  }
-  if (!system) {
-    const lower = (modelName ?? "").toLowerCase();
-    const fileName = lower.includes("wan") && lower.includes("2.6")
-      ? "wan2.6Single-imageFirstFrameMode.md"
-      : isSeedance2Model(lower)
-        ? "seedance2Multi-parameterMode.md"
-        : mode === "startEndRequired" || mode === "endFrameOptional" || mode === "startFrameOptional"
-          ? "universalFirstAndLastFrameMode.md"
-          : typeof mode === "string" && mode.startsWith("[\"") && mode.endsWith("\"]")
-            ? "universalMulti-parameterMode.md"
-            : null;
-    if (fileName) {
-      try { system = await fs.readFile(path.join(u.getPath(["modelPrompt"]), "video", fileName), "utf-8"); } catch {}
-    }
-  }
-  if (system) return system;
-  const fallback = await u.db("o_prompt").where("type", "videoPromptGeneration").first();
-  return fallback?.useData || fallback?.data || undefined;
-}
 
 export default router.post(
   "/",
   validateFields({
-    projectId: z.number(), scriptId: z.number(), trackId: z.number(), info: z.array(infoSchema), model: z.string(), mode: z.string(), idempotencyKey: z.string().min(8).max(150),
+    projectId: z.number(), scriptId: z.number(), trackId: z.number(), info: z.array(infoSchema), model: z.string(), mode: z.string(), idempotencyKey: z.string().min(8).max(150), generation: generationSchema.optional(),
   }),
   async (req, res) => {
-    const { trackId, projectId, scriptId, info, model, mode, idempotencyKey } = req.body;
+    const { trackId, projectId, scriptId, info, model, mode, idempotencyKey, generation } = req.body;
     try {
       const project = await u.db("o_project").where({ id: projectId }).select("id", "artStyle").first();
       if (!project) return res.status(400).send(error("项目不存在"));
-      const system = await promptSystem(model, mode);
-      const visualManual = u.getArtPrompt(project.artStyle || "无", "art_skills", "art_storyboard_video");
-      const prepared = await prepareVideoPromptJob(u.db, { projectId, scriptId, trackId, model, mode, info, idempotencyKey });
+      const prepared = await prepareRuntimeVideoPromptJob( { projectId, scriptId, trackId, model, mode, info, idempotencyKey, generation });
       if (prepared.job.state === "failed") return res.status(400).send(error(prepared.job.reason ?? "提示词生成失败"));
       if (prepared.job.state === "succeeded") {
         const current = await u.db("o_videoTrack as track").leftJoin("ext_creative_state as state", function () {
@@ -63,10 +32,7 @@ export default router.post(
       // A durable receipt lets the UI follow this exact job immediately,
       // instead of keeping a model request open while polling older jobs.
       res.status(202).send(success({ state: prepared.job.state, jobId: prepared.job.id }));
-      void executeVideoPromptJob(u.db, prepared.job.id, async (job) => {
-        const response = await u.Ai.Text("universalAi").invoke({ system: videoPromptSystem(system), messages: [{ role: "assistant", content: visualManual }, { role: "user", content: `模型：${model}\n${job.promptInput}` }] });
-        return response.text;
-      }).catch(() => undefined); // The job records its failure for polling.
+      void executeVideoPromptJob(u.db, prepared.job.id, generateRuntimeVideoPrompt).catch(() => undefined); // The job records its failure for polling.
     } catch (e) {
       await markVideoPromptPreparationFailed(u.db, { projectId, scriptId, trackId }, u.error(e).message).catch(() => undefined);
       return res.status(400).send(error(u.error(e).message));

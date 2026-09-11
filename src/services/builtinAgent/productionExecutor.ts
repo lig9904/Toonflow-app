@@ -126,7 +126,6 @@ function scopedMediaInstructions(
 }
 
 export function createProductionAgentExecutor(deps: ProductionExecutorDependencies) {
-  const extractAssets = createAssetExtractionHelper({ db: deps.db, model: deps.model });
   return async (ctx: BuiltinExecutionContext): Promise<unknown> => {
     const { run } = ctx;
     if (run.agentType !== "productionAgent" || run.projectId == null || run.scriptId == null) throw new BuiltinRuntimeError("INVALID_INPUT", "制作任务需要项目和剧集");
@@ -168,13 +167,23 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
       // worker resumes. Replay the original stage input, not our later writes.
       return independentOutput ? ctx.step(`production.flow.after.${after}:r${revision}`, { projectId, scriptId }, read) : read();
     };
-    const skillCache = new Map<string, string>();
-    const skill = async (name: string) => { if (!skillCache.has(name)) skillCache.set(name, await deps.loadSkill(name)); return skillCache.get(name)!; };
+    const frozenSkills = await ctx.step("production.promptSnapshot", {}, async () => {
+      const instructions = await deps.db("o_prompt").where({ type: "scriptAssetExtraction" }).first();
+      const skills = Object.fromEntries(await Promise.all([
+      "builtin_production_director.md", "builtin_production_derive.md", "builtin_production_storyboard.md", "builtin_production_review.md",
+    ].map(async (name) => [name, await deps.loadSkill(name)])));
+      return { ...skills, assetExtraction: String(instructions?.useData || instructions?.data || "") };
+    });
+    const extractAssets = createAssetExtractionHelper({ db: deps.db, model: deps.model, loadInstructions: async () => frozenSkills.assetExtraction });
+    const skill = async (name: string) => {
+      if (!(name in frozenSkills)) throw new BuiltinRuntimeError("INVALID_INPUT", "当前运行未记录该提示词版本");
+      return frozenSkills[name];
+    };
     const model = async <T>(key: string, role: StructuredModelRequest<T>["role"], skillName: string, schema: z.ZodType<T>, input: unknown, budget: number, reserveTokens = 0): Promise<T> => {
       if (!independentOutput && budget < 128) throw new BuiltinRuntimeError("BUDGET_EXCEEDED", "输出额度不足以执行制作阶段");
       await ctx.assertActive();
       const system = role === "productionAgent:decisionAgent" ? `${productionDecisionPrompt}\n${scopedMediaInstructionPrompt}`
-        : `${await skill(skillName)}\n\n当前服务器执行契约（取代上述旧工具、XML和前端保存流程）：${productionStageContract(role)} 所有项目、剧集、素材、分镜 ID 必须来自输入。`;
+        : `${await skill(skillName)}\n\n当前服务器执行契约：${productionStageContract(role)} 所有项目、剧集、素材、分镜 ID 必须来自输入。`;
       const result = await ctx.step(`production.${key}:r${revision}`, { input, role, systemHash: hash(system), ...(independentOutput ? { outputBudgetMode: "model_per_call" } : { budget, reserveTokens }) }, async () => {
         const remaining = !independentOutput && ctx.remainingOutputTokens ? await ctx.remainingOutputTokens() : run.limits.maxOutputTokens;
         const effectiveBudget = independentOutput ? 0 : Math.min(budget, remaining - reserveTokens);

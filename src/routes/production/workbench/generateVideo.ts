@@ -1,3 +1,4 @@
+import { preflightVideoPrompt } from "@/services/videoPromptReview";
 import express from "express";
 import u from "@/utils";
 import { z } from "zod";
@@ -36,10 +37,11 @@ export default express.Router().post("/", async (req, res) => {
       if (existing.payloadHash !== requestHash) throw new VideoJobError("CONFLICT", "idempotencyKey 已用于不同的视频任务参数");
       return res.send(success({ videoId: existing.videoId, jobId: existing.id, status: existing.status, reused: true }));
     }
+    const promptReview = await preflightVideoPrompt(u.db, { projectId: input.projectId, scriptId: input.scriptId, trackId: input.trackId, prompt: input.prompt, model: input.model, mode: input.mode, generation: { duration: input.duration, resolution: input.resolution, audio: input.audio ?? false }, info: input.uploadData, referenceTypes: references.map((item) => item.type) });
     const request: VideoJobRequest = { modelKey: input.model, providerFingerprint: provider.fingerprint, projectId: input.projectId,
       scriptId: input.scriptId, trackId: input.trackId, outputPath: `/${input.projectId}/video/${uuid()}.mp4`, config };
     const reserved = await jobs.reserveNewVideo(input.idempotencyKey, request, requestHash);
-    res.send(success({ videoId: reserved.job.videoId, jobId: reserved.job.id, status: reserved.job.status, reused: !reserved.created }));
+    res.send(success({ videoId: reserved.job.videoId, jobId: reserved.job.id, status: reserved.job.status, reused: !reserved.created, promptReview }));
     if (reserved.created) void jobs.submitReserved(reserved.job.id).catch((error) => console.error("[videoJobs] submit failed", error));
   } catch (error) {
     sendProductionError(res, error);

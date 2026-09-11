@@ -7,6 +7,7 @@ import { ensureImageJobsSchema, ImageJobError, ImageJobService, type ImageJob } 
 import { resolveImageFlowOwner, ImageFlowWorkspaceError } from "../imageFlowWorkspace";
 import { assertImageMediaProject, resolveImageMediaOwnership, MediaOwnershipError } from "../../lib/mediaOwnership";
 import { imageReferencesMatch, type ImageReferenceSnapshot } from "./referenceSnapshot";
+import type { ImageReviewService, PreparedImageReview } from "../imageReviews";
 
 const BINDINGS = "ext_image_job_bindings";
 
@@ -28,6 +29,7 @@ export interface PrepareImageGenerationInput {
   target: ImageGenerationTarget;
   builtinRun?: { id: string; inputRevision: number };
   referenceAssets?: ImageReferenceSnapshot[];
+  referencePaths?: Array<string | undefined>;
   outputPath?: string;
 }
 
@@ -56,6 +58,7 @@ export interface ImageGenerationServiceOptions {
   uuid?(): string;
   now?(): number;
   pollMs?: number;
+  imageReviews?: ImageReviewService;
 }
 
 interface BindingContext {
@@ -69,6 +72,8 @@ interface BindingContext {
   previousState?: string | null;
   builtinRun?: { id: string; inputRevision: number };
   referenceAssets?: ImageReferenceSnapshot[];
+  referencePaths?: Array<string | null>;
+  imageReview?: PreparedImageReview;
 }
 
 interface BindingRow {
@@ -88,6 +93,7 @@ interface BindingRow {
   runInputRevision: number | string | null;
   candidateImageId: number | string | null;
   artifactPath: string | null;
+  artifactHash: string | null;
   selected: number | boolean;
   state: string;
   error: string | null;
@@ -134,6 +140,7 @@ export async function ensureProductionImageJobSchema(db: Knex): Promise<void> {
     await db.raw(`CREATE INDEX IF NOT EXISTS "ext_image_job_bindings_artifact_idx" ON "${BINDINGS}" ("artifactPath") WHERE "artifactPath" IS NOT NULL`);
     await db.raw(`ALTER TABLE "${BINDINGS}" ADD COLUMN IF NOT EXISTS "runId" text`);
     await db.raw(`ALTER TABLE "${BINDINGS}" ADD COLUMN IF NOT EXISTS "runInputRevision" bigint`);
+    await db.raw(`ALTER TABLE "${BINDINGS}" ADD COLUMN IF NOT EXISTS "artifactHash" text`);
     return;
   }
   if (!(await db.schema.hasTable(BINDINGS))) {
@@ -154,6 +161,7 @@ export async function ensureProductionImageJobSchema(db: Knex): Promise<void> {
       table.integer("runInputRevision");
       table.integer("candidateImageId");
       table.text("artifactPath");
+      table.text("artifactHash");
       table.boolean("selected").notNullable().defaultTo(false);
       table.text("state").notNullable();
       table.text("error");
@@ -163,6 +171,7 @@ export async function ensureProductionImageJobSchema(db: Knex): Promise<void> {
       table.index(["artifactPath"]);
     });
   }
+  if (!(await db.schema.hasColumn(BINDINGS, "artifactHash"))) await db.schema.alterTable(BINDINGS, (table) => { table.text("artifactHash"); });
 }
 
 /** Returns the owning project for both selected and saved-but-unselected generated images. */
@@ -184,6 +193,7 @@ export class ImageGenerationService {
   private readonly pollMs: number;
   private schema?: Promise<void>;
   private timer?: ReturnType<typeof setInterval>;
+  private readonly artifactHashes = new Map<string, string | null>();
 
   constructor(options: ImageGenerationServiceOptions) {
     this.db = options.db;
@@ -193,7 +203,10 @@ export class ImageGenerationService {
     this.jobs = new ImageJobService({
       db: options.db,
       providerFor: options.providerFor,
-      download: options.download,
+      download: async (url, outputPath) => {
+        await options.download(url, outputPath);
+        if (options.imageReviews) this.artifactHashes.set(outputPath, await options.imageReviews.hashSavedImage(outputPath).catch(() => null));
+      },
       onSaved: (job, trx) => this.bindSavedArtifact(job, trx),
       now: this.now,
       initialPollDelayMs: this.pollMs,
@@ -209,6 +222,8 @@ export class ImageGenerationService {
       ...(await this.readBindingContext(input)), requestedModelKey: input.modelKey,
       ...(input.builtinRun ? { builtinRun: normalizeBuiltinRun(input.builtinRun) } : {}),
       ...(input.referenceAssets ? { referenceAssets: input.referenceAssets } : {}),
+      ...(input.referencePaths ? { referencePaths: input.referencePaths.map((value) => value ?? null) } : {}),
+      ...(this.options.imageReviews ? { imageReview: await this.options.imageReviews.prepare(input) } : {}),
     };
     const effectiveModelKey = existing?.modelKey ?? await this.resolveEffectiveModel(input.modelKey, input.config.referenceList?.length ?? 0);
     if (!existing && this.options.validateConfig) {
@@ -327,7 +342,10 @@ export class ImageGenerationService {
     if (stableJson(expectedTarget) !== stableJson(saved.target)) throw new ImageGenerationError("CONFLICT", "generationKey 已绑定不同的图片目标或版本", 409);
     if (input.modelKey !== (saved.requestedModelKey ?? job.modelKey)) throw new ImageGenerationError("CONFLICT", "generationKey 已绑定不同的请求图片模型", 409);
     if (stableJson(input.builtinRun ? normalizeBuiltinRun(input.builtinRun) : null) !== stableJson(saved.builtinRun ?? null)) throw new ImageGenerationError("CONFLICT", "generationKey 已绑定不同的内置运行版本", 409);
-    if (stableJson(input.referenceAssets ?? null) !== stableJson(saved.referenceAssets ?? null)) throw new ImageGenerationError("CONFLICT", "generationKey 已绑定不同的素材参考版本", 409);
+    // Older reservations predate reference metadata; replay their exact saved context.
+    // Existing provider-request hashes still protect the actual ordered image bytes.
+    if (saved.referenceAssets !== undefined && stableJson(input.referenceAssets ?? null) !== stableJson(saved.referenceAssets)) throw new ImageGenerationError("CONFLICT", "generationKey 已绑定不同的素材参考版本", 409);
+    if (saved.referencePaths !== undefined && stableJson(input.referencePaths?.map((value) => value ?? null) ?? null) !== stableJson(saved.referencePaths)) throw new ImageGenerationError("CONFLICT", "generationKey 已绑定不同的图片参考路径", 409);
     return saved as BindingContext;
   }
 
@@ -494,11 +512,20 @@ export class ImageGenerationService {
     } else {
       selected = runMaySelect;
     }
-    await trx(BINDINGS).where({ jobId: job.id }).update({ artifactPath: job.outputPath, selected, state: "SUCCEEDED", error: null, updatedAt: this.now() });
+    await trx(BINDINGS).where({ jobId: job.id }).update({ artifactPath: job.outputPath, artifactHash: this.artifactHashes.get(job.outputPath) ?? null, selected, state: "SUCCEEDED", error: null, updatedAt: this.now() });
+    this.artifactHashes.delete(job.outputPath);
   }
 
   private async syncTerminal(job: ImageJob): Promise<void> {
-    if (job.status === "SUCCEEDED") return;
+    if (job.status === "SUCCEEDED") {
+      // Save/bind has committed. Review errors must never turn a successful image into a failure.
+      // The immutable prepare marker remains in the job payload for restart recovery.
+      if (this.options.imageReviews && (job.payload.context as BindingContext | undefined)?.imageReview) {
+        try { await this.options.imageReviews.enqueue({ projectId: job.projectId, jobId: job.id, automatic: true }); }
+        catch { console.error("[imageReviews] enqueue deferred until recovery", { jobId: job.id }); }
+      }
+      return;
+    }
     if (job.status !== "FAILED" && job.status !== "RECONCILIATION_REQUIRED") return;
     await this.db.transaction(async (trx) => {
       await lockProjectTransaction(trx, job.projectId);

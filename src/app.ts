@@ -29,6 +29,8 @@ import { configureMediaJobRecoveryExecutors } from "@/services/mediaJobControl";
 import { cleanupExpiredVideoReferenceLeases, ensureVideoReferenceBridgeSchema } from "@/services/videoReferenceBridge";
 import { createVideoReferenceBridgeRouter } from "@/services/videoReferenceBridge/http";
 import { ensureVideoPromptJobSchema } from "@/services/videoPromptJobs";
+import { ensurePromptRegistrySchema } from "@/services/promptRegistry";
+import { getProductionImageReviewService } from "@/services/imageReviews/runtime";
 
 const app = express();
 const server = http.createServer(app);
@@ -60,6 +62,7 @@ async function checkPermissions() {
 
 export default async function startServe(randomPort: Boolean = false) {
   await dbReady;
+  await ensurePromptRegistrySchema(u.db);
   await ensureVideoPromptJobSchema(u.db);
   await ensureVideoReferenceBridgeSchema(u.db);
   await cleanupExpiredVideoReferenceLeases(u.db);
@@ -68,6 +71,7 @@ export default async function startServe(randomPort: Boolean = false) {
   await u.oss.ready();
   configureMediaJobRecoveryExecutors({ image: getProductionImageGenerationService(), video: getRuntimeVideoJobService() });
   getProductionImageGenerationService().start();
+  getProductionImageReviewService().start();
   void resumeVideoJobs().catch((error) => console.error("[videoJobs] recovery failed", error instanceof Error ? error.name : "UnknownError"));
 
   await u.writeVersion();
@@ -267,6 +271,7 @@ export default async function startServe(randomPort: Boolean = false) {
 
 // 支持await关闭
 export async function closeServe(): Promise<void> {
+  getProductionImageReviewService().stop();
   getProductionImageGenerationService().stop();
   getRuntimeVideoJobService().stop();
   await getBuiltinAgentRuntime().stop();

@@ -12,6 +12,7 @@ import { buildStoryboardImagePrompt, visualStyleHint } from "../../lib/storyboar
 import { reconcileStoredStoryboardReferences } from "../storyboardVisuals";
 import { snapshotImageReference, type ImageReferenceSnapshot } from "../imageJobs/referenceSnapshot";
 import { matchVideoGenerationDuration, videoTailHoldInstruction } from "../../lib/videoGenerationTiming";
+import { preflightVideoPrompt } from "../videoPromptReview";
 
 export interface MediaModelCapabilities {
   type?: string;
@@ -104,11 +105,26 @@ export function createProductionMediaCapabilities(deps: Dependencies): Productio
             instruction: typeof request.params.imageInstruction === "string" ? request.params.imageInstruction : undefined,
           });
         }
+        if (!referenceAssets && !storyboardIds.length && assetIds.length) {
+          const assets = await deps.db("o_assets as asset").leftJoin("o_image as image", "image.id", "asset.imageId")
+            .where("asset.projectId", request.projectId).whereIn("asset.id", assetIds).select("asset.*", "image.filePath");
+          referenceAssets = assetIds.map((id) => {
+            const asset = assets.find((row) => Number(row.id) === id);
+            if (!asset?.filePath) throw new BuiltinRuntimeError("INVALID_INPUT", "素材参考图片缺失，请先生成或选择图片");
+            return snapshotImageReference(asset, String(asset.filePath));
+          });
+        }
         const referenceInputs: VideoReferenceInput[] = [
           ...storyboardIds.map((id) => ({ id, sources: "storyboard" as const, fileType: "image" as const })),
           ...assetIds.map((id) => ({ id, sources: "assets" as const, fileType: "image" as const })),
         ];
         const references = await loadOwnedVideoReferences(deps.db, request.projectId, request.scriptId, referenceInputs, deps.toBase64);
+        const referenceBoards = storyboardIds.length ? await deps.db("o_storyboard").where({ projectId: request.projectId, scriptId: request.scriptId }).whereIn("id", storyboardIds).select("id", "filePath") : [];
+        const referenceAssetRows = assetIds.length ? await deps.db("o_assets as asset").leftJoin("o_image as image", "image.id", "asset.imageId").where("asset.projectId", request.projectId).whereIn("asset.id", assetIds).select("asset.id", "image.filePath") : [];
+        const referencePaths = referenceInputs.map((input) => {
+          const row = (input.sources === "storyboard" ? referenceBoards : referenceAssetRows).find((item) => Number(item.id) === input.id);
+          return row?.filePath ? String(row.filePath) : undefined;
+        });
         const model = await deps.imageModelFor(request.modelKey, references.length);
         const modes = model.mode ?? [];
         if (references.length === 0 && !modes.includes("text")) throw new BuiltinRuntimeError("INVALID_INPUT", "当前图片模型需要参考图，请先补齐素材图片");
@@ -117,7 +133,7 @@ export function createProductionMediaCapabilities(deps: Dependencies): Productio
         if (request.targetKind === "track") throw new BuiltinRuntimeError("INVALID_INPUT", "图片任务不能绑定视频轨道");
         await request.ctx.assertActive();
         receipt = await deps.images.prepare({ generationKey: request.generationKey, projectId: request.projectId, modelKey: request.modelKey,
-          referenceAssets,
+          referenceAssets, referencePaths,
           config: { prompt, size: String(request.params.size ?? ""), aspectRatio: String(request.params.aspectRatio ?? ""), referenceList: references as Array<{ type: "image"; base64: string }> },
           target: { kind: request.targetKind, id: request.targetId, scriptId: request.scriptId, expectedVersion },
           builtinRun: { id: request.ctx.run.id, inputRevision: request.ctx.run.inputRevision ?? 0 },
@@ -160,6 +176,10 @@ export function createProductionMediaCapabilities(deps: Dependencies): Productio
         const project = await deps.db("o_project").where({ id: request.projectId }).first();
         const config = { ...settings, prompt: [String(request.params.prompt ?? ""), videoTailHoldInstruction(plannedDuration, duration)].filter(Boolean).join("\n"), referenceList, aspectRatio: project?.videoRatio };
         if (!config.prompt || !config.aspectRatio) throw new BuiltinRuntimeError("INVALID_INPUT", "视频提示词或画幅缺失");
+        const promptReview = await preflightVideoPrompt(deps.db, { projectId: request.projectId, scriptId: request.scriptId,
+          trackId: request.targetId, prompt: config.prompt, model: request.modelKey, mode: settings.mode,
+          generation: { duration: settings.duration, resolution: settings.resolution, audio: settings.audio }, info: referenceInputs });
+        await request.ctx.emit("video.promptReview", { trackId: request.targetId, review: promptReview });
         const requestHash = hashVideoJobRequest({ modelKey: request.modelKey, providerFingerprint: provider.fingerprint, projectId: request.projectId, scriptId: request.scriptId, trackId: request.targetId, config });
         const pathKey = createHash("sha256").update(request.generationKey).digest("hex");
         const reserved = await request.ctx.commit(`video.reserve:${request.targetId}`, { generationKey: request.generationKey, requestHash }, async (trx) => {

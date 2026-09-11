@@ -1,3 +1,4 @@
+import { readCurrentVideoPromptReview } from "@/services/videoPromptReview";
 import express from "express";
 import u from "@/utils";
 import { z } from "zod";
@@ -30,12 +31,13 @@ export default router.post(
     const jobsByTrack = new Map<number, any>();
     for (const job of selectedJobs) if (!jobsByTrack.has(Number(job.trackId))) jobsByTrack.set(Number(job.trackId), job);
     const state = (value: string): string => value === "succeeded" ? "已完成" : value === "failed" ? "生成失败" : value === "queued" || value === "running" ? "生成中" : value;
-    const promptList = tracks.map((track) => {
+    const promptList = await Promise.all(tracks.map(async (track) => {
+      const promptReview = await readCurrentVideoPromptReview(u.db, { projectId, scriptId, trackId: Number(track.id), prompt: track.prompt ?? "" });
       const job = jobsByTrack.get(Number(track.id));
       return job
-        ? { id: Number(track.id), jobId: String(job.id), idempotencyKey: String(job.idempotencyKey), state: state(String(job.state)), reason: job.reason ?? "", prompt: track.prompt ?? "", version: versionByTrack.get(Number(track.id)) ?? 0 }
-        : { ...track, version: versionByTrack.get(Number(track.id)) ?? 0 };
-    });
+        ? { promptReview, id: Number(track.id), jobId: String(job.id), idempotencyKey: String(job.idempotencyKey), state: state(String(job.state)), reason: job.reason ?? "", prompt: track.prompt ?? "", version: versionByTrack.get(Number(track.id)) ?? 0 }
+        : { ...track, promptReview, version: versionByTrack.get(Number(track.id)) ?? 0 };
+    }));
     res.status(200).send(success(promptList));
   },
 );

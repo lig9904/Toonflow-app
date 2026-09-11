@@ -47,7 +47,7 @@ describe("official Volcengine Seedream and Seedance provider", () => {
     assert.equal(provider.vendor.models[4].durationResolutionMap[0].duration.at(-1), 30);
     assert.deepEqual(provider.vendor.models[5].durationResolutionMap[0].resolution, ["480p", "720p", "1080p", "4k"]);
     assert.deepEqual(provider.vendor.models[6].durationResolutionMap[0].resolution, ["480p", "720p"]);
-    assert(provider.vendor.models.slice(4).every((model: any) => model.referenceTransport === "url"));
+    assert(provider.vendor.models.slice(4).every((model: any) => model.referenceTransport === "url" && model.referenceRatio === "adaptive"));
     assert(provider.vendor.inputs.filter((input: any) => input.required).every((input: any) => ["apiKey", "baseUrl"].includes(input.key)));
   });
 

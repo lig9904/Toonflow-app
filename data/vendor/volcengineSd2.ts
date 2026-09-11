@@ -42,6 +42,7 @@ interface VideoModel {
   durationResolutionMap: { duration: number[]; resolution: string[] }[];
   aspectRatios?: ("16:9" | "4:3" | "1:1" | "3:4" | "9:16" | "21:9" | "adaptive")[];
   referenceTransport?: "url";
+  referenceRatio?: "adaptive";
 }
 
 interface TTSModel {
@@ -206,6 +207,7 @@ const vendor: VendorConfig = {
       durationResolutionMap: [{ duration: [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30], resolution: ["480p", "720p", "1080p"] }],
       aspectRatios: ["16:9", "4:3", "1:1", "3:4", "9:16", "21:9", "adaptive"],
       referenceTransport: "url",
+      referenceRatio: "adaptive",
     },
     {
       name: "Seedance-2.0(音画同生)",
@@ -216,6 +218,7 @@ const vendor: VendorConfig = {
       durationResolutionMap: [{ duration: [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], resolution: ["480p", "720p", "1080p", "4k"] }],
       aspectRatios: ["16:9", "4:3", "1:1", "3:4", "9:16", "21:9", "adaptive"],
       referenceTransport: "url",
+      referenceRatio: "adaptive",
     },
     {
       name: "Seedance-2.0-Fast(音画同生)",
@@ -226,6 +229,7 @@ const vendor: VendorConfig = {
       durationResolutionMap: [{ duration: [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], resolution: ["480p", "720p"] }],
       aspectRatios: ["16:9", "4:3", "1:1", "3:4", "9:16", "21:9", "adaptive"],
       referenceTransport: "url",
+      referenceRatio: "adaptive",
     },
     {
       name: "Seedance-2.0-Mini(音画同生)",
@@ -236,6 +240,7 @@ const vendor: VendorConfig = {
       durationResolutionMap: [{ duration: [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], resolution: ["480p", "720p"] }],
       aspectRatios: ["16:9", "4:3", "1:1", "3:4", "9:16", "21:9", "adaptive"],
       referenceTransport: "url",
+      referenceRatio: "adaptive",
     },
   ],
 };

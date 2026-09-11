@@ -151,7 +151,7 @@ export function createProductionMediaCapabilities(deps: Dependencies): Productio
         const referenceInputs = selectVideoPromptReferences(settings.mode,inventory,request.targetId);
         const provider = await deps.videoProviderFor(request.modelKey);
         const referenceList = await loadOwnedVideoReferences(deps.db, request.projectId, request.scriptId, referenceInputs, deps.toBase64,
-          videoReferenceOptionsForProvider(provider, deps.mediaRootDir ?? ""));
+          videoReferenceOptionsForProvider(provider, deps.mediaRootDir ?? "", request.modelKey));
         const project = await deps.db("o_project").where({ id: request.projectId }).first();
         const expectedTrackVersion = Number.isSafeInteger(request.params.expectedTrackVersion) ? Number(request.params.expectedTrackVersion) : (await getCreativeState(deps.db,"track",request.targetId,request.projectId)).version;
         const input = {projectId:request.projectId,scriptId:request.scriptId,trackId:request.targetId,model:request.modelKey,mode:typeof settings.mode === "string"?settings.mode:JSON.stringify(settings.mode),info:referenceInputs,generation:{duration:settings.duration,resolution:settings.resolution,audio:settings.audio},expectedVersion:expectedTrackVersion,idempotencyKey:`${request.generationKey}:prompt`};

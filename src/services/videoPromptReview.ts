@@ -8,6 +8,7 @@ import type { VideoPromptJob } from "./videoPromptJobs";
 import { parsePromptMode, validatePromptReferenceSelection, type VideoGenerationSettings } from "./videoPromptComposition";
 import { classifyVideoPromptReviewFailure } from "./videoPromptReviewRuntime";
 import { readCurrentImageReviewResults, type CurrentImageReviewResult } from "./imageReviews";
+import { isVolcengineTrustedModel, readPromptTrustedBindings } from "./volcengineReferenceRuntime";
 
 export const videoPromptReviewSchema = z.object({
   findings: z.array(z.object({ code: z.string().min(1).max(100), severity: z.enum(["error", "warning", "info"]), message: z.string().min(1).max(2000), shotId: z.number().int().positive().optional(), field: z.string().max(100).optional() })).max(100),
@@ -68,7 +69,8 @@ export async function currentPromptReferences(db: Knex, projectId: number, scrip
     referencedAssetIds.length ? db("ext_creative_state").where({ projectId, entityType: "asset" }).whereIn("entityId", referencedAssetIds).select("entityId", "version") : [],
   ]);
   const withVersion = (entityType: "storyboard" | "asset", row: any) => ({ ...row, version: Number((entityType === "storyboard" ? storyboardStates : assetStates).find((state) => Number(state.entityId) === Number(row.id))?.version ?? 0) });
-  return { info, selectedStoryboards: info.filter((item: any) => item.sources === "storyboard").map((item: any) => storyboards.find((row) => Number(row.id) === Number(item.id))).filter(Boolean).map((row: any) => withVersion("storyboard", row)), selectedAssets: info.filter((item: any) => item.sources === "assets").map((item: any) => assets.find((row) => Number(row.id) === Number(item.id))).filter(Boolean).map((row: any) => withVersion("asset", row)), linkedAssets: linkedAssets.map((row) => withVersion("asset", row)) };
+  const trustedAssets = Object.hasOwn(saved ?? {}, "trustedAssets") ? await readPromptTrustedBindings(db, projectId, scriptId, info) : undefined;
+  return { info, selectedStoryboards: info.filter((item: any) => item.sources === "storyboard").map((item: any) => storyboards.find((row) => Number(row.id) === Number(item.id))).filter(Boolean).map((row: any) => withVersion("storyboard", row)), selectedAssets: info.filter((item: any) => item.sources === "assets").map((item: any) => assets.find((row) => Number(row.id) === Number(item.id))).filter(Boolean).map((row: any) => withVersion("asset", row)), linkedAssets: linkedAssets.map((row) => withVersion("asset", row)), ...(trustedAssets ? { trustedAssets } : {}) };
 }
 
 export async function readCurrentVideoPromptReview(db: Knex, input: { projectId: number; scriptId: number; trackId: number; prompt: string; model?: string; mode?: unknown; generation?: VideoGenerationSettings; info?: Array<{ id: number; sources: string; fileType?: string }> }): Promise<VideoPromptReviewReport | null> {
@@ -85,7 +87,7 @@ export async function readCurrentVideoPromptReview(db: Knex, input: { projectId:
     if (input.generation !== undefined && videoPromptReviewHash(input.generation) !== videoPromptReviewHash(compositionSnapshot?.context.generation)) continue;
     const normalizeInfo = (items: any[]) => items.map((item) => ({ id: Number(item.id), sources: item.sources, fileType: item.fileType ?? "image" }));
     if (input.info !== undefined && videoPromptReviewHash(normalizeInfo(input.info)) !== videoPromptReviewHash(normalizeInfo(referenceSnapshot?.info ?? []))) continue;
-    const currentReferences = await currentPromptReferences(db, input.projectId, input.scriptId, source, referenceSnapshot);
+    const currentReferences = await currentPromptReferences(db, input.projectId, input.scriptId, source, { ...referenceSnapshot, ...(isVolcengineTrustedModel(row.model) ? { trustedAssets: referenceSnapshot?.trustedAssets ?? [] } : {}) });
     if (row.reviewBinding === promptReviewBinding({ sourceSnapshot: source, referenceSnapshot: currentReferences, compositionSnapshot, model: row.model, mode: row.mode }, input.prompt)) return json(row.reviewReport);
   }
   return null;
@@ -106,21 +108,22 @@ function imageReviewBoundaryFinding(item: CurrentImageReviewResult): VideoPrompt
   return boundary ? [{ code: `IMAGE_REFERENCE_${item.state.toUpperCase()}`, severity: boundary[0], field: "references", message: `参考图片 ${label}：${boundary[1]}` }] : [];
 }
 
-async function currentImageReferenceFindings(db: Knex, input: { projectId: number; scriptId: number; info: Array<{ id: number; sources: string; fileType?: string }>; referenceTypes?: Array<"image" | "video" | "audio"> }): Promise<VideoPromptFinding[]> {
-  const imageInputs = input.info.filter((item, index) => (input.referenceTypes?.[index] ?? item.fileType ?? "image") === "image");
+async function currentImageReferenceFindings(db: Knex, input: { projectId: number; scriptId: number; model?: string; info: Array<{ id: number; sources: string; fileType?: string }>; referenceTypes?: Array<"image" | "video" | "audio"> }): Promise<VideoPromptFinding[]> {
+  const trusted = isVolcengineTrustedModel(input.model) ? await readPromptTrustedBindings(db, input.projectId, input.scriptId, input.info) : [];
+  const imageInputs = input.info.filter((item, index) => (input.referenceTypes?.[index] ?? item.fileType ?? "image") === "image" && !trusted.some((entry) => entry.inputIndex === index));
   const storyboardIds = [...new Set(imageInputs.filter((item) => item.sources === "storyboard").map((item) => Number(item.id)))];
   const assetIds = [...new Set(imageInputs.filter((item) => item.sources === "assets").map((item) => Number(item.id)))];
   const [storyboards, assets] = await Promise.all([
     storyboardIds.length ? readCurrentImageReviewResults(db, { projectId: input.projectId, scriptId: input.scriptId, targetKind: "storyboard", targetIds: storyboardIds }).catch(() => []) : [],
     assetIds.length ? readCurrentImageReviewResults(db, { projectId: input.projectId, scriptId: input.scriptId, targetKind: "asset", targetIds: assetIds }).catch(() => []) : [],
   ]);
-  return [...storyboards, ...assets].flatMap(imageReviewBoundaryFinding);
+  return [...storyboards, ...assets].flatMap(imageReviewBoundaryFinding).concat(trusted.map((entry) => ({ code: "VOLCENGINE_TRUSTED_REFERENCE", severity: "info" as const, field: "references", message: `引用已绑定的火山素材 ${entry.assetId}；本地图片核验结果不代表云端素材已核验，提交前会重新检查素材可用状态` })));
 }
 
 /** Pre-submission is read-only and never rewrites a manually edited prompt or calls a paid model. */
 export async function preflightVideoPrompt(db: Knex, input: { projectId: number; scriptId: number; trackId: number; prompt: string; model: string; mode: unknown; generation: VideoGenerationSettings; info: Array<{ id: number; sources: string; fileType?: string }>; referenceTypes?: Array<"image" | "video" | "audio"> }): Promise<VideoPromptReviewReport> {
   const source = await db("o_storyboard").where({ projectId: input.projectId, scriptId: input.scriptId, trackId: input.trackId }).orderBy("index").orderBy("id").select("id", "prompt", "videoDesc", "duration");
-  const references = await currentPromptReferences(db, input.projectId, input.scriptId, source, { info: input.info });
+  const references = await currentPromptReferences(db, input.projectId, input.scriptId, source, { info: input.info, ...(isVolcengineTrustedModel(input.model) ? { trustedAssets: [] } : {}) });
   const counts = { image: 0, video: 0, audio: 0 };
   const labels = input.info.map((item, index) => { const type = input.referenceTypes?.[index] ?? item.fileType ?? "image"; if (!(type in counts)) throw new VideoJobError("INVALID_INPUT", "参考媒体类型无效"); const media = type as keyof typeof counts; return `@${{ image: "图片", video: "视频", audio: "音频" }[media]}${++counts[media]}`; });
   const findings = [...deterministicPromptFindings({ sourceSnapshot: source, referenceSnapshot: references, referenceLabels: labels }, input.prompt), ...await currentImageReferenceFindings(db, input)];

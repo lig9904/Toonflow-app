@@ -8,6 +8,7 @@ import { randomUUID } from "node:crypto";
 import { rename, rm } from "node:fs/promises";
 import path from "node:path";
 import isPathInside from "is-path-inside";
+import { revalidateTrustedVideoReferences } from "../volcengineReferenceRuntime";
 
 let singleton: VideoJobService | undefined;
 
@@ -15,6 +16,7 @@ export function getRuntimeVideoJobService(): VideoJobService {
   if (!singleton) {
     singleton = new VideoJobService(u.db, {
       providerFor: (modelKey) => getPersistentVideoTaskProvider(modelKey as `${string}:${string}`),
+      beforeSubmit: (job, config) => revalidateTrustedVideoReferences(u.db, job.modelKey, config, (filePath) => u.oss.getImageBase64(filePath)),
       download: async (url, outputPath, job) => {
         const bytes = await fetchVideoBytes(url);
         if (!job?.modelKey.startsWith("agentsYun:")) {

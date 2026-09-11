@@ -25,7 +25,7 @@ export default express.Router().post("/", async (req, res) => {
     let provider;
     try { provider = await getPersistentVideoTaskProvider(input.model as `${string}:${string}`); }
     catch (error) { throw new VideoJobError("UNSUPPORTED_PROVIDER", error instanceof Error ? error.message : String(error)); }
-    const references = await loadOwnedVideoReferences(u.db, input.projectId, input.scriptId, input.uploadData, (path) => u.oss.getImageBase64(path), videoReferenceOptionsForProvider(provider, u.getPath("oss")));
+    const references = await loadOwnedVideoReferences(u.db, input.projectId, input.scriptId, input.uploadData, (path) => u.oss.getImageBase64(path), videoReferenceOptionsForProvider(provider, u.getPath("oss"), input.model));
     const project = await u.db("o_project").where({ id: input.projectId }).select("videoRatio").first();
     const config = { prompt: input.prompt, referenceList: references, mode: parseVideoMode(input.mode), duration: input.duration,
       aspectRatio: (project?.videoRatio as "16:9" | "9:16") || "16:9", resolution: input.resolution, audio: input.audio };

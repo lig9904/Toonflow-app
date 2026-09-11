@@ -107,6 +107,28 @@ function validateMediaInstructions(
   }
 }
 
+/** A track-level instruction is itself an explicit target selection. When the
+ * planner omits storyboardIds, resolve only that named track through the
+ * current script snapshot; never infer an unmentioned track or query outside
+ * the frozen flow scope. */
+export function normalizeExplicitVideoTrackScope(
+  generateVideosRequested: boolean,
+  storyboardIds: number[],
+  mediaInstructions: Array<{ targetKind: "asset" | "storyboard" | "track"; targetId: number }>,
+  knownStoryboards: Map<number, { trackId?: unknown }>,
+): number[] {
+  const selected = [...new Set(storyboardIds.map(Number))];
+  if (!generateVideosRequested || selected.length) return selected;
+  const tracks = [...new Set(mediaInstructions.filter((item) => item.targetKind === "track").map((item) => Number(item.targetId)))];
+  if (!tracks.length) return selected;
+  for (const trackId of tracks) {
+    const matches = [...knownStoryboards].filter(([, row]) => Number(row?.trackId) === trackId).map(([id]) => id);
+    if (!matches.length) throw new BuiltinRuntimeError("INVALID_INPUT", `视频局部要求轨道 ${trackId} 不属于当前剧集分镜快照`);
+    selected.push(...matches);
+  }
+  return [...new Set(selected)];
+}
+
 function scopedMediaInstructions(
   target: MediaTarget,
   globalInstructions: string,
@@ -228,6 +250,7 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
     let knownTopAssets = new Set(flow.assets.map((asset: any) => Number(asset.id)));
     let knownAssets = new Set(flow.assets.flatMap((asset: any) => [Number(asset.id), ...asset.derive.map((child: any) => Number(child.id))]));
     let knownStoryboards = new Map(flow.storyboard.map((storyboard: any) => [Number(storyboard.id), storyboard]));
+    plan.storyboardIds = normalizeExplicitVideoTrackScope(actions.includes("generateVideos"), plan.storyboardIds, plan.mediaInstructions, knownStoryboards);
     if (plan.assetIds.some((id) => !knownAssets.has(id)) || plan.storyboardIds.some((id) => !knownStoryboards.has(id))) throw new BuiltinRuntimeError("INVALID_INPUT", "制作规划引用了项目外实体");
     validateMediaInstructions(plan, knownAssets, knownStoryboards);
     if (plan.question && !actions.length) throw new BuiltinRuntimeError("INVALID_INPUT", `本次没有可执行的制作步骤：${plan.question}`);

@@ -29,7 +29,7 @@ export default express.Router().post("/", async (req, res) => {
     const promptReviews = new Map<number, VideoPromptReviewReport>();
     const reservations: Array<{ idempotencyKey: string; request: VideoJobRequest; requestHash: string }> = [];
     for (const item of input.trackData) {
-      const references = await loadOwnedVideoReferences(u.db, input.projectId, input.scriptId, item.uploadData, (path) => u.oss.getImageBase64(path), videoReferenceOptionsForProvider(provider, u.getPath("oss")));
+      const references = await loadOwnedVideoReferences(u.db, input.projectId, input.scriptId, item.uploadData, (path) => u.oss.getImageBase64(path), videoReferenceOptionsForProvider(provider, u.getPath("oss"), input.model));
       const config = { prompt: item.prompt, referenceList: references, mode: parseVideoMode(input.mode), duration: item.duration,
         aspectRatio: (project?.videoRatio as "16:9" | "9:16") || "16:9", resolution: input.resolution, audio: input.audio };
       const requestHash = hashVideoJobRequest({ modelKey: input.model, providerFingerprint: provider.fingerprint, projectId: input.projectId,

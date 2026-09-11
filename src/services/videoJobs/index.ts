@@ -65,6 +65,7 @@ export interface VideoTaskProvider {
 export interface VideoJobDependencies {
   providerFor: (modelKey: string) => Promise<VideoTaskProvider>;
   download: (url: string, outputPath: string, job?: VideoJob) => Promise<void>;
+  beforeSubmit?: (job: VideoJob, config: unknown) => Promise<void>;
   now?: () => number;
   maxConcurrent?: number;
   maxQueryFailures?: number;
@@ -441,6 +442,7 @@ export class VideoJobService {
           });
           job = { ...job, payload: { ...job.payload, config: submitConfig } };
         }
+        await this.dependencies.beforeSubmit?.(job, submitConfig);
         const submitted = await provider.submit(submitConfig);
         if (!submitted?.taskId) throw new Error("上游未返回任务 ID");
         await this.db.transaction(async (trx) => {

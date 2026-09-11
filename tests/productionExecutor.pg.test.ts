@@ -410,6 +410,56 @@ test("video generation deduplicates by real track and passes full provider param
   } finally { await f.destroy(); }
 });
 
+test("an explicit current-track video instruction supplies omitted storyboard selection from only the script snapshot", options, async () => {
+  const f = await fixture();
+  try {
+    await f.db("o_project").where({ id: f.projectId }).update({ mode: "text" });
+    const [track] = await insertRowsReturningIds(f.db, "o_videoTrack", { projectId: f.projectId, scriptId: f.scriptId, duration: 4, prompt: "human prompt" });
+    const [one, two] = await insertRowsReturningIds(f.db, "o_storyboard", [
+      { projectId: f.projectId, scriptId: f.scriptId, index: 0, prompt: "one", videoDesc: "one", duration: "2", track: "A", trackId: track, shouldGenerateImage: 0, state: "未生成" },
+      { projectId: f.projectId, scriptId: f.scriptId, index: 1, prompt: "two", videoDesc: "two", duration: "2", track: "A", trackId: track, shouldGenerateImage: 0, state: "未生成" },
+    ]);
+    const received: any[] = [];
+    const model = modelFor((request) => request.role === "productionAgent:decisionAgent" ? {
+      actions: ["generateVideos"], assetIds: [], storyboardIds: [], globalMediaInstructions: "same style",
+      mediaInstructions: [{ targetKind: "track", targetId: track, instructions: "only this track" }], question: null, summary: "video",
+    } : { items: [], summary: "" }, []);
+    const result = await runOnce(f, model, { generateVideo: async (input) => { received.push(input); return { status: "succeeded", jobId: "track-video" }; } }, { ...defaultBuiltinRunLimits, maxVideoGenerations: 1 }, "generate current track", async () => ({ mode: "text", resolution: "480p", audio: false }));
+    assert.equal(result.run.status, "succeeded", result.run.errorMessage ?? "");
+    assert.equal(received.length, 1);
+    assert.equal(received[0].targetId, track);
+    assert.deepEqual(received[0].params.storyboardIds, [one, two]);
+    assert.match(received[0].params.instructions, /only this track/);
+  } finally { await f.destroy(); }
+});
+
+test("video scope omission never expands to every track, and unknown or cross-script tracks fail closed", options, async () => {
+  const f = await fixture();
+  try {
+    const [track] = await insertRowsReturningIds(f.db, "o_videoTrack", { projectId: f.projectId, scriptId: f.scriptId, duration: 2 });
+    await insertRowsReturningIds(f.db, "o_storyboard", { projectId: f.projectId, scriptId: f.scriptId, index: 0, prompt: "one", duration: "2", track: "A", trackId: track, shouldGenerateImage: 0, state: "未生成" });
+    let mediaCalls = 0;
+    const media = { generateVideo: async () => { mediaCalls++; return { status: "succeeded", jobId: "must-not-run" }; } };
+    const omitted = await runOnce(f, modelFor((request) => request.role === "productionAgent:decisionAgent" ? { actions: ["generateVideos"], assetIds: [], storyboardIds: [], mediaInstructions: [], question: null, summary: "omitted" } : { items: [], summary: "" }, []), media, { ...defaultBuiltinRunLimits, maxVideoGenerations: 1 });
+    assert.equal(omitted.run.status, "succeeded", omitted.run.errorMessage ?? "");
+    assert.equal((omitted.run.result as any).outcome, "partial");
+    assert.equal(mediaCalls, 0);
+
+    const [emptyTrack] = await insertRowsReturningIds(f.db, "o_videoTrack", { projectId: f.projectId, scriptId: f.scriptId, duration: 2 });
+    const unknown = await runOnce(f, modelFor((request) => request.role === "productionAgent:decisionAgent" ? { actions: ["generateVideos"], assetIds: [], storyboardIds: [], mediaInstructions: [{ targetKind: "track", targetId: emptyTrack, instructions: "unknown" }], question: null, summary: "unknown" } : { items: [], summary: "" }, []), media, { ...defaultBuiltinRunLimits, maxVideoGenerations: 1 });
+    assert.equal(unknown.run.status, "failed");
+    assert.match(unknown.run.errorMessage ?? "", /不属于当前剧集分镜快照/);
+
+    const [otherScript] = await insertRowsReturningIds(f.db, "o_script", { projectId: f.projectId, name: "other", content: "other" });
+    const [otherTrack] = await insertRowsReturningIds(f.db, "o_videoTrack", { projectId: f.projectId, scriptId: otherScript, duration: 2 });
+    await insertRowsReturningIds(f.db, "o_storyboard", { projectId: f.projectId, scriptId: otherScript, index: 0, prompt: "foreign", duration: "2", track: "B", trackId: otherTrack, shouldGenerateImage: 0, state: "未生成" });
+    const crossScript = await runOnce(f, modelFor((request) => request.role === "productionAgent:decisionAgent" ? { actions: ["generateVideos"], assetIds: [], storyboardIds: [], mediaInstructions: [{ targetKind: "track", targetId: otherTrack, instructions: "cross" }], question: null, summary: "cross" } : { items: [], summary: "" }, []), media, { ...defaultBuiltinRunLimits, maxVideoGenerations: 1 });
+    assert.equal(crossScript.run.status, "failed");
+    assert.match(crossScript.run.errorMessage ?? "", /不属于当前剧集分镜快照/);
+    assert.equal(mediaCalls, 0);
+  } finally { await f.destroy(); }
+});
+
 test("scoped image instructions do not leak one storyboard's local request into another", options, async () => {
   const f = await fixture();
   try {

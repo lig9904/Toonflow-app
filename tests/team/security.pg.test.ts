@@ -154,6 +154,11 @@ test("the route registry is exact, complete for router.ts, and classifies reads 
   assert.equal(getRouteAuthorization("POST", "/api/builtinAgent/get")?.resources?.[0].table, "ext_builtin_runs");
   assert.equal(getRouteAuthorization("POST", "/api/assetsGenerate/batchGenerateImageAssets")?.resources?.[0].nestedIdField, "id");
   assert.equal(getRouteAuthorization("POST", "/api/assetsGenerate/batchPolishAssetsPrompt")?.resources?.[0].nestedIdField, "assetsId");
+  assert.equal(getRouteAuthorization("POST", "/api/production/trustedAssets/groups")?.action, "read");
+  assert.equal(getRouteAuthorization("POST", "/api/production/trustedAssets/getBindings")?.action, "read");
+  assert.equal(getRouteAuthorization("POST", "/api/production/trustedAssets/setBindings")?.action, "edit");
+  assert.equal(getRouteAuthorization("POST", "/api/production/trustedAssets/syncBindings")?.action, "edit");
+  assert.equal(getRouteAuthorization("POST", "/api/production/trustedAssets/CreateAsset"), undefined);
   assert.equal(getRouteAuthorization("POST", "/api/models/delight"), undefined);
 });
 

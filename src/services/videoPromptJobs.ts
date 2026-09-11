@@ -7,6 +7,7 @@ import type { Knex } from "knex";
 import { lockProjectTransaction } from "@/lib/dbTransaction";
 import { advanceCreativeState, getCreativeState } from "@/services/creativeWorkspace";
 import { buildStoryboardVideoPrompt, visualText } from "@/lib/storyboardVisualContract";
+import { isVolcengineTrustedModel, readPromptTrustedBindings } from "./volcengineReferenceRuntime";
 
 const JOBS = "ext_video_prompt_jobs";
 const ready = new WeakMap<object, Promise<void>>();
@@ -201,8 +202,11 @@ export async function prepareVideoPromptJob(db: Knex, input: VideoPromptJobInput
     const selectedAssetById = new Map(versionedAssets.map((row) => [Number(row.id), row]));
     const referenceCounts = { image: 0, video: 0, audio: 0 };
     const referenceLabels: string[] = [];
+    const trustedAssets = isVolcengineTrustedModel(input.model) ? await readPromptTrustedBindings(trx, projectId, scriptId, input.info ?? []) : undefined;
     const selectedVisual = (input.info ?? []).map((item, index) => {
       const row = item.sources === "storyboard" ? selectedStoryboardById.get(Number(item.id)) : selectedAssetById.get(Number(item.id));
+      const trusted = trustedAssets?.find((entry) => entry.inputIndex === index);
+      if (trusted && (!trusted.sourceCurrent || trusted.remoteStatus !== "Active")) throw new VideoPromptJobError("INVALID_INPUT", "火山素材绑定已过期或来源已变化，请重新同步并绑定后生成提示词");
       if (!row?.filePath) throw new VideoPromptJobError("INVALID_INPUT", "所选参考尚无媒体文件，不能编造上传标签");
       const mediaType = item.sources === "storyboard" ? "image" : resolveVideoReferenceMediaType(row.mediaType, row.type, row.filePath);
       if (item.fileType && item.fileType !== mediaType) throw new VideoPromptJobError("INVALID_INPUT", "参考媒体类型与实际素材不一致");
@@ -210,7 +214,7 @@ export async function prepareVideoPromptJob(db: Knex, input: VideoPromptJobInput
       const number = ++referenceCounts[mediaType];
       referenceLabels.push(`@${label}${number}`);
       const framePosition = ["singleImage", "startEndRequired", "endFrameOptional", "startFrameOptional"].includes(input.mode) ? (index === 0 ? "，帧位置：首帧" : "，帧位置：尾帧") : "";
-      return `选择顺序${index + 1}，@${label}${number}${framePosition}，来源 ${item.sources} ${Number(item.id)}：${row.name ?? "分镜参考"}；${visualText(row.describe ?? row.prompt ?? "")}`;
+      return `选择顺序${index + 1}，@${label}${number}${framePosition}，来源 ${item.sources} ${Number(item.id)}：${row.name ?? "分镜参考"}；${visualText(row.describe ?? row.prompt ?? "")}${trusted ? `；实际视觉输入为已绑定火山素材 ${trusted.assetId}，本地图片仅用于关联` : ""}`;
     }).filter(Boolean);
     const semanticIdentity = versionedLinkedAssets.map((row) => `语义身份（仅用于理解，不代表已上传参考图）：${row.name ?? "未命名"}：${row.describe ?? ""}`).join("\n");
     validatePromptReferenceSelection(input.mode, [...Array(referenceCounts.image).fill("image"), ...Array(referenceCounts.video).fill("video"), ...Array(referenceCounts.audio).fill("audio")]);
@@ -221,7 +225,7 @@ export async function prepareVideoPromptJob(db: Knex, input: VideoPromptJobInput
       semanticIdentity,
       selectedVisual.length ? `本次用户选择的视觉参考（仅这些素材会作为视觉输入）：\n${selectedVisual.join("\n")}` : "本次未选择视觉参考图，不能假定存在已上传参考图。",
     ].filter(Boolean).join("\n\n");
-    const referenceSnapshot = { info: input.info, selectedStoryboards: versionedStoryboards, selectedAssets: versionedAssets, linkedAssets: versionedLinkedAssets };
+    const referenceSnapshot = { info: input.info, selectedStoryboards: versionedStoryboards, selectedAssets: versionedAssets, linkedAssets: versionedLinkedAssets, ...(trustedAssets ? { trustedAssets } : {}) };
     const requestHash = hash({ requestIdentityHash, sourceSnapshot, referenceSnapshot });
     const active = await trx(JOBS).where({ projectId, scriptId, trackId }).whereIn("state", ["queued", "running"]).first();
     if (active) throw new VideoPromptJobError("CONFLICT", "当前轨道已有提示词任务正在生成");
@@ -292,7 +296,7 @@ async function executeVideoPromptJobOnce(db: Knex, jobId: string, generate: (job
       const currentSourceStates = currentSourceRows.length ? await trx("ext_entity_state").where({ projectId: claimed.job.projectId, entityType: "storyboard" }).whereIn("entityId", currentSourceRows.map((item) => Number(item.id))).select("entityId", "version") : [];
       const currentSources = currentSourceRows.map((item) => ({ ...item, version: Number(currentSourceStates.find((state) => Number(state.entityId) === Number(item.id))?.version ?? 0) }));
       const savedReferences = (claimed.job.referenceSnapshot && typeof claimed.job.referenceSnapshot === "object" ? claimed.job.referenceSnapshot : {}) as { info?: Array<{ id: number; sources: string }>; selectedStoryboards?: unknown[]; selectedAssets?: unknown[]; linkedAssets?: unknown[] };
-      const currentReferences = await currentPromptReferences(trx, claimed.job.projectId, claimed.job.scriptId, currentSources, savedReferences);
+      const currentReferences = await currentPromptReferences(trx, claimed.job.projectId, claimed.job.scriptId, currentSources, { ...savedReferences, ...(isVolcengineTrustedModel(claimed.job.model) ? { trustedAssets: (savedReferences as any).trustedAssets ?? [] } : {}) });
       const locked = await trx("ext_entity_state").where({ projectId: claimed.job.projectId, entityType: "storyboard", locked: 1 }).whereIn("entityId", claimed.job.sourceSnapshot.map((item) => item.id)).first();
       const sourceChanged = hash(currentSources) !== hash(claimed.job.sourceSnapshot);
       const referencesChanged = hash(currentReferences) !== hash(savedReferences);

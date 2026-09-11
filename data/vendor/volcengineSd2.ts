@@ -150,8 +150,8 @@ const vendor: VendorConfig = {
   inputs: [
     { key: "apiKey", label: "API密钥", type: "password", required: true, placeholder: "火山引擎API Key" },
     { key: "baseUrl", label: "请求地址", type: "url", required: true, placeholder: "以v3结束，示例：https://ark.cn-beijing.volces.com/api/v3" },
-    { key: "ak", label: "旧版 Access Key（不再使用）", type: "text", required: false },
-    { key: "sk", label: "旧版 Secret Key（不再使用）", type: "password", required: false },
+    { key: "ak", label: "素材库 Access Key ID（仅素材库同步需要）", type: "text", required: false },
+    { key: "sk", label: "素材库 Secret Access Key（仅素材库同步需要）", type: "password", required: false },
     { key: "groupId", label: "旧版资产组 ID（不再使用）", type: "text", required: false },
     { key: "tosEndpoint", label: "旧版 TOS Endpoint（不再使用）", type: "url", required: false },
     { key: "tosBucket", label: "旧版 TOS Bucket（不再使用）", type: "text", required: false },

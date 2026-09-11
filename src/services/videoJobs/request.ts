@@ -2,6 +2,8 @@ import type { Knex } from "knex";
 import { resolveVideoReferenceMediaType } from "@/lib/videoPromptReferences";
 import { issueVideoReferenceLease, type VideoReferenceLeaseOptions, type VideoReferenceSource } from "@/services/videoReferenceBridge";
 import { VideoJobError } from "./index";
+import { isVolcengineTrustedModel, loadTrustedVideoReference } from "../volcengineReferenceRuntime";
+import type { VolcengineBindingSnapshot } from "../volcengineTrustedAssets";
 
 export interface VideoReferenceInput {
   id: number;
@@ -11,6 +13,7 @@ export interface VideoReferenceInput {
 
 export interface VideoReferenceLoadOptions extends Partial<VideoReferenceLeaseOptions> {
   transport?: "base64" | "url";
+  useVolcengineTrustedAssets?: boolean;
 }
 
 export type LoadedVideoReference = {
@@ -22,15 +25,17 @@ export type LoadedVideoReference = {
   contentHash?: string;
   sizeBytes?: number;
   mtimeMs?: number;
+  trustedAsset?: VolcengineBindingSnapshot;
 };
 
-export function videoReferenceOptionsForProvider(provider: { referenceTransport?: "base64" | "url" }, rootDir: string): VideoReferenceLoadOptions | undefined {
+export function videoReferenceOptionsForProvider(provider: { referenceTransport?: "base64" | "url" }, rootDir: string, modelKey?: string): VideoReferenceLoadOptions | undefined {
   if (provider.referenceTransport !== "url") return undefined;
   return {
     transport: "url",
     rootDir,
     publicOrigin: String(process.env.TOONFLOW_MEDIA_PUBLIC_ORIGIN || ""),
     secret: String(process.env.TOONFLOW_MEDIA_BRIDGE_SECRET || ""),
+    ...(isVolcengineTrustedModel(modelKey) ? { useVolcengineTrustedAssets: true } : {}),
   };
 }
 
@@ -60,6 +65,10 @@ export async function loadOwnedVideoReferences(
   return Promise.all(uploadData.map(async (item) => {
     if (!Number.isSafeInteger(item.id) || item.id <= 0) throw new VideoJobError("INVALID_INPUT", "引用素材 ID 不合法");
     const source: VideoReferenceSource = { projectId, scriptId, id: item.id, sources: item.sources, fileType: item.fileType };
+    if (options.useVolcengineTrustedAssets) {
+      const bound = await loadTrustedVideoReference(db, source, toBase64);
+      if (bound) return bound;
+    }
     if (options.transport === "url") {
       if (!options.rootDir || !options.publicOrigin || !options.secret) throw new VideoJobError("UNSUPPORTED_PROVIDER", "KZ 参考素材桥接未配置媒体公网 origin 或 bridge secret");
       const lease = await issueVideoReferenceLease(db, source, options as VideoReferenceLeaseOptions);

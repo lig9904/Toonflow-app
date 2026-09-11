@@ -1,6 +1,7 @@
 import type { Knex } from "knex";
 import type { Request } from "express";
 import { resolveImageFlowOwner } from "../imageFlowWorkspace";
+import { videoPromptIdDiagnostic } from "../../lib/videoPromptIdDiagnostic";
 import {
   TeamSecurityError,
   type ProjectAction,
@@ -229,6 +230,10 @@ export function routeAuthorizationMiddleware(deps: RouteAuthorizationDeps) {
       next();
     } catch (error) {
       const failure = error instanceof TeamSecurityError ? error : new TeamSecurityError("ACCESS_FAILED", "访问被拒绝", 403);
+      if (failure.code === "INVALID_ID") {
+        const diagnostic = videoPromptIdDiagnostic(String(req.originalUrl || req.url || "").split("?", 1)[0], req.body);
+        if (diagnostic) console.warn("[video-prompt.invalid-id]", JSON.stringify(diagnostic));
+      }
       res.status(failure.status).send({ code: failure.code, message: failure.message });
     }
   };

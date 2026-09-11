@@ -4,6 +4,7 @@ import { validateFields } from "@/middleware/middleware";
 import u from "@/utils";
 import { z } from "zod";
 import { tool, jsonSchema } from "ai";
+import { imageOutputSizes } from "@/lib/imageRequestCapabilities";
 const router = express.Router();
 
 // 检查语言模型
@@ -40,6 +41,12 @@ export default router.post(
       const modelList = await u.vendor.getModelList(vendorConfigData.id!);
 
       const selectedModel = modelList.find((i: any) => i.modelName == modelName);
+      if (!selectedModel || selectedModel.type !== type) return res.status(400).send(error("未找到对应类型的模型，请刷新模型列表后重试"));
+      if (type === "image") {
+        const sizes = imageOutputSizes(`${id}:${modelName}`, selectedModel);
+        if (!sizes.length) return res.status(400).send(error("当前图片模型没有可用的测试尺寸"));
+        requestFn.image.modelData.size = sizes[0];
+      }
       if (type == "video") {
         requestFn["video"].modelData = {
           model: modelName,

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { isSeedance2Model } from "../src/lib/videoPromptReferences";
-import { assertVideoPromptDialogue, speakerFindings, videoPromptSystem } from "../src/lib/videoPromptContract";
+import { assertVideoPromptDialogue, dialogueFindings, extractVideoDialogue, speakerFindings, videoPromptSystem } from "../src/lib/videoPromptContract";
 
 test("dated Seedance 2.0 and 2.5 IDs use the same supported family format", () => {
   for (const name of ["doubao-seedance-2-0-260128", "doubao-seedance-2-5-260628", "seedance-2.5-standard-i2v", "Seedance 2.0 Fast"]) assert.equal(isSeedance2Model(name), true, name);
@@ -30,4 +30,26 @@ test("unquoted Chinese dialogue remains protected and quoted signs are not speec
   }
   assert.throws(() => assertVideoPromptDialogue("雪璃：等着我。", "平静空镜", ["雪璃"]), /遗漏或改写/);
   assert.doesNotThrow(() => assertVideoPromptDialogue("画面：店铺牌子写着『欢迎』。", "空镜"));
+});
+
+test("known character names inside visual colon descriptions are not dialogue", () => {
+  const source = "镜头1（2秒）：画内唯一主体是成年海獭九九：真实海獭物种体型与比例，棕色厚毛，圆耳，浅色口鼻，短小前爪，无衣着、无人类配饰，自然蹲伏于石台旁，不拟人化站立。无对白、无字幕。";
+  assert.deepEqual(extractVideoDialogue(source, ["九九"]), []);
+  assert.deepEqual(dialogueFindings(source, "成年海獭九九保持真实海獭比例、棕色厚毛、圆耳、浅色口鼻、短小前爪、无衣着，自然蹲伏。", ["九九"]), []);
+  assert.deepEqual(extractVideoDialogue("小说：蓝贝壳。画面：海獭捧贝壳。"), []);
+});
+
+test("explicit fields, speech verbs, quoted names and line-boundary character dialogue remain protected", () => {
+  const cases = [
+    ["对白：不要走！", [], "不要走！"],
+    ["画外音（雪璃）：别动，我会回来。", ["雪璃"], "别动，我会回来。"],
+    ["镜头中雪璃问：你看见了吗？", ["雪璃"], "你看见了吗？"],
+    ["雪璃：「等着我。」", ["雪璃"], "等着我。"],
+    ["镜头1：雪璃：等着我。", ["雪璃"], "等着我。"],
+  ] as const;
+  for (const [source, names, speech] of cases) {
+    assert.deepEqual(extractVideoDialogue(source, [...names]), [speech]);
+    assert.throws(() => assertVideoPromptDialogue(source, "平静空镜", [...names]), /遗漏或改写/);
+    assert.doesNotThrow(() => assertVideoPromptDialogue(source, `保留台词：${speech}`, [...names]));
+  }
 });

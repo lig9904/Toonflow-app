@@ -337,7 +337,7 @@ export type ReferenceList = { type: "image"; base64: string } | { type: "audio";
 interface ImageConfig {
   prompt: string;
   referenceList?: Extract<ReferenceList, { type: "image" }>[];
-  size: "1K" | "2K" | "4K";
+  size: string; // 由模型 resolutions 元数据校验，包含 1.5K、3K 等官方档位
   aspectRatio: `${number}:${number}`;
 }
 

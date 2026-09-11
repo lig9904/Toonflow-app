@@ -23,14 +23,28 @@ const escaped = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 /** Only speech-labelled text is deterministic dialogue evidence, never signs or camera prose. */
 export function extractVideoDialogue(source: string, speakerNames: string[] = []): string[] {
   const names = speakerNames.filter(Boolean).map(escaped).sort((a, b) => b.length - a.length);
-  const labels = ["对白", "台词", "画外音", "旁白", "内心独白", "内心OS", "VO", "OS", "说道", "喊道", "说", "问", "回答", ...names].join("|");
-  const speech = new RegExp(`(?:${labels})(?:[（(][^）)\\n]{0,40}[）)])?[^。！？!?\\n『「“\":：]{0,30}[：:]\\s*([^\\n]+)`, "giu");
   const result: string[] = [];
-  for (const match of source.matchAll(speech)) {
-    const tail = match[1].trim();
+  const append = (tailValue: string) => {
+    const tail = tailValue.trim();
     const quote = tail.match(/^[^『「“"]{0,20}[『「“"]([^』」”"\n]+)[』」”"]/u);
     const text = (quote?.[1] ?? tail.split(/\s*[|｜]\s*|[；;]\s*(?:画面|动作|镜头|音效|景别|时长)[：:]/u)[0]).trim();
     if (text && !/^(?:无|无台词|无对白|暂无|无旁白)[。.]?$/.test(text)) result.push(text);
+  };
+  // Explicit speech fields are semantic evidence even without a named speaker.
+  const explicit = /(?:^|[。！？!?；;，,：:\n])\s*(?:对白|台词|画外音|旁白|内心独白|内心OS|VO|OS)(?:[（(][^）)\n]{0,40}[）)])?\s*[：:]\s*([^\n]+)/gimu;
+  for (const match of source.matchAll(explicit)) append(match[1]);
+  // A speech verb is meaningful when attached to a known speaker (or a
+  // multi-character speaker token when no inventory was supplied). Requiring
+  // the subject prevents words such as "小说：" from becoming dialogue.
+  const spokenSubject = names.length ? names.join("|") : "[\\p{L}\\p{N}_]{2,20}";
+  const spoken = new RegExp(`(?:${spokenSubject})(?:在画外)?(?:说道|喊道|回答|说|问)\\s*[：:]\\s*([^\\n]+)`, "giu");
+  for (const match of source.matchAll(spoken)) append(match[1]);
+  // Bare "角色：台词" remains supported at a line/sentence/field boundary.
+  // Do not scan arbitrary prose for a known name followed by a colon: phrases
+  // such as "成年海獭九九：真实海獭比例……" are visual descriptions.
+  if (names.length) {
+    const named = new RegExp(`(?:^|[。！？!?；;，,：:\\n])\\s*(?:${names.join("|")})(?:[（(][^）)\\n]{0,40}[）)])?\\s*[：:]\\s*([^\\n]+)`, "gimu");
+    for (const match of source.matchAll(named)) append(match[1]);
   }
   return [...new Set(result)];
 }

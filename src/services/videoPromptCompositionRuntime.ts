@@ -21,6 +21,6 @@ export async function generateRuntimeVideoPrompt(job: VideoPromptJob) {
     { role: "user", content: job.promptInput },
   ] });
   return reviewGeneratedVideoPrompt(job, response.text, async (request) => invokeVideoPromptReview(
-    request, (options) => u.Ai.Text("universalAi", false).invoke(options), await getConfiguredTextOutputLimit("universalAi"),
+    request, (options) => u.Ai.Text("universalAi", true, 1).invoke(options), await getConfiguredTextOutputLimit("universalAi"),
   ));
 }

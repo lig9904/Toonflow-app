@@ -8,6 +8,7 @@ import type { PrepareImageGenerationInput } from "../imageJobs/runtime";
 import { encodeReviewImage, imageDigest, inlineReferenceHash, MAX_REVIEW_REFERENCES, MAX_REVIEW_TOTAL_BYTES } from "./media";
 import { diagnoseImageReviewFailure, imageReviewFailureSummary, ImageReviewDiagnosticError, parseImageReviewOutput, type ImageReviewDiagnostics } from "./output";
 import { reserveAttachedModelCall, type AttachedModelCallDecision } from "../attachedModelBudget";
+import { getCreativeState } from "../creativeWorkspace";
 
 const TABLE = "ext_image_reviews";
 export const imageReviewResultSchema = z.object({
@@ -24,6 +25,7 @@ export interface PreparedImageReview {
   generationPrompt: string;
   prompt: { content: string; version: string | number };
   targetContext: Record<string, unknown>;
+  sourceVersion?: number;
   referenceCount: number;
   references: Array<{ label: string; asset?: ImageReferenceSnapshot; filePath?: string; sha256?: string; unavailable?: string }>;
   unavailable?: string;
@@ -127,7 +129,7 @@ export class ImageReviewService {
   /** Runs before generation payload compaction, outside any generation transaction. */
   async prepare(input: PrepareImageGenerationInput): Promise<PreparedImageReview> {
     const references = input.config.referenceList ?? [];
-    const snapshot: PreparedImageReview = { version: 1, generationPrompt: input.config.prompt, prompt: { content: "", version: 0 }, targetContext: {}, referenceCount: references.length, references: [] };
+    const snapshot: PreparedImageReview = { version: 1, generationPrompt: input.config.prompt, prompt: { content: "", version: 0 }, targetContext: {}, ...(input.sourceVersion !== undefined ? { sourceVersion: input.sourceVersion } : {}), referenceCount: references.length, references: [] };
     try {
       await this.ensure();
       snapshot.prompt = await this.options.readPrompt();
@@ -403,10 +405,11 @@ async function hydrateImageReviewReport(db: Knex, row: any): Promise<ImageReview
     if (current?.filePath) { try { selected = canonicalMediaPath(current.filePath) === canonicalMediaPath(row.artifactPath); } catch {} }
     // Flow candidates have no canonical selected pointer. Do not claim they are selected.
     const targetChanged = Object.keys(snapshot.targetContext).length > 0 && JSON.stringify(targetContext(current)) !== JSON.stringify(snapshot.targetContext);
+    const sourceVersionCurrent = snapshot.sourceVersion === undefined || row.targetKind !== "asset" || (await getCreativeState(db, "asset", Number(row.targetId), Number(row.projectId))).version === snapshot.sourceVersion;
     const references = snapshot.references.flatMap((item) => item.asset ? [item.asset] : []);
     const referencesCurrent = await imageReferencesMatch(db, Number(row.projectId), references).catch(() => false);
     return { id: row.id, jobId: Number(row.jobId), projectId: Number(row.projectId), scriptId: row.scriptId == null ? null : Number(row.scriptId), targetKind: row.targetKind, targetId: row.targetId, artifactPath: row.artifactPath, artifactHash: row.artifactHash,
-      status: row.status, summary: row.summary, findings: JSON.parse(row.findings), reviewedAt: row.reviewedAt == null ? null : Number(row.reviewedAt), selected, stale: !selected || targetChanged || !referencesCurrent,
+      status: row.status, summary: row.summary, findings: JSON.parse(row.findings), reviewedAt: row.reviewedAt == null ? null : Number(row.reviewedAt), selected, stale: !selected || targetChanged || !sourceVersionCurrent || !referencesCurrent,
       referenceCoverage: row.referenceCoverage, promptVersion: snapshot.prompt.version, modelName: row.model ? JSON.parse(row.model).modelName : null, createdAt: Number(row.createdAt), updatedAt: Number(row.updatedAt), diagnostics: row.diagnostics ? JSON.parse(row.diagnostics) : null,
       originRunId: row.runId ?? null, actorId: row.actorId == null ? null : Number(row.actorId), billingOwnerType: row.billingOwnerType || "project", billingOwnerId: row.billingOwnerId || `project:${row.projectId}`,
       modelCallChargedAt: row.modelCallChargedAt == null ? null : Number(row.modelCallChargedAt) };

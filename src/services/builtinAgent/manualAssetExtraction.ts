@@ -23,7 +23,7 @@ export function createManualAssetExtractionExecutor(deps:{db:Knex;model:Structur
     const context=(ctx.run.intent as any)?.context as ManualExtractionContext;
     if (!context || context.projectId!==ctx.run.projectId) throw new BuiltinRuntimeError('INVALID_INPUT','素材提取范围无效');
     const ids=context.sourceScripts.map(s=>s.id);
-    const extract=createAssetExtractionHelper({...deps,loadInstructions:async()=>context.instructions,onSaved:async trx=>{await trx("o_script").where({projectId:context.projectId,extractRunId:ctx.run.id}).whereIn("id",ids).update({extractState:1,errorReason:null});}});
+    const extract=createAssetExtractionHelper({...deps,requireBindings:true,loadInstructions:async()=>context.instructions,onSaved:async trx=>{await trx("o_script").where({projectId:context.projectId,extractRunId:ctx.run.id}).whereIn("id",ids).update({extractState:1,errorReason:null});}});
     try {
       const result=await extract(ctx,{projectId:context.projectId,sourceScripts:context.sourceScripts,request:ctx.run.continuation||ctx.run.prompt,maxOutputTokens:ctx.run.limits.maxOutputTokens,useModelOutputLimit:true,stepKey:'manual.extractAssets'});
       await ctx.emit('message.completed',{text:`素材提取已保存，已关联 ${result.bindings.length} 集剧本。`});

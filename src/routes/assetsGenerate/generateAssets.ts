@@ -12,16 +12,17 @@ const router = express.Router();
 const requestSchema = {
   projectId: z.number(), model: z.string(), resolution: z.string(), id: z.number(),
   type: z.enum(["role", "scene", "tool"]), name: z.string(), prompt: z.string(),
+  expectedVersion: z.number().int().nonnegative(),
   base64: z.string().optional().nullable(), idempotencyKey: z.string().min(8).max(200).optional(),
 };
 
 export default router.post("/", validateFields(requestSchema), async (req, res) => {
-  const { projectId, model, resolution, id, type, name, prompt, base64 } = req.body;
+  const { projectId, model, resolution, id, type, name, prompt, base64, expectedVersion } = req.body;
   const headerKey = req.get("Idempotency-Key");
   const generationKey = req.body.idempotencyKey ?? (headerKey && headerKey.length >= 8 ? headerKey : `web-asset:${projectId}:${id}:${u.uuid()}`);
   try {
     const receipt = await generateRootAssetImage(u.db, getProductionImageGenerationService(), {
-      projectId, assetId: id, type, name, prompt, model, resolution, base64, generationKey,
+      projectId, assetId: id, type, name, prompt, model, resolution, base64, generationKey, expectedVersion,
     });
     if (receipt.status === "succeeded" && receipt.artifactPath) {
       return res.status(200).send(success({ path: await u.oss.getSmallImageUrl(receipt.artifactPath), assetsId: id, jobId: receipt.jobId }));

@@ -8,6 +8,7 @@ import { resolveImageFlowOwner, ImageFlowWorkspaceError } from "../imageFlowWork
 import { assertImageMediaProject, resolveImageMediaOwnership, MediaOwnershipError } from "../../lib/mediaOwnership";
 import { imageReferencesMatch, type ImageReferenceSnapshot } from "./referenceSnapshot";
 import type { ImageReviewService, PreparedImageReview } from "../imageReviews";
+import { ensureCreativeWorkspaceSchema, getCreativeState } from "../creativeWorkspace";
 
 const BINDINGS = "ext_image_job_bindings";
 
@@ -28,6 +29,7 @@ export interface PrepareImageGenerationInput {
   };
   target: ImageGenerationTarget;
   builtinRun?: { id: string; inputRevision: number };
+  sourceVersion?: number;
   referenceAssets?: ImageReferenceSnapshot[];
   referencePaths?: Array<string | undefined>;
   outputPath?: string;
@@ -71,6 +73,7 @@ interface BindingContext {
   previousFilePath?: string | null;
   previousState?: string | null;
   builtinRun?: { id: string; inputRevision: number };
+  sourceVersion?: number;
   referenceAssets?: ImageReferenceSnapshot[];
   referencePaths?: Array<string | null>;
   imageReview?: PreparedImageReview;
@@ -91,6 +94,7 @@ interface BindingRow {
   previousState: string | null;
   runId: string | null;
   runInputRevision: number | string | null;
+  sourceVersion: number | string | null;
   candidateImageId: number | string | null;
   artifactPath: string | null;
   artifactHash: string | null;
@@ -109,6 +113,7 @@ export class ImageGenerationError extends Error {
 }
 
 export async function ensureProductionImageJobSchema(db: Knex): Promise<void> {
+  await ensureCreativeWorkspaceSchema(db);
   await ensureImageJobsSchema(db);
   if (isPostgres(db)) {
     await db.raw(`
@@ -127,6 +132,7 @@ export async function ensureProductionImageJobSchema(db: Knex): Promise<void> {
         "previousState" text,
         "runId" text,
         "runInputRevision" bigint,
+        "sourceVersion" bigint,
         "candidateImageId" bigint,
         "artifactPath" text,
         selected boolean NOT NULL DEFAULT false,
@@ -140,6 +146,7 @@ export async function ensureProductionImageJobSchema(db: Knex): Promise<void> {
     await db.raw(`CREATE INDEX IF NOT EXISTS "ext_image_job_bindings_artifact_idx" ON "${BINDINGS}" ("artifactPath") WHERE "artifactPath" IS NOT NULL`);
     await db.raw(`ALTER TABLE "${BINDINGS}" ADD COLUMN IF NOT EXISTS "runId" text`);
     await db.raw(`ALTER TABLE "${BINDINGS}" ADD COLUMN IF NOT EXISTS "runInputRevision" bigint`);
+    await db.raw(`ALTER TABLE "${BINDINGS}" ADD COLUMN IF NOT EXISTS "sourceVersion" bigint`);
     await db.raw(`ALTER TABLE "${BINDINGS}" ADD COLUMN IF NOT EXISTS "artifactHash" text`);
     return;
   }
@@ -159,6 +166,7 @@ export async function ensureProductionImageJobSchema(db: Knex): Promise<void> {
       table.text("previousState");
       table.text("runId");
       table.integer("runInputRevision");
+      table.integer("sourceVersion");
       table.integer("candidateImageId");
       table.text("artifactPath");
       table.text("artifactHash");
@@ -172,6 +180,7 @@ export async function ensureProductionImageJobSchema(db: Knex): Promise<void> {
     });
   }
   if (!(await db.schema.hasColumn(BINDINGS, "artifactHash"))) await db.schema.alterTable(BINDINGS, (table) => { table.text("artifactHash"); });
+  if (!(await db.schema.hasColumn(BINDINGS, "sourceVersion"))) await db.schema.alterTable(BINDINGS, (table) => { table.integer("sourceVersion"); });
 }
 
 /** Returns the owning project for both selected and saved-but-unselected generated images. */
@@ -221,6 +230,7 @@ export class ImageGenerationService {
     const context = existing ? this.contextForExisting(existing, input) : {
       ...(await this.readBindingContext(input)), requestedModelKey: input.modelKey,
       ...(input.builtinRun ? { builtinRun: normalizeBuiltinRun(input.builtinRun) } : {}),
+      ...(input.sourceVersion !== undefined ? { sourceVersion: input.sourceVersion } : {}),
       ...(input.referenceAssets ? { referenceAssets: input.referenceAssets } : {}),
       ...(input.referencePaths ? { referencePaths: input.referencePaths.map((value) => value ?? null) } : {}),
       ...(this.options.imageReviews ? { imageReview: await this.options.imageReviews.prepare(input) } : {}),
@@ -342,6 +352,7 @@ export class ImageGenerationService {
     if (stableJson(expectedTarget) !== stableJson(saved.target)) throw new ImageGenerationError("CONFLICT", "generationKey 已绑定不同的图片目标或版本", 409);
     if (input.modelKey !== (saved.requestedModelKey ?? job.modelKey)) throw new ImageGenerationError("CONFLICT", "generationKey 已绑定不同的请求图片模型", 409);
     if (stableJson(input.builtinRun ? normalizeBuiltinRun(input.builtinRun) : null) !== stableJson(saved.builtinRun ?? null)) throw new ImageGenerationError("CONFLICT", "generationKey 已绑定不同的内置运行版本", 409);
+    if (saved.sourceVersion !== undefined && input.sourceVersion !== saved.sourceVersion) throw new ImageGenerationError("CONFLICT", "generationKey 已绑定不同的素材源版本", 409);
     // Older reservations predate reference metadata; replay their exact saved context.
     // Existing provider-request hashes still protect the actual ordered image bytes.
     if (saved.referenceAssets !== undefined && stableJson(input.referenceAssets ?? null) !== stableJson(saved.referenceAssets)) throw new ImageGenerationError("CONFLICT", "generationKey 已绑定不同的素材参考版本", 409);
@@ -371,7 +382,8 @@ export class ImageGenerationService {
       if (current && (await this.db("o_image").where({ id: current, assetsId: target.id, state: "生成中" }).first())) throw new ImageGenerationError("CONFLICT", "资产图片正在生成中", 409);
       const expected = target.expectedVersion ?? current;
       if (expected !== current) throw new ImageGenerationError("VERSION_CONFLICT", "资产图片版本已变化", 409);
-      return { contractVersion: 1, target: normalizeTarget(target, expected), expectedVersion: expected, targetSignature: assetSignature(asset), previousImageId: asset.imageId == null ? null : Number(asset.imageId) };
+      if (input.sourceVersion !== undefined && (await getCreativeState(this.db, "asset", target.id, input.projectId)).version !== input.sourceVersion) throw new ImageGenerationError("VERSION_CONFLICT", "素材内容版本已变化", 409);
+      return { contractVersion: 1, target: normalizeTarget(target, expected), expectedVersion: expected, targetSignature: assetSignature(asset), previousImageId: asset.imageId == null ? null : Number(asset.imageId), ...(input.sourceVersion !== undefined ? { sourceVersion: input.sourceVersion } : {}) };
     }
     if (target.kind === "storyboard") {
       const row = await this.db("o_storyboard").where({ id: target.id, projectId: input.projectId, scriptId: target.scriptId }).first();
@@ -408,6 +420,7 @@ export class ImageGenerationService {
         targetId: String(target.id), expectedVersion: context.expectedVersion, targetSignature: context.targetSignature,
         previousImageId: context.previousImageId ?? null, previousFilePath: context.previousFilePath ?? null,
         previousState: context.previousState ?? null, runId: context.builtinRun?.id ?? null, runInputRevision: context.builtinRun?.inputRevision ?? null,
+        sourceVersion: context.sourceVersion ?? null,
         selected: false, state: "RESERVED", createdAt: now, updatedAt: now,
       };
       if (target.kind === "asset") {
@@ -416,6 +429,7 @@ export class ImageGenerationService {
         if (target.scriptId != null && !(await trx("o_scriptAssets").where({ scriptId: target.scriptId, assetId: target.id }).first())) throw new ImageGenerationError("PROJECT_MISMATCH", "资产不属于当前剧集", 400);
         if (await lockedAssetReference(trx, target.id)) throw new ImageGenerationError("LOCKED", "锁定分镜引用了该资产，不能生成图片", 423);
         if (Number(asset.imageId ?? 0) !== context.expectedVersion || assetSignature(asset) !== context.targetSignature) throw new ImageGenerationError("VERSION_CONFLICT", "资产已被其他操作修改", 409);
+        if (context.sourceVersion !== undefined && (await getCreativeState(trx, "asset", target.id, job.projectId)).version !== context.sourceVersion) throw new ImageGenerationError("VERSION_CONFLICT", "素材内容版本已变化", 409);
         const [candidateImageId] = await insertRowsReturningIds(trx, "o_image", {
           assetsId: target.id, type: asset.type, state: "生成中", model: job.modelKey.split(/:(.+)/)[1] ?? job.modelKey,
           resolution: (job.payload.config as { size?: unknown }).size == null ? null : String((job.payload.config as { size?: unknown }).size),
@@ -459,7 +473,7 @@ export class ImageGenerationService {
         claimVersion: null, claimToken: null, targetSignature: context.targetSignature,
         previousImageId: context.previousImageId ?? null, previousFilePath: context.previousFilePath ?? null,
         previousState: context.previousState ?? null, runId: context.builtinRun?.id ?? null,
-        runInputRevision: context.builtinRun?.inputRevision ?? null, candidateImageId: null, artifactPath: null,
+        runInputRevision: context.builtinRun?.inputRevision ?? null, sourceVersion: context.sourceVersion ?? null, candidateImageId: null, artifactPath: null,
         selected: false, state, error: message, createdAt: this.now(), updatedAt: this.now(),
       });
     });
@@ -496,8 +510,9 @@ export class ImageGenerationService {
       const candidateImageId = Number(binding.candidateImageId);
       await trx("o_image").where({ id: candidateImageId, assetsId: Number(binding.targetId) }).update({ filePath: job.outputPath, state: "已完成", errorReason: null });
       const asset = await trx("o_assets").where({ id: Number(binding.targetId), projectId: job.projectId }).first();
+      const sourceVersionCurrent = binding.sourceVersion == null || (await getCreativeState(trx, "asset", Number(binding.targetId), job.projectId)).version === Number(binding.sourceVersion);
       const pointerIsExpected = asset && (Number(asset.imageId) === candidateImageId || (binding.runId && Number(asset.imageId ?? 0) === Number(binding.previousImageId ?? 0)));
-      selected = Boolean(runMaySelect && referencesCurrent && pointerIsExpected && assetSignature(asset) === binding.targetSignature && !(await lockedAssetReference(trx, Number(binding.targetId))));
+      selected = Boolean(runMaySelect && sourceVersionCurrent && referencesCurrent && pointerIsExpected && assetSignature(asset) === binding.targetSignature && !(await lockedAssetReference(trx, Number(binding.targetId))));
       if (selected && asset && Number(asset.imageId) !== candidateImageId) await trx("o_assets").where({ id: asset.id, projectId: job.projectId, imageId: binding.previousImageId ?? null }).update({ imageId: candidateImageId });
       if (!selected && asset && Number(asset.imageId) === candidateImageId) {
         await trx("o_assets").where({ id: asset.id, projectId: job.projectId, imageId: candidateImageId }).update({ imageId: binding.previousImageId == null ? null : Number(binding.previousImageId) });
@@ -628,6 +643,7 @@ export class ImageGenerationService {
     if ((input.target.kind === "asset" || input.target.kind === "storyboard") && (!Number.isSafeInteger(input.target.id) || input.target.id <= 0)) throw new ImageGenerationError("INVALID_INPUT", "图片目标 ID 不合法");
     if (input.outputPath) canonicalMediaPath(input.outputPath);
     if (input.builtinRun) normalizeBuiltinRun(input.builtinRun);
+    if (input.sourceVersion !== undefined && (!Number.isSafeInteger(input.sourceVersion) || input.sourceVersion < 0)) throw new ImageGenerationError("INVALID_INPUT", "sourceVersion 必须是非负整数");
   }
 }
 

@@ -10,6 +10,8 @@ import { ImageReviewService } from "../src/services/imageReviews";
 import { BuiltinAgentRuntime, ensureBuiltinAgentRuntimeSchema } from "../src/services/builtinAgentRuntime";
 import { generateRootAssetImage } from "../src/services/rootAssetImages";
 import { ensureTeamSchema } from "../src/services/team";
+import { advanceCreativeState } from "../src/services/creativeWorkspace";
+import { lockProjectTransaction } from "../src/lib/dbTransaction";
 
 const options = { timeout: 30_000 };
 const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aGN8AAAAASUVORK5CYII=", "base64");
@@ -76,12 +78,60 @@ test("a root asset may replace its claimed candidate while retaining its own ref
     const [oldImageId] = await insertRowsReturningIds(f.db, "o_image", { assetsId: assetId, filePath: `/${f.projectId}/root-old.png`, state: "已完成" });
     await f.db("o_assets").where({ id: assetId }).update({ imageId: oldImageId });
     const generation = createImageGenerationService({ db: f.db, providerFor: async () => ({ executionMode: "sync", fingerprint: "audit-root-sync", submit: async () => ({ outputBase64: png.toString("base64"), mimeType: "image/png" as const }), query: async () => { throw new Error("unused"); } }), download: async () => undefined });
-    const receipt = await generateRootAssetImage(f.db, generation, { projectId: f.projectId, assetId, type: "role", name: "root", prompt: "same identity", model: "audit:image", resolution: "1K", base64: `data:image/png;base64,${png.toString("base64")}`, generationKey: "audit-root-self-reference" });
+    const receipt = await generateRootAssetImage(f.db, generation, { projectId: f.projectId, assetId, type: "role", name: "root", prompt: "same identity", model: "audit:image", resolution: "1K", base64: `data:image/png;base64,${png.toString("base64")}`, generationKey: "audit-root-self-reference", expectedVersion: 0 });
     const selected = await f.db("o_assets as asset").join("o_image as image", "image.id", "asset.imageId").where("asset.id", assetId).select("image.id", "image.filePath").first();
     assert.equal(receipt.status, "succeeded");
     assert.equal(receipt.selected, true);
     assert.notEqual(Number(selected.id), oldImageId);
     assert.equal(selected.filePath, receipt.artifactPath);
+  } finally { await f.destroy(); }
+});
+
+test("an old root-image request is rejected before acceptance after another user updates the asset source", options, async () => {
+  const f = await fixture();
+  try {
+    const [assetId] = await insertRowsReturningIds(f.db, "o_assets", { projectId: f.projectId, name: "root", type: "role", prompt: "source A", describe: "identity" });
+    let submits = 0;
+    const generation = createImageGenerationService({ db: f.db, providerFor: async () => ({ executionMode: "sync", fingerprint: "audit-source-version", submit: async () => { submits++; return { outputBase64: png.toString("base64"), mimeType: "image/png" as const }; }, query: async () => { throw new Error("unused"); } }), download: async () => undefined });
+    await f.db.transaction(async (trx) => {
+      await lockProjectTransaction(trx, f.projectId);
+      await trx("o_assets").where({ id: assetId, projectId: f.projectId }).update({ prompt: "source B" });
+      await advanceCreativeState(trx, { entityType: "asset", entityId: assetId, projectId: f.projectId, expectedVersion: 0, actor: { kind: "human", id: "human:2" } });
+    });
+    await assert.rejects(generateRootAssetImage(f.db, generation, { projectId: f.projectId, assetId, type: "role", name: "root", prompt: "source A", model: "audit:image", resolution: "1K", generationKey: "audit-old-request-before-accept", expectedVersion: 0 }), (error: any) => error?.code === "VERSION_CONFLICT");
+    assert.equal(submits, 0);
+    assert.equal((await f.db("ext_image_jobs")).length, 0);
+    assert.equal((await f.db("o_assets").where({ id: assetId }).first()).prompt, "source B");
+  } finally { await f.destroy(); }
+});
+
+test("a root-image result from an obsolete accepted source remains a candidate and completed replay does not submit again", options, async () => {
+  const f = await fixture();
+  try {
+    const [assetId] = await insertRowsReturningIds(f.db, "o_assets", { projectId: f.projectId, name: "root", type: "role", prompt: "source A", describe: "identity" });
+    let submits = 0;
+    const generation = createImageGenerationService({ db: f.db, providerFor: async () => ({ executionMode: "sync", fingerprint: "audit-source-window", submit: async () => {
+      submits++;
+      await f.db.transaction(async (trx) => {
+        await lockProjectTransaction(trx, f.projectId);
+        await trx("o_assets").where({ id: assetId, projectId: f.projectId }).update({ prompt: "source B" });
+        await advanceCreativeState(trx, { entityType: "asset", entityId: assetId, projectId: f.projectId, expectedVersion: 0, actor: { kind: "human", id: "human:2" } });
+      });
+      return { outputBase64: png.toString("base64"), mimeType: "image/png" as const };
+    }, query: async () => { throw new Error("unused"); } }), download: async () => undefined });
+    const input = { projectId: f.projectId, assetId, type: "role" as const, name: "root", prompt: "source A", model: "audit:image", resolution: "1K", generationKey: "audit-source-window-result", expectedVersion: 0 };
+    const first = await generateRootAssetImage(f.db, generation, input);
+    assert.equal(first.status, "succeeded");
+    assert.equal(first.selected, false);
+    assert.equal((await f.db("o_assets").where({ id: assetId }).first()).prompt, "source B");
+    assert.equal((await f.db("o_assets").where({ id: assetId }).first()).imageId, null);
+    const binding = await f.db("ext_image_job_bindings").where({ jobId: first.jobId }).first();
+    assert.equal(Number(binding.sourceVersion), 0);
+    assert(Number(binding.candidateImageId) > 0);
+    const replay = await generateRootAssetImage(f.db, generation, input);
+    assert.equal(replay.jobId, first.jobId);
+    assert.equal(replay.selected, false);
+    assert.equal(submits, 1);
   } finally { await f.destroy(); }
 });
 

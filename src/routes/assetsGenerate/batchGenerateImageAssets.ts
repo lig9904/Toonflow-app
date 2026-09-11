@@ -12,7 +12,7 @@ const router = express.Router();
 const requestSchema = {
   projectId: z.number(), model: z.string(), resolution: z.string(), concurrentCount: z.number().int().min(1).max(20).optional(),
   idempotencyKey: z.string().min(8).max(180).optional(),
-  items: z.array(z.object({ id: z.number(), type: z.enum(["role", "scene", "tool"]), name: z.string(), prompt: z.string(), base64: z.string().optional().nullable() })).min(1),
+  items: z.array(z.object({ id: z.number(), expectedVersion: z.number().int().nonnegative(), type: z.enum(["role", "scene", "tool"]), name: z.string(), prompt: z.string(), base64: z.string().optional().nullable() })).min(1),
 };
 
 export default router.post("/", validateFields(requestSchema), async (req, res) => {
@@ -23,7 +23,7 @@ export default router.post("/", validateFields(requestSchema), async (req, res) 
   try {
     const attempts = await Promise.allSettled(items.map((item: (typeof items)[number]) => prepareRootAssetImage(u.db, jobs, {
       projectId, assetId: item.id, type: item.type, name: item.name, prompt: item.prompt,
-      model, resolution, base64: item.base64, generationKey: `${prefix}:asset:${item.id}`,
+      model, resolution, base64: item.base64, generationKey: `${prefix}:asset:${item.id}`, expectedVersion: item.expectedVersion,
     })));
     const prepared = attempts.flatMap((item) => item.status === "fulfilled" ? [item.value] : []);
     const failures = attempts.flatMap((item, index) => item.status === "rejected" ? [{ id: items[index].id, error: u.error(item.reason).message }] : []);

@@ -177,7 +177,7 @@ test("independent production resumes the same task without replaying its saved d
       if (request.role === "universalAi") assert.match(request.system, /PRODUCTION-COMMON-V1/);
       else if (request.role !== "productionAgent:decisionAgent") assert.match(request.system, /PRODUCTION-SKILL-V1/);
       if (request.role === "productionAgent:decisionAgent") return { value: request.schema.parse({ actions: ["extractAssets", "planning", "deriveAssets", "storyboard"], assetIds: [f.assetId], storyboardIds: [], question: null, summary: "Plan and storyboard" }), outputTokens: 100 };
-      if (request.role === "universalAi") return { value: request.schema.parse({ roles: [{ action: "reuse", assetId: f.assetId, expectedVersion: 0 }], scenes: [], props: [], summary: "Reuse" }), outputTokens: 600 };
+      if (request.role === "universalAi") return { value: request.schema.parse({ roles: [{ action: "reuse", assetId: f.assetId, expectedVersion: 0 }], scenes: [], props: [], bindings: [{scriptId:f.scriptId,assets:[{kind:"existing",assetId:f.assetId}]}], summary: "Reuse" }), outputTokens: 600 };
       if (request.role === "productionAgent:deriveAssetsAgent") return { value: request.schema.parse({ assets: [] }), outputTokens: 7 };
       if (request.role === "productionAgent:directorPlanAgent") { directorCalls++; return { value: request.schema.parse({ scriptPlan: "Saved before interruption" }), outputTokens: 14000 }; }
       storyboardCalls++;

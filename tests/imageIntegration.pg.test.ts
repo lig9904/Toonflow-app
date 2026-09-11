@@ -91,7 +91,7 @@ test("root assets use one durable job, preserve real candidate IDs, and reject c
     const targetId = await asset(f);
     const log = { submits: [] as unknown[], queries: [] as string[] };
     const service = jobs(f.db, provider(log));
-    const input = { projectId: f.projectId, assetId: targetId, type: "role" as const, name: "hero", prompt: "red coat", model: "zhenzhen:seedream-v5", resolution: "1K", generationKey: "root-asset-stable-key" };
+    const input = { projectId: f.projectId, assetId: targetId, type: "role" as const, name: "hero", prompt: "red coat", model: "zhenzhen:seedream-v5", resolution: "1K", generationKey: "root-asset-stable-key", expectedVersion: 0 };
     const first = await generateRootAssetImage(f.db, service, input);
     const second = await generateRootAssetImage(f.db, service, input);
     assert.equal(first.status, "succeeded");
@@ -199,7 +199,7 @@ test("restart resumes by query only and a late asset result cannot replace a hum
       query: async () => { queries += 1; return upstream === "pending" ? { status: "pending" } : { status: "succeeded", outputUrl: "https://relay.invalid/restart.jpg" }; },
     };
     const first = jobs(f.db, p);
-    const input = { projectId: f.projectId, assetId: targetId, type: "role" as const, name: "hero", prompt: "wait", model: "zhenzhen:seedream-v5", resolution: "1K", generationKey: "restart-root-key" };
+    const input = { projectId: f.projectId, assetId: targetId, type: "role" as const, name: "hero", prompt: "wait", model: "zhenzhen:seedream-v5", resolution: "1K", generationKey: "restart-root-key", expectedVersion: 0 };
     const prepared = await prepareRootAssetImageForTest(f.db, first, input);
     const pending = await first.submitAndWait({ projectId: f.projectId, jobId: prepared.jobId, maxWaitMs: 0 });
     assert.equal(pending.status, "pending");
@@ -233,7 +233,7 @@ test("one failed upstream item does not discard another saved batch candidate", 
       query: async (taskId) => taskId === "batch-ok" ? { status: "succeeded", outputUrl: "https://relay.invalid/one.jpg" } : { status: "failed", error: "provider rejected second" },
     };
     const service = jobs(f.db, p);
-    const common = { projectId: f.projectId, type: "role" as const, prompt: "batch", model: "zhenzhen:seedream-v5", resolution: "1K" };
+    const common = { projectId: f.projectId, type: "role" as const, prompt: "batch", model: "zhenzhen:seedream-v5", resolution: "1K", expectedVersion: 0 };
     const [one, two] = await Promise.all([
       generateRootAssetImage(f.db, service, { ...common, assetId: firstId, name: "first", generationKey: "partial-first-key" }),
       generateRootAssetImage(f.db, service, { ...common, assetId: secondId, name: "second", generationKey: "partial-second-key" }),
@@ -285,7 +285,7 @@ test("recovery reconstructs a reserved job whose binding transaction never commi
     const log = { submits: [] as unknown[], queries: [] as string[] };
     const p = provider(log);
     const first = jobs(f.db, p);
-    const prepared = await prepareRootAssetImageForTest(f.db, first, { projectId: f.projectId, assetId: targetId, type: "role", name: "hero", prompt: "orphan", model: "zhenzhen:seedream-v5", resolution: "1K", generationKey: "orphan-binding-key" });
+    const prepared = await prepareRootAssetImageForTest(f.db, first, { projectId: f.projectId, assetId: targetId, type: "role", name: "hero", prompt: "orphan", model: "zhenzhen:seedream-v5", resolution: "1K", generationKey: "orphan-binding-key", expectedVersion: 0 });
     const binding = await f.db("ext_image_job_bindings").where({ jobId: prepared.jobId }).first();
     await f.db("o_assets").where({ id: targetId }).update({ imageId: null });
     await f.db("o_image").where({ id: binding.candidateImageId }).del();
@@ -314,7 +314,7 @@ test("a target changed between reserve and binding becomes a durable prepare fai
       db: f.db, providerFor: async () => { providerEntered(); await gate; return { ...p, submit: async (config) => { submits += 1; return p.submit(config); } }; },
       download: async () => undefined, uuid: () => "prepare-race", pollMs: 10,
     });
-    const preparing = prepareRootAssetImageForTest(f.db, service, { projectId: f.projectId, assetId: targetId, type: "role", name: "hero", prompt: "race", model: "zhenzhen:seedream-v5", resolution: "1K", generationKey: "prepare-failure-key" });
+    const preparing = prepareRootAssetImageForTest(f.db, service, { projectId: f.projectId, assetId: targetId, type: "role", name: "hero", prompt: "race", model: "zhenzhen:seedream-v5", resolution: "1K", generationKey: "prepare-failure-key", expectedVersion: 0 });
     await entered;
     const [humanImageId] = await insertRowsReturningIds(f.db, "o_image", { assetsId: targetId, filePath: "/human-race.jpg", state: "已完成", type: "role" });
     await f.db("o_assets").where({ id: targetId }).update({ imageId: humanImageId });

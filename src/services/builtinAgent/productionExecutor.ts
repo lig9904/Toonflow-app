@@ -179,7 +179,7 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
     ].map(async (name) => [name, await deps.loadSkill(name)])));
       return { ...skills, assetExtraction: String(instructions?.useData || instructions?.data || "") };
     });
-    const extractAssets = createAssetExtractionHelper({ db: deps.db, model: deps.model, loadInstructions: async () => frozenSkills.assetExtraction });
+    const extractAssets = createAssetExtractionHelper({ db: deps.db, model: deps.model, requireBindings:true, loadInstructions: async () => frozenSkills.assetExtraction });
     const skill = async (name: string) => {
       if (!(name in frozenSkills)) throw new BuiltinRuntimeError("INVALID_INPUT", "当前运行未记录该提示词版本");
       return frozenSkills[name];

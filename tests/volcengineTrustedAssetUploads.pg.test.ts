@@ -13,6 +13,7 @@ import { readVolcengineReferenceBindings, VolcengineTrustedAssetClient } from ".
 import {
   getVolcengineAssetUpload,
   createVolcengineAssetUploadRuntime,
+  ensureVolcengineAssetUploadSchema,
   listVolcengineAssetGroupCreations,
   listVolcengineAssetUploads,
   startVolcengineAssetGroupCreation,
@@ -121,5 +122,19 @@ test("upload runtime uses the controlled media bridge for a project-level Toonfl
     assert.equal(prepared.mediaType, "Image"); assert.equal(prepared.sourceFileHash, expectedSourceFileHash); assert.match(prepared.leaseUrl, /^https:\/\/media\.example\.test\/media-bridge\//);
     const lease = await fixture.db("ext_video_reference_leases").where({ leaseId: prepared.leaseId }).first();
     assert.equal(lease.projectId, projectId); assert.equal(lease.scriptId, 0); assert.equal(lease.sourceKind, "projectAssets"); assert.equal((await fixture.db("o_script").select()).length, 0); assert.equal(Object.hasOwn(lease, "url"), false);
+    await ensureVolcengineAssetUploadSchema(fixture.db);
+    await fixture.db.raw('ALTER TABLE "ext_volcengine_asset_uploads" ALTER COLUMN "mtimeMs" TYPE real');
+    let createCalls = 0;
+    const client = new VolcengineTrustedAssetClient({ credentials: { accessKeyId: "AK_TEST_ONLY", secretAccessKey: "SK_TEST_ONLY" }, fetch: async (url) => {
+      const action = new URL(String(url)).searchParams.get("Action");
+      if (action === "GetAssetGroup") return new Response(JSON.stringify({ Result: { Id: "group-aigc", GroupType: "AIGC", ProjectName: "default" } }), { status: 200 });
+      assert.equal(action, "CreateAsset"); createCalls += 1;
+      return new Response(JSON.stringify({ Result: { Id: "asset-float-regression" } }), { status: 200 });
+    } });
+    const upload = await startVolcengineAssetUpload(fixture.db, client, { projectId, targetKind: "asset", targetId: assetId, remoteProjectName: "default", groupId: "group-aigc", groupType: "AIGC", assetType: "Image", mode: "uploadOnly", expectedSourceVersion: 0, expectedSourceFileHash, expectedBindingVersion: null, idempotencyKey: "runtime-real-timestamp" }, "human:1", runtime);
+    assert.equal(upload.status, "processing"); assert.equal(createCalls, 1);
+    const stored = await fixture.db("ext_volcengine_asset_uploads").where({ operationId: upload.operationId }).first();
+    assert.equal((await fixture.db("ext_volcengine_asset_uploads").columnInfo("mtimeMs")).type, "double precision");
+    assert(Math.abs(Number(stored.mtimeMs) - prepared.mtimeMs) < 0.5, "real NAS epoch timestamps must survive PostgreSQL persistence");
   } finally { await fixture.destroy(); await rm(root, { recursive: true, force: true }); }
 });

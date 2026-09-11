@@ -12,7 +12,7 @@ import { createAssetExtractionHelper } from "./assetExtraction";
 import { getCreativeState } from "../creativeWorkspace";
 import pLimit from "p-limit";
 import { builtinThinkLevelFromIntent, hasIndependentProductionOutput, hasUnlimitedMediaBudget } from "./contracts";
-import { productionActionLabels, productionDecisionPrompt, productionStageContract, explicitProductionTextScope, isExplicitVideoOnlyRequest } from "./productionPrompts";
+import { productionActionLabels, productionDecisionPrompt, productionStageContract, explicitProductionTextScope, isExplicitVideoOnlyRequest, explicitVideoSettings } from "./productionPrompts";
 import { reconcileStoryboardAssetIds } from "../../lib/storyboardVisualContract";
 
 export interface ProductionMediaRequest {
@@ -241,10 +241,17 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
       }, { modelCall: true });
       return result.value;
     };
-    const planBudget = Math.min(1800, Math.floor(run.limits.maxOutputTokens / 3));
-    const plan = await model("plan", "productionAgent:decisionAgent", "production_agent_decision.md", planSchema, { request: requestText, project, flow,
+    const explicitVideoOnly = isExplicitVideoOnlyRequest(requestText);
+    const planBudget = explicitVideoOnly ? 0 : Math.min(1800, Math.floor(run.limits.maxOutputTokens / 3));
+    const planningInput = { request: requestText, project, flow,
       authorization: { maxImageGenerations: run.limits.maxImageGenerations, maxVideoGenerations: run.limits.maxVideoGenerations,
-        imageUnlimited: hasUnlimitedMediaBudget(run, "image"), videoUnlimited: hasUnlimitedMediaBudget(run, "video") } }, planBudget);
+        imageUnlimited: hasUnlimitedMediaBudget(run, "image"), videoUnlimited: hasUnlimitedMediaBudget(run, "video") } };
+    const plan = explicitVideoOnly
+      ? await ctx.step(`production.plan:r${revision}`, { deterministicIntent: "generateVideos", request: requestText, projectId, scriptId }, async () => planSchema.parse({
+        actions: ["generateVideos"], assetIds: [], storyboardIds: [], globalMediaInstructions: "", mediaInstructions: [], question: null,
+        summary: "执行明确的视频单阶段请求", videoSettings: explicitVideoSettings(requestText),
+      }))
+      : await model("plan", "productionAgent:decisionAgent", "production_agent_decision.md", planSchema, planningInput, planBudget);
     // Compatibility names describe the same operation, so canonicalize once.
     const requestedActions = new Set(plan.actions.map(canonical));
     const explicitTextScope = explicitProductionTextScope(requestText);
@@ -256,7 +263,7 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
     let knownTopAssets = new Set(flow.assets.map((asset: any) => Number(asset.id)));
     let knownAssets = new Set(flow.assets.flatMap((asset: any) => [Number(asset.id), ...asset.derive.map((child: any) => Number(child.id))]));
     let knownStoryboards = new Map(flow.storyboard.map((storyboard: any) => [Number(storyboard.id), storyboard]));
-    plan.storyboardIds = normalizeExplicitVideoTrackScope(actions.includes("generateVideos"), isExplicitVideoOnlyRequest(requestText), plan.storyboardIds, plan.mediaInstructions, knownStoryboards);
+    plan.storyboardIds = normalizeExplicitVideoTrackScope(actions.includes("generateVideos"), explicitVideoOnly, plan.storyboardIds, plan.mediaInstructions, knownStoryboards);
     if (plan.assetIds.some((id) => !knownAssets.has(id)) || plan.storyboardIds.some((id) => !knownStoryboards.has(id))) throw new BuiltinRuntimeError("INVALID_INPUT", "制作规划引用了项目外实体");
     validateMediaInstructions(plan, knownAssets, knownStoryboards);
     if (plan.question && !actions.length) throw new BuiltinRuntimeError("INVALID_INPUT", `本次没有可执行的制作步骤：${plan.question}`);

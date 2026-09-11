@@ -115,10 +115,16 @@ export async function ensureVolcengineAssetUploadSchema(db: Knex): Promise<void>
       table.text("operationId").primary(); table.bigInteger("projectId").notNullable(); table.bigInteger("scriptId").nullable(); table.text("targetKind").notNullable(); table.bigInteger("targetId").notNullable();
       table.text("actorId").notNullable(); table.text("idempotencyKey").notNullable(); table.text("requestHash").notNullable(); table.text("remoteProjectName").notNullable(); table.text("groupId").notNullable(); table.text("assetType").notNullable();
       table.text("name").notNullable(); table.text("remoteName").notNullable(); table.text("mode").notNullable(); table.integer("expectedBindingVersion").nullable(); table.integer("sourceVersion").notNullable(); table.text("sourceFilePath").notNullable();
-      table.text("sourceFileHash").notNullable(); table.text("contentHash").notNullable(); table.bigInteger("sizeBytes").notNullable(); table.float("mtimeMs").notNullable(); table.text("leaseId").notNullable(); table.bigInteger("leaseExpiresAt").notNullable();
+      table.text("sourceFileHash").notNullable(); table.text("contentHash").notNullable(); table.bigInteger("sizeBytes").notNullable();
+      if (isPostgres(trx)) table.specificType("mtimeMs", "double precision").notNullable(); else table.float("mtimeMs").notNullable();
+      table.text("leaseId").notNullable(); table.bigInteger("leaseExpiresAt").notNullable();
       table.text("status").notNullable(); table.text("remoteAssetId").nullable(); table.text("remoteStatus").nullable(); table.text("bindStatus").notNullable(); table.text("error").nullable(); table.bigInteger("createdAt").notNullable(); table.bigInteger("updatedAt").notNullable();
       table.unique(["projectId", "idempotencyKey"]); table.index(["projectId", "targetKind", "targetId", "updatedAt"]);
     });
+    if (isPostgres(trx)) {
+      const column = await trx(UPLOAD_OPERATIONS).columnInfo("mtimeMs");
+      if (["real", "float4"].includes(column.type)) await trx.raw("ALTER TABLE ?? ALTER COLUMN ?? TYPE double precision USING ??::double precision", [UPLOAD_OPERATIONS, "mtimeMs", "mtimeMs"]);
+    }
   });
 }
 

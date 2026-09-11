@@ -14,6 +14,7 @@ import u from "@/utils";
 import { agentGatewayConfigFromEnv, createAgentGateway } from "@/services/agentGateway";
 import { resumeVideoJobs, getRuntimeVideoJobService } from "@/services/videoJobs/runtime";
 import { getTrustedAssetUploadRecovery } from "@/services/volcengineTrustedAssetUploadRuntime";
+import { ensureVolcengineAssetUploadSchema } from "@/services/volcengineTrustedAssetUploads";
 import { dbReady } from "@/utils/db";
 import socketInit from "@/socket/index";
 import { isEletron } from "@/utils/getPath";
@@ -66,6 +67,7 @@ export default async function startServe(randomPort: Boolean = false) {
   await ensurePromptRegistrySchema(u.db);
   await ensureVideoPromptJobSchema(u.db);
   await ensureVideoReferenceBridgeSchema(u.db);
+  await ensureVolcengineAssetUploadSchema(u.db);
   await cleanupExpiredVideoReferenceLeases(u.db);
   await finishLegacyProductionWaits(u.db);
   await checkPermissions();

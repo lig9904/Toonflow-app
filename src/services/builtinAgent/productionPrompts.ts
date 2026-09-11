@@ -61,3 +61,12 @@ export function isExplicitVideoOnlyRequest(request: string): boolean {
   const onlyVideo = new RegExp(`^(?:请|帮我)?(?:只|仅)\\s*(?:生成|制作)\\s*${output}`, "u");
   return currentTrack.test(text) || onlyVideo.test(text);
 }
+
+/** Preserve explicit generation parameters when no planning model is needed. */
+export function explicitVideoSettings(request: string): { resolution: string | null; audio: boolean | null } {
+  const resolutions = [...new Set([...request.matchAll(/\b(480p|720p|1080p|4k)\b/giu)].map((match) => match[1].toLowerCase()))];
+  if (resolutions.length > 1) throw new Error("请为本次视频明确一个分辨率");
+  const mute = /无音频|无声音|无声视频|静音|关闭(?:音频|声音)|不(?:要)?生成音频/u.test(request);
+  const audio = !mute && /有声视频|带(?:音频|声音)|开启(?:音频|声音)|生成音频/u.test(request);
+  return { resolution: resolutions[0] ?? null, audio: mute ? false : audio ? true : null };
+}

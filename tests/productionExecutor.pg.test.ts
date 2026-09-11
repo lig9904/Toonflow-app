@@ -420,16 +420,24 @@ test("an explicit current-track video-only request overrides a wrong planner act
       { projectId: f.projectId, scriptId: f.scriptId, index: 1, prompt: "two", videoDesc: "two", duration: "2", track: "A", trackId: track, shouldGenerateImage: 0, state: "未生成" },
     ]);
     const received: any[] = [];
-    const model = modelFor((request) => request.role === "productionAgent:decisionAgent" ? {
-      actions: ["extractAssets"], assetIds: [], storyboardIds: [], globalMediaInstructions: "",
-      mediaInstructions: [], question: null, summary: "wrong planner action",
-    } : { items: [], summary: "" }, []);
+    const modelCalls: string[] = [];
+    const model = modelFor(() => { throw new Error("explicit video-only must not call planner"); }, modelCalls);
     const result = await runOnce(f, model, { generateVideo: async (input) => { received.push(input); return { status: "succeeded", jobId: "track-video" }; } }, { ...defaultBuiltinRunLimits, maxVideoGenerations: 1 }, "为当前轨道生成1条4秒视频，480p，无音频。沿用已保存并人工补充的视频提示词与现有分镜参考图，不出图、不重写分镜或导演计划。", async () => ({ mode: "text", resolution: "480p", audio: false }));
     assert.equal(result.run.status, "succeeded", result.run.errorMessage ?? "");
     assert.equal(received.length, 1);
     assert.equal(received[0].targetId, track);
     assert.deepEqual(received[0].params.storyboardIds, [one, two]);
     assert.match(received[0].params.instructions, /人工补充的视频提示词/);
+    assert.deepEqual(modelCalls, []);
+    const persisted = await f.db("ext_builtin_runs").where({ id: result.run.id }).first();
+    const planStep = await f.db("ext_builtin_run_steps").where({ runId: result.run.id, stepKey: "production.plan:r0" }).first();
+    assert.equal(Number(persisted.modelCalls), 0);
+    assert.equal(Boolean(planStep.modelCall), false);
+
+    let plannerCalls = 0;
+    const ordinary = await runOnce(f, modelFor((request) => { if (request.role === "productionAgent:decisionAgent") plannerCalls++; return { actions: [], assetIds: [], storyboardIds: [], question: null, summary: "nothing requested" }; }, []), undefined, defaultBuiltinRunLimits, "查看当前制作状态");
+    assert.equal(ordinary.run.status, "succeeded", ordinary.run.errorMessage ?? "");
+    assert.equal(plannerCalls, 1);
   } finally { await f.destroy(); }
 });
 

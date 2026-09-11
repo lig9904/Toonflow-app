@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { explicitProductionTextScope, isExplicitVideoOnlyRequest } from "../src/services/builtinAgent/productionPrompts";
+import { explicitProductionTextScope, isExplicitVideoOnlyRequest, explicitVideoSettings } from "../src/services/builtinAgent/productionPrompts";
 
 test("direct current-track and only-video commands have deterministic video-only intent", () => {
   for (const input of [
@@ -34,4 +34,11 @@ test("negative, analytical, prompt-description and multi-stage requests do not f
     assert.equal(isExplicitVideoOnlyRequest(input), false, input);
     assert.equal(explicitProductionTextScope(input), undefined);
   }
+});
+
+test("deterministic video requests retain explicit resolution and audio settings", () => {
+  assert.deepEqual(explicitVideoSettings("为当前轨道生成1条4秒视频，1080p，无音频"), { resolution: "1080p", audio: false });
+  assert.deepEqual(explicitVideoSettings("只生成视频，720P，带声音"), { resolution: "720p", audio: true });
+  assert.deepEqual(explicitVideoSettings("只生成视频，无对白"), { resolution: null, audio: null });
+  assert.throws(() => explicitVideoSettings("只生成视频，480p或720p"), /明确一个分辨率/);
 });

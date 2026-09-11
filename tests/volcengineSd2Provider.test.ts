@@ -33,7 +33,7 @@ describe("official Volcengine Seedream and Seedance provider", () => {
     const { provider } = await fixture();
     assert.equal(provider.vendor.id, "volcengineSd2");
     assert.equal(provider.vendor.name, "火山引擎sd2.0真人");
-    assert.equal(provider.vendor.version, "3.0");
+    assert.equal(provider.vendor.version, "3.1");
     assert.equal(provider.persistentVideoTaskVersion, 1);
     assert.equal(provider.synchronousImageRequestVersion, 1);
     assert.deepEqual(provider.vendor.models.map((model: any) => model.modelName), [
@@ -85,6 +85,22 @@ describe("official Volcengine Seedream and Seedance provider", () => {
     assert.deepEqual(await persistent.query("task / 1"), { status: "succeeded", outputUrl: "https://cdn.example.test/video.mp4" });
     assert.equal(f.calls[1].url, "https://ark.example.test/api/v3/contents/generations/tasks/task%20%2F%201");
     assert.equal(f.logs.length, 0);
+  });
+
+  it("lets first-frame images determine the output ratio while preserving text and reference ratios", async () => {
+    const f = await fixture();
+    f.setHandler(() => new Response(JSON.stringify({ id: "task-first-frame" }), { status: 200 }));
+    for (const model of f.provider.vendor.models.filter((item: any) => item.type === "video")) {
+      for (const mode of ["singleImage", "endFrameOptional", "startEndRequired"]) {
+        await f.provider.submitVideoTask({ prompt: "scene", duration: 4, resolution: "480p", aspectRatio: "16:9", mode,
+          referenceList: mode === "startEndRequired" ? [imageReference(), imageReference()] : [imageReference()] }, model);
+        assert.equal("ratio" in f.calls.at(-1)!.body, false, `${model.modelName}:${mode}`);
+      }
+      await f.provider.submitVideoTask({ prompt: "scene", duration: 4, resolution: "480p", aspectRatio: "9:16", mode: "text", referenceList: [] }, model);
+      assert.equal(f.calls.at(-1)!.body.ratio, "9:16");
+      await f.provider.submitVideoTask({ prompt: "scene", duration: 4, resolution: "480p", aspectRatio: "9:16", mode: model.mode.at(-1), referenceList: [imageReference()] }, model);
+      assert.equal(f.calls.at(-1)!.body.ratio, "9:16");
+    }
   });
 
   it("rejects invalid capabilities before POST and distinguishes upstream rejection from uncertainty", async () => {

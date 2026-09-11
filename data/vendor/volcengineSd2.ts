@@ -1,6 +1,6 @@
 /**
  * Toonflow 火山官方图片和视频适配器（保留原 sd2.0 真人供应商标识）
- * @version 3.0
+ * @version 3.1
  */
 
 // ============================================================
@@ -141,7 +141,7 @@ declare const exports: {
 
 const vendor: VendorConfig = {
   id: "volcengineSd2",
-  version: "3.0",
+  version: "3.1",
   author: "toonflow",
   name: "火山引擎sd2.0真人",
   description: "使用火山方舟官方图片与视频生成 API。图片生成参考可从 NAS 读取为 Base64；视频生成参考使用应用现有的签名媒体 URL，无需 TOS。真人素材须先在方舟可信素材库完成真人认证与授权，再以 asset:// Asset ID 使用；本适配器不自动上传或注册真人素材。",
@@ -455,11 +455,13 @@ const submitVideoTask = async (config: VideoConfig, model: VideoModel): Promise<
   const body: any = {
     model: model.modelName,
     content,
-    ratio: config.aspectRatio,
     duration: config.duration,
     resolution: config.resolution || "720p",
     watermark: false,
   };
+  // First-frame generation inherits its aspect ratio from the supplied frame.
+  // Ark rejects an explicit ratio for first-frame and first-last-frame tasks.
+  if (config.mode === "text" || Array.isArray(config.mode)) body.ratio = config.aspectRatio;
   if (Array.isArray(config.mode) && model.modelName.includes("seedance-2-5")) body.omni_reference_task_type = "reference";
 
   if (model.audio === "optional") {
@@ -513,7 +515,7 @@ const ttsRequest = async (config: TTSConfig, model: TTSModel): Promise<string> =
 };
 
 const checkForUpdates = async (): Promise<{ hasUpdate: boolean; latestVersion: string; notice: string }> => {
-  return { hasUpdate: false, latestVersion: "3.0", notice: "" };
+  return { hasUpdate: false, latestVersion: "3.1", notice: "" };
 };
 
 const updateVendor = async (): Promise<string> => {

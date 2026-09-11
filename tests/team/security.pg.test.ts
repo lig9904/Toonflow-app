@@ -152,6 +152,8 @@ test("the route registry is exact, complete for router.ts, and classifies reads 
   assert.equal(getRouteAuthorization("POST", "/api/project/addDirectorManual")?.scope, "admin");
   assert.equal(getRouteAuthorization("POST", "/api/builtinAgent/list")?.action, "read");
   assert.equal(getRouteAuthorization("POST", "/api/builtinAgent/get")?.resources?.[0].table, "ext_builtin_runs");
+  assert.equal(getRouteAuthorization("POST", "/api/assetsGenerate/batchGenerateImageAssets")?.resources?.[0].nestedIdField, "id");
+  assert.equal(getRouteAuthorization("POST", "/api/assetsGenerate/batchPolishAssetsPrompt")?.resources?.[0].nestedIdField, "assetsId");
   assert.equal(getRouteAuthorization("POST", "/api/models/delight"), undefined);
 });
 
@@ -162,7 +164,13 @@ test("route authorization rechecks membership and rejects cross-project resource
     await assert.rejects(authorizeRoute({ db: f.db }, "POST", "/api/unknown/action", principal), rejectedWith("UNKNOWN_OPERATION"));
     const [script] = await f.db("o_script").insert({ projectId: f.editorProject, name: "one" }).returning("id");
     const [foreignAsset] = await f.db("o_assets").insert({ projectId: f.adminProject, name: "other", type: "role" }).returning("id");
+    const [localAsset] = await f.db("o_assets").insert({ projectId: f.editorProject, name: "local", type: "role" }).returning("id");
     await assert.rejects(authorizeRoute({ db: f.db }, "POST", "/api/script/addScript", principal, { body: { projectId: f.editorProject, assets: [foreignAsset.id] } } as any), rejectedWith("PROJECT_MISMATCH"));
+    await authorizeRoute({ db: f.db }, "POST", "/api/assetsGenerate/batchGenerateImageAssets", principal, { body: { projectId: f.editorProject, items: [{ id: localAsset.id }] } } as any);
+    await authorizeRoute({ db: f.db }, "POST", "/api/assetsGenerate/batchPolishAssetsPrompt", principal, { body: { projectId: f.editorProject, items: [{ assetsId: localAsset.id }] } } as any);
+    await assert.rejects(authorizeRoute({ db: f.db }, "POST", "/api/assetsGenerate/batchGenerateImageAssets", principal, { body: { projectId: f.editorProject, items: [{ assetsId: localAsset.id }] } } as any), rejectedWith("INVALID_ID"));
+    await assert.rejects(authorizeRoute({ db: f.db }, "POST", "/api/assetsGenerate/batchPolishAssetsPrompt", principal, { body: { projectId: f.editorProject, items: [{ id: localAsset.id }] } } as any), rejectedWith("INVALID_ID"));
+    await assert.rejects(authorizeRoute({ db: f.db }, "POST", "/api/assetsGenerate/batchGenerateImageAssets", principal, { body: { projectId: f.editorProject, items: [{ id: foreignAsset.id }] } } as any), rejectedWith("PROJECT_MISMATCH"));
     await f.db.schema.createTable("ext_builtin_runs", (table) => { table.text("id").primary(); table.bigInteger("projectId"); });
     const runId = "12345678-1234-1234-1234-123456789abc";
     await f.db("ext_builtin_runs").insert({ id: runId, projectId: f.editorProject });

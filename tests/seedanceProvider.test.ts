@@ -8,7 +8,7 @@ import { buildSeedance2AssetReferenceContext } from "../src/lib/videoPromptRefer
 
 type FetchCall = { url: string; method: string; headers: Record<string, string>; body: any };
 
-const providerPath = path.resolve(process.cwd(), "data/vendor/volcengine.ts");
+const providerPath = path.resolve(process.cwd(), "data/vendor/volcengineSd2.ts");
 const baseUrl = "http://127.0.0.1:18765/api/v3";
 const apiKey = "seedance-local-test-key";
 
@@ -54,6 +54,7 @@ describe("Seedance provider local contract", () => {
       wasm: false,
       sandbox: {
         exports,
+        URL,
         logger: () => undefined,
         fetch: async (input: string | URL | Request, init?: RequestInit) => {
           const headers = Object.fromEntries(new Headers(init?.headers).entries());
@@ -89,8 +90,8 @@ describe("Seedance provider local contract", () => {
 
   it("keeps only image/video/audio reference kinds in the Seedance 2 model config", () => {
     const model = seedanceModel();
-    assert.deepEqual(model.mode, ["text", "startFrameOptional", ["imageReference:9", "videoReference:3", "audioReference:3"]]);
-    const configuredKinds = (model.mode[2] as string[]).map((item) => item.split(":")[0]);
+    assert.deepEqual(model.mode, ["text", "singleImage", "endFrameOptional", "startEndRequired", ["imageReference:9", "videoReference:3", "audioReference:3"]]);
+    const configuredKinds = (model.mode.at(-1) as string[]).map((item) => item.split(":")[0]);
     assert.deepEqual(configuredKinds.sort(), ["audioReference", "imageReference", "videoReference"]);
   });
 
@@ -108,10 +109,10 @@ describe("Seedance provider local contract", () => {
         resolution: "720p",
         aspectRatio: "16:9",
         audio: true,
-        mode: ["text", ["imageReference:9", "videoReference:3", "audioReference:3"]],
+        mode: ["imageReference:9", "videoReference:3", "audioReference:3"],
         referenceList: [
           { type: "image", sourceType: "base64", base64: "data:image/png;base64,IMAGE" },
-          { type: "video", sourceType: "base64", base64: "data:video/mp4;base64,VIDEO" },
+          { type: "video", sourceType: "url", url: "https://media.example.test/movement.mp4" },
           { type: "audio", sourceType: "base64", base64: "data:audio/wav;base64,AUDIO" },
         ],
       },
@@ -128,7 +129,7 @@ describe("Seedance provider local contract", () => {
       ["text", "image_url", "video_url", "audio_url"],
     );
     assert.equal(calls[0].body.content[1].image_url.url, "data:image/png;base64,IMAGE");
-    assert.equal(calls[0].body.content[2].video_url.url, "data:video/mp4;base64,VIDEO");
+    assert.equal(calls[0].body.content[2].video_url.url, "https://media.example.test/movement.mp4");
     assert.equal(calls[0].body.content[3].audio_url.url, "data:audio/wav;base64,AUDIO");
     assert.equal(calls[1].url, `${baseUrl}/contents/generations/tasks/task-local-1`);
     assert.equal(calls[1].headers.authorization, `Bearer ${apiKey}`);
@@ -143,12 +144,12 @@ describe("Seedance provider local contract", () => {
           duration: 5,
           resolution: "720p",
           aspectRatio: "16:9",
-          mode: ["text"],
+          mode: "text",
           referenceList: [],
         },
         seedanceModel(),
       ),
-      /视频生成任务创建失败/,
+      /视频生成任务创建.*HTTP 503.*提交结果不确定/,
     );
     assert.equal(calls.length, 1);
   });
@@ -162,7 +163,7 @@ describe("Seedance provider local contract", () => {
           duration: 5,
           resolution: "720p",
           aspectRatio: "16:9",
-          mode: ["text"],
+          mode: "text",
           referenceList: [],
         },
         seedanceModel(),

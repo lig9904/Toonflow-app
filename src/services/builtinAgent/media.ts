@@ -13,9 +13,11 @@ import { reconcileStoredStoryboardReferences } from "../storyboardVisuals";
 import { snapshotImageReference, type ImageReferenceSnapshot } from "../imageJobs/referenceSnapshot";
 import { matchVideoGenerationDuration, videoTailHoldInstruction } from "../../lib/videoGenerationTiming";
 import { preflightVideoPrompt } from "../videoPromptReview";
-import { loadVideoReferenceInventory, selectVideoPromptReferences } from "../videoPromptComposition";
+import { buildVideoPromptReferenceCandidates, loadVideoReferenceInventory } from "../videoPromptComposition";
 import { getCreativeState } from "../creativeWorkspace";
 import type { prepareRuntimeVideoPromptForGeneration } from "../videoPromptCompositionRuntime";
+import { captureVideoModeSelectionSnapshot, ensureVideoModeIntentSchema, readVideoModeIntent, resolveStoredVideoMode, revalidateVideoModeSelection } from "../videoModeResolution";
+import type { StoredVideoModeSelection } from "../videoModeResolution";
 
 export interface MediaModelCapabilities {
   type?: string;
@@ -40,18 +42,22 @@ interface Dependencies {
 /** Match the existing Web's 480p/audio-off defaults when the model supports them. */
 export function defaultVideoSettings(model: MediaModelCapabilities) {
   const resolutions = [...new Set((model.durationResolutionMap ?? []).flatMap((entry) => entry.resolution))];
-  return { mode: model.mode?.[0], resolution: resolutions.includes("480p") ? "480p" : resolutions[0], audio: model.audio === true };
+  return { mode: "auto", resolution: resolutions.includes("480p") ? "480p" : resolutions[0], audio: model.audio === true };
 }
 
 export function validateVideoParameters(model: MediaModelCapabilities, params: Record<string, unknown>) {
   const mode = parseVideoMode(params.mode);
-  if (!(model.mode ?? []).some((allowed) => JSON.stringify(allowed) === JSON.stringify(mode))) throw new BuiltinRuntimeError("INVALID_INPUT", "视频模式不受当前模型支持");
+  if (mode !== "auto" && !(model.mode ?? []).some((allowed) => JSON.stringify(allowed) === JSON.stringify(mode))) throw new BuiltinRuntimeError("INVALID_INPUT", "视频模式不受当前模型支持");
   const duration = Number(params.duration);
   const resolution = String(params.resolution ?? "");
   if (!(model.durationResolutionMap ?? []).some((entry) => entry.duration.includes(duration) && entry.resolution.includes(resolution))) throw new BuiltinRuntimeError("INVALID_INPUT", "视频时长和分辨率组合不受当前模型支持，请调整轨道时长或模型");
   const audio = params.audio === true;
   if ((model.audio === false && audio) || (model.audio === true && !audio)) throw new BuiltinRuntimeError("INVALID_INPUT", "音频开关与当前模型能力不一致");
   return { mode, duration, resolution, audio };
+}
+
+export function agentVideoReferenceSelection(saved: StoredVideoModeSelection, inventory: Parameters<typeof buildVideoPromptReferenceCandidates>[0], trackId: number) {
+  return saved.referencesInitialized ? saved.references : buildVideoPromptReferenceCandidates(inventory, trackId);
 }
 
 export function createProductionMediaCapabilities(deps: Dependencies): ProductionMediaCapability {
@@ -142,19 +148,29 @@ export function createProductionMediaCapabilities(deps: Dependencies): Productio
         let duration: number;
         try { duration = matchVideoGenerationDuration(model, plannedDuration, String(request.params.resolution ?? "")); }
         catch (error) { throw new BuiltinRuntimeError("INVALID_INPUT", error instanceof Error ? error.message : String(error)); }
-        const settings = validateVideoParameters(model, { ...request.params, duration });
+        await ensureVideoModeIntentSchema(deps.db);
+        const savedModeIntent = await readVideoModeIntent(deps.db, { projectId: request.projectId, scriptId: request.scriptId, trackId: request.targetId });
+        const modeIntent = savedModeIntent.modeIntent;
+        const baseSettings = validateVideoParameters(model, { ...request.params, mode: modeIntent, duration });
         const storyboardIds = Array.isArray(request.params.storyboardIds) ? [...new Set(request.params.storyboardIds.map(Number))] : [];
         const rows = await deps.db("o_storyboard").where({ projectId: request.projectId, scriptId: request.scriptId, trackId: request.targetId }).orderBy("index").orderBy("id");
         if (!storyboardIds.length || rows.length !== storyboardIds.length || rows.some((row) => !storyboardIds.includes(Number(row.id)))) throw new BuiltinRuntimeError("INVALID_INPUT", "视频生成必须包含当前轨道的完整分镜，请重新读取轨道");
 
         const inventory = await loadVideoReferenceInventory(deps.db,{projectId:request.projectId,scriptId:request.scriptId,trackIds:[request.targetId]});
-        const referenceInputs = selectVideoPromptReferences(settings.mode,inventory,request.targetId);
+        let modeResolution;
+        try { modeResolution = await resolveStoredVideoMode(deps.db, { projectId: request.projectId, scriptId: request.scriptId, trackId: request.targetId, model: request.modelKey, capabilities: model, references: agentVideoReferenceSelection(savedModeIntent, inventory, request.targetId), expectedIntentRevision: savedModeIntent.revision }); }
+        catch (error) { throw new BuiltinRuntimeError("INVALID_INPUT", error instanceof Error ? error.message : String(error)); }
+        const settings = { ...baseSettings, mode: modeResolution.resolvedMode };
+        const referenceInputs = modeResolution.resolvedReferences;
+        await request.ctx.emit("video.modeResolved", modeResolution);
         const provider = await deps.videoProviderFor(request.modelKey);
+        const modeSnapshot=await captureVideoModeSelectionSnapshot(deps.db,{projectId:request.projectId,scriptId:request.scriptId,trackId:request.targetId,resolution:modeResolution},deps.toBase64);
         const referenceList = await loadOwnedVideoReferences(deps.db, request.projectId, request.scriptId, referenceInputs, deps.toBase64,
           videoReferenceOptionsForProvider(provider, deps.mediaRootDir ?? "", request.modelKey));
+        await revalidateVideoModeSelection(deps.db,{projectId:request.projectId,scriptId:request.scriptId,trackId:request.targetId,snapshot:modeSnapshot},deps.toBase64);
         const project = await deps.db("o_project").where({ id: request.projectId }).first();
         const expectedTrackVersion = Number.isSafeInteger(request.params.expectedTrackVersion) ? Number(request.params.expectedTrackVersion) : (await getCreativeState(deps.db,"track",request.targetId,request.projectId)).version;
-        const input = {projectId:request.projectId,scriptId:request.scriptId,trackId:request.targetId,model:request.modelKey,mode:typeof settings.mode === "string"?settings.mode:JSON.stringify(settings.mode),info:referenceInputs,generation:{duration:settings.duration,resolution:settings.resolution,audio:settings.audio},expectedVersion:expectedTrackVersion,idempotencyKey:`${request.generationKey}:prompt`};
+        const input = {projectId:request.projectId,scriptId:request.scriptId,trackId:request.targetId,model:request.modelKey,mode:typeof settings.mode === "string"?settings.mode:JSON.stringify(settings.mode),info:referenceInputs,modeIntentSnapshot:{modeIntent:modeResolution.modeIntent,revision:savedModeIntent.revision},generation:{duration:settings.duration,resolution:settings.resolution,audio:settings.audio},expectedVersion:expectedTrackVersion,idempotencyKey:`${request.generationKey}:prompt`};
         let prepared;
         if (deps.prepareVideoPrompt) {
           prepared = await deps.prepareVideoPrompt(input, {
@@ -169,7 +185,7 @@ export function createProductionMediaCapabilities(deps: Dependencies): Productio
           prepared={prompt:track.prompt,trackVersion:version,stale:false};
         }
         if(prepared.stale)throw new BuiltinRuntimeError("CONFLICT","源分镜已更新，已保留人工提示词；请在画布核对并保存提示词后重新发起生成");
-        const config = { ...settings, prompt: [prepared.prompt,String(request.params.instructions??""),videoTailHoldInstruction(plannedDuration, duration)].filter(Boolean).join("\n"), referenceList, aspectRatio: project?.videoRatio };
+        const config = { ...settings, prompt: [prepared.prompt,String(request.params.instructions??""),videoTailHoldInstruction(plannedDuration, duration)].filter(Boolean).join("\n"), referenceList, aspectRatio: project?.videoRatio, toonflowModeSelection: modeSnapshot };
         if (!config.prompt || !config.aspectRatio) throw new BuiltinRuntimeError("INVALID_INPUT", "视频提示词或画幅缺失");
         const promptReview = await preflightVideoPrompt(deps.db, { projectId: request.projectId, scriptId: request.scriptId,
           trackId: request.targetId, prompt: config.prompt, model: request.modelKey, mode: settings.mode,
@@ -182,6 +198,9 @@ export function createProductionMediaCapabilities(deps: Dependencies): Productio
           await assertTrackUnchanged(trx, request, rows);
           const currentTrack=await trx("o_videoTrack").where({id:request.targetId,projectId:request.projectId,scriptId:request.scriptId}).first();
           if((await getCreativeState(trx,"track",request.targetId,request.projectId)).version!==prepared.trackVersion||currentTrack?.prompt!==prepared.prompt)throw new BuiltinRuntimeError("CONFLICT","人工视频提示词已修改，本次旧请求未提交");
+          const currentModeIntent=await readVideoModeIntent(trx,{projectId:request.projectId,scriptId:request.scriptId,trackId:request.targetId});
+          const selection=(value:typeof currentModeIntent)=>({modeIntent:value.modeIntent,references:value.references,referencesInitialized:value.referencesInitialized,revision:value.revision});
+          if(JSON.stringify(selection(currentModeIntent))!==JSON.stringify(selection(savedModeIntent)))throw new BuiltinRuntimeError("CONFLICT","视频生成方式或参考用途已变化，本次旧请求未提交");
           if(JSON.stringify(await loadVideoReferenceInventory(trx,{projectId:request.projectId,scriptId:request.scriptId,trackIds:[request.targetId]}))!==JSON.stringify(inventory))throw new BuiltinRuntimeError("CONFLICT","视频参考或绑定音色已变化，本次旧请求未提交");
           return deps.videos.reserveNewVideos([{ idempotencyKey: request.generationKey, request: { modelKey: request.modelKey, providerFingerprint: provider.fingerprint,
             projectId: request.projectId, scriptId: request.scriptId, trackId: request.targetId, config, outputPath: `/${request.projectId}/video/${pathKey}.mp4` }, requestHash }], trx).then((results) => results[0]);

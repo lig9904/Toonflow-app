@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { referenceLabelFindings } from "../src/lib/videoPromptContract";
-import { actualVideoPromptMode, effectiveVideoGeneration, selectVideoPromptReferences } from "../src/services/videoPromptComposition";
+import { actualVideoPromptMode, effectiveVideoGeneration, resolveInventoryVideoMode, selectVideoPromptReferences } from "../src/services/videoPromptComposition";
 import { reviewGeneratedVideoPrompt } from "../src/services/videoPromptReview";
 import type { VideoPromptJob } from "../src/services/videoPromptJobs";
 
@@ -26,16 +26,32 @@ test("reference labels preserve typed independent numbering and reject invented 
   assert.equal(referenceLabelFindings("@图片1", []).length, 1);
 });
 
-test("shared reference selection includes bound role audio and obeys typed limits", () => {
+test("shared reference selection rejects overflow, preserves every fitting reference and never guesses first-last frames", () => {
   const inventory = {
     storyboards: [{ id: 11, trackId: 3, filePath: "/a.png" }, { id: 12, trackId: 3, filePath: "/b.png" }],
     linkedAssets: [{ storyboardId: 11, id: 21, assetsId: null, type: "role", filePath: "/role.png", storedFileType: "image" }],
     boundAudio: [{ roleAssetId: 21, familyId: 30, id: 31, name: "voice", describe: "", prompt: "", filePath: "/voice.mp3", version: 2 }],
   };
-  assert.deepEqual(selectVideoPromptReferences(["imageReference:1", "audioReference:1"], inventory, 3), [
-    { id: 11, sources: "storyboard", fileType: "image" }, { id: 31, sources: "assets", fileType: "audio" },
+  assert.throws(() => selectVideoPromptReferences(["imageReference:1", "audioReference:1"], inventory, 3), /无法使用本片段全部素材/);
+  assert.deepEqual(selectVideoPromptReferences(["imageReference:3", "audioReference:1"], inventory, 3), [
+    { id: 11, sources: "storyboard", fileType: "image", purpose: "style_reference" },
+    { id: 12, sources: "storyboard", fileType: "image", purpose: "style_reference" },
+    { id: 21, sources: "assets", fileType: "image", purpose: "identity_reference" },
+    { id: 31, sources: "assets", fileType: "audio", purpose: "audio_reference" },
   ]);
-  assert.deepEqual(selectVideoPromptReferences("startEndRequired", inventory, 3).map((item) => item.id), [11, 12]);
+  assert.throws(() => selectVideoPromptReferences("startEndRequired", inventory, 3), /无法使用本片段全部素材/);
+  assert.deepEqual(selectVideoPromptReferences("singleImage", { ...inventory, storyboards: [inventory.storyboards[0]], linkedAssets: [], boundAudio: [] }, 3), [
+    { id: 11, sources: "storyboard", fileType: "image", purpose: "first_frame" },
+  ]);
+});
+
+test("automatic inventory ignores ungenerated placeholders while explicit persisted IDs remain a database validation concern", () => {
+  const resolved = resolveInventoryVideoMode("auto", { mode: ["text", "singleImage", ["imageReference:3"]] }, {
+    storyboards: [{ id: 41, trackId: 3, filePath: null }],
+    linkedAssets: [{ storyboardId: 41, id: 42, type: "role", filePath: null }],
+    boundAudio: [],
+  }, 3);
+  assert.equal(resolved.resolvedMode, "text"); assert.deepEqual(resolved.resolvedReferences, []);
 });
 
 test("semantic review gets real source identities, intent, timing and audio; one minimal repair", async () => {

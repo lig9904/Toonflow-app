@@ -8,6 +8,7 @@ import { lockProjectTransaction } from "@/lib/dbTransaction";
 import { advanceCreativeState, getCreativeState } from "@/services/creativeWorkspace";
 import { buildStoryboardVideoPrompt, visualText } from "@/lib/storyboardVisualContract";
 import { isVolcengineTrustedModel, readPromptTrustedBindings } from "./volcengineReferenceRuntime";
+import { acknowledgeVideoPromptReferences, ensureVideoModeIntentSchema, type VideoModeIntent, type VideoReferencePurpose } from "./videoModeResolution";
 
 const JOBS = "ext_video_prompt_jobs";
 const ready = new WeakMap<object, Promise<void>>();
@@ -20,7 +21,8 @@ export interface VideoPromptJobInput {
   trackId: number;
   model: string;
   mode: string;
-  info: Array<{ id: number; sources: string; fileType?: "image" | "video" | "audio" }>;
+  info: Array<{ id: number; sources: string; fileType?: "image" | "video" | "audio"; purpose?: VideoReferencePurpose }>;
+  modeIntentSnapshot?: { modeIntent: VideoModeIntent; revision: number };
   idempotencyKey: string;
   expectedVersion: number;
   generation?: VideoGenerationSettings;
@@ -144,6 +146,7 @@ function toJob(row: any): VideoPromptJob {
 
 export async function prepareVideoPromptJob(db: Knex, input: VideoPromptJobInput, options: { compose?: (context: { db: Knex; scriptDuration: number; referenceCount: number }) => Promise<VideoPromptComposition> } = {}): Promise<{ job: VideoPromptJob; reused: boolean }> {
   await ensureVideoPromptJobSchema(db);
+  await ensureVideoModeIntentSchema(db);
   const projectId = positive(input.projectId, "projectId");
   const scriptId = positive(input.scriptId, "scriptId");
   const trackId = positive(input.trackId, "trackId");
@@ -155,7 +158,7 @@ export async function prepareVideoPromptJob(db: Knex, input: VideoPromptJobInput
     if (!(await trx("o_script").where({ id: scriptId, projectId }).first())) throw new VideoPromptJobError("CONFLICT", "剧集不属于当前项目");
     const track = await trx("o_videoTrack").where({ id: trackId, projectId, scriptId }).forUpdate().first();
     if (!track) throw new VideoPromptJobError("CONFLICT", "视频轨道不属于当前项目或剧集");
-    const requestIdentityHash = hash({ projectId, scriptId, trackId, model: input.model, mode: input.mode, info: input.info, expectedVersion, ...(input.generation === undefined ? {} : { generation: input.generation }) });
+    const requestIdentityHash = hash({ projectId, scriptId, trackId, model: input.model, mode: input.mode, info: input.info, modeIntentSnapshot: input.modeIntentSnapshot, expectedVersion, ...(input.generation === undefined ? {} : { generation: input.generation }) });
     const existingByRequest = await trx(JOBS).where({ projectId, scriptId, trackId, idempotencyKey }).first();
     if (existingByRequest) {
       if (existingByRequest.requestIdentityHash && existingByRequest.requestIdentityHash !== requestIdentityHash) throw new VideoPromptJobError("CONFLICT", "提示词任务编号已用于不同请求");
@@ -213,8 +216,8 @@ export async function prepareVideoPromptJob(db: Knex, input: VideoPromptJobInput
       const label = { image: "图片", video: "视频", audio: "音频" }[mediaType];
       const number = ++referenceCounts[mediaType];
       referenceLabels.push(`@${label}${number}`);
-      const framePosition = ["singleImage", "startEndRequired", "endFrameOptional", "startFrameOptional"].includes(input.mode) ? (index === 0 ? "，帧位置：首帧" : "，帧位置：尾帧") : "";
-      return `选择顺序${index + 1}，@${label}${number}${framePosition}，来源 ${item.sources} ${Number(item.id)}：${row.name ?? "分镜参考"}；${visualText(row.describe ?? row.prompt ?? "")}${trusted ? "；实际输入为已绑定火山素材，本地图片仅用于关联；最终提示词仍使用上述引用标签，不能用素材 ID 指代" : ""}`;
+      const framePosition = item.purpose === "first_frame" ? "，帧位置：首帧" : item.purpose === "last_frame" ? "，帧位置：尾帧" : !item.purpose && ["singleImage", "startEndRequired", "endFrameOptional", "startFrameOptional"].includes(input.mode) ? (index === 0 ? "，帧位置：首帧" : "，帧位置：尾帧") : "";
+      return `选择顺序${index + 1}，@${label}${number}${framePosition}${item.purpose ? `，用途：${item.purpose}` : ""}，来源 ${item.sources} ${Number(item.id)}：${row.name ?? "分镜参考"}；${visualText(row.describe ?? row.prompt ?? "")}${trusted ? "；实际输入为已绑定火山素材，本地图片仅用于关联；最终提示词仍使用上述引用标签，不能用素材 ID 指代" : ""}`;
     }).filter(Boolean);
     const semanticIdentity = versionedLinkedAssets.map((row) => `语义身份（仅用于理解，不代表已上传参考图）：${row.name ?? "未命名"}：${row.describe ?? ""}`).join("\n");
     validatePromptReferenceSelection(input.mode, [...Array(referenceCounts.image).fill("image"), ...Array(referenceCounts.video).fill("video"), ...Array(referenceCounts.audio).fill("audio")]);
@@ -225,7 +228,7 @@ export async function prepareVideoPromptJob(db: Knex, input: VideoPromptJobInput
       semanticIdentity,
       selectedVisual.length ? `本次用户选择的视觉参考（仅这些素材会作为视觉输入）：\n${selectedVisual.join("\n")}` : "本次未选择视觉参考图，不能假定存在已上传参考图。",
     ].filter(Boolean).join("\n\n");
-    const referenceSnapshot = { info: input.info, selectedStoryboards: versionedStoryboards, selectedAssets: versionedAssets, linkedAssets: versionedLinkedAssets, ...(trustedAssets ? { trustedAssets } : {}) };
+    const referenceSnapshot = { info: input.info, selectedStoryboards: versionedStoryboards, selectedAssets: versionedAssets, linkedAssets: versionedLinkedAssets, ...(input.modeIntentSnapshot ? { modeIntent: input.modeIntentSnapshot } : {}), ...(trustedAssets ? { trustedAssets } : {}) };
     const requestHash = hash({ requestIdentityHash, sourceSnapshot, referenceSnapshot });
     const active = await trx(JOBS).where({ projectId, scriptId, trackId }).whereIn("state", ["queued", "running"]).first();
     if (active) throw new VideoPromptJobError("CONFLICT", "当前轨道已有提示词任务正在生成");
@@ -295,8 +298,8 @@ async function executeVideoPromptJobOnce(db: Knex, jobId: string, generate: (job
       const currentSourceRows = await trx("o_storyboard").where({ projectId: claimed.job.projectId, scriptId: claimed.job.scriptId, trackId: claimed.job.trackId }).orderBy("index").orderBy("id").select("id", "prompt", "videoDesc", "duration");
       const currentSourceStates = currentSourceRows.length ? await trx("ext_entity_state").where({ projectId: claimed.job.projectId, entityType: "storyboard" }).whereIn("entityId", currentSourceRows.map((item) => Number(item.id))).select("entityId", "version") : [];
       const currentSources = currentSourceRows.map((item) => ({ ...item, version: Number(currentSourceStates.find((state) => Number(state.entityId) === Number(item.id))?.version ?? 0) }));
-      const savedReferences = (claimed.job.referenceSnapshot && typeof claimed.job.referenceSnapshot === "object" ? claimed.job.referenceSnapshot : {}) as { info?: Array<{ id: number; sources: string }>; selectedStoryboards?: unknown[]; selectedAssets?: unknown[]; linkedAssets?: unknown[] };
-      const currentReferences = await currentPromptReferences(trx, claimed.job.projectId, claimed.job.scriptId, currentSources, { ...savedReferences, ...(isVolcengineTrustedModel(claimed.job.model) ? { trustedAssets: (savedReferences as any).trustedAssets ?? [] } : {}) });
+      const savedReferences = (claimed.job.referenceSnapshot && typeof claimed.job.referenceSnapshot === "object" ? claimed.job.referenceSnapshot : {}) as { info?: Array<{ id: number; sources: string }>; selectedStoryboards?: unknown[]; selectedAssets?: unknown[]; linkedAssets?: unknown[]; modeIntent?: { modeIntent: VideoModeIntent; revision: number } };
+      const currentReferences = await currentPromptReferences(trx, claimed.job.projectId, claimed.job.scriptId, currentSources, { ...savedReferences, ...(isVolcengineTrustedModel(claimed.job.model) ? { trustedAssets: (savedReferences as any).trustedAssets ?? [] } : {}) }, claimed.job.trackId);
       const locked = await trx("ext_entity_state").where({ projectId: claimed.job.projectId, entityType: "storyboard", locked: 1 }).whereIn("entityId", claimed.job.sourceSnapshot.map((item) => item.id)).first();
       const sourceChanged = hash(currentSources) !== hash(claimed.job.sourceSnapshot);
       const referencesChanged = hash(currentReferences) !== hash(savedReferences);
@@ -310,6 +313,8 @@ async function executeVideoPromptJobOnce(db: Knex, jobId: string, generate: (job
       }
       await advanceCreativeState(trx, { entityType: "track", entityId: claimed.job.trackId, projectId: claimed.job.projectId, expectedVersion: claimed.job.trackVersion, actor: { kind: "system", id: `video-prompt:${claimed.job.id}` } });
       await trx("o_videoTrack").where({ id: claimed.job.trackId, projectId: claimed.job.projectId, scriptId: claimed.job.scriptId }).update({ prompt: resultPrompt, state: "已完成", reason: null });
+      const promptModeRevision = (claimed.job.referenceSnapshot as any)?.modeIntent?.revision;
+      await acknowledgeVideoPromptReferences(trx, { projectId: claimed.job.projectId, scriptId: claimed.job.scriptId, trackId: claimed.job.trackId, expectedRevision: Number.isSafeInteger(promptModeRevision) ? Number(promptModeRevision) : undefined }, `video-prompt:${claimed.job.id}`);
       await trx(JOBS).where({ id: claimed.job.id }).update({ state: "succeeded", resultPrompt, reason: null, updatedAt: Date.now() });
       return { ...claimed.job, state: "succeeded", resultPrompt, promptReview, reason: null };
     });

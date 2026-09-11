@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { Knex } from "knex";
+import { acknowledgeVideoPromptReferences, ensureVideoModeIntentSchema } from "../videoModeResolution";
 import { lockProjectTransaction } from "@/lib/dbTransaction";
 import { insertRowsReturningIds } from "@/lib/insertRows";
 import { advanceCreativeState, CreativeWorkspaceError, ensureCreativeWorkspaceSchema, getCreativeState } from "@/services/creativeWorkspace";
@@ -160,6 +161,7 @@ async function updateTrackField(db: Knex, input: any, actor: TrustedActor, field
   const idempotencyKey = key(input);
   const who = actorId(actor);
   const requestHash = hash({ projectId, scriptId, trackId, expectedVersion, field, value });
+  if (field === "prompt") await ensureVideoModeIntentSchema(db);
   return db.transaction(async (trx) => {
     await lockProjectTransaction(trx, projectId);
     const replay = await receipt<any>(trx, who, projectId, idempotencyKey, requestHash);
@@ -168,6 +170,7 @@ async function updateTrackField(db: Knex, input: any, actor: TrustedActor, field
     await advance(trx, trackId, projectId, expectedVersion, actor);
     const updated = await trx("o_videoTrack").where({ id: trackId, projectId, scriptId }).update({ [field]: value });
     if (updated !== 1) throw new TrackWorkspaceError("VERSION_CONFLICT", "轨道已被其他成员修改，请刷新后重试");
+    if (field === "prompt") await acknowledgeVideoPromptReferences(trx, { projectId, scriptId, trackId, expectedRevision: Number.isSafeInteger(input.modeIntentRevision) ? Number(input.modeIntentRevision) : undefined }, who);
     const result = { track: { ...(await view(trx, track)), [field]: value } };
     await saveReceipt(trx, who, projectId, idempotencyKey, requestHash, result);
     return { ...result, reused: false };

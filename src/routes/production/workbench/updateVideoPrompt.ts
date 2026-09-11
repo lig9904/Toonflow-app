@@ -3,6 +3,7 @@ import u from "@/utils";
 import { success } from "@/lib/responseFormat";
 import { requireProjectAccess, TeamSecurityError } from "@/services/team";
 import { TrackWorkspaceError, updateTrackPrompt } from "@/services/trackWorkspace";
+import { VideoModeResolutionError } from "@/services/videoModeResolution";
 
 function userId(req: Request): number {
   const id = Number((req as any).teamPrincipal?.id ?? (req as any).user?.id);
@@ -12,6 +13,7 @@ function userId(req: Request): number {
 
 function sendError(res: Response, error: unknown) {
   if (error instanceof TeamSecurityError) return res.status(error.status).send({ code: error.code, message: error.message });
+  if (error instanceof VideoModeResolutionError) return res.status(error.status).send({ code: error.code, message: error.message });
   if (error instanceof TrackWorkspaceError) {
     const status = { INVALID_INPUT: 400, NOT_FOUND: 404, PROJECT_MISMATCH: 403, VERSION_CONFLICT: 409, IDEMPOTENCY_CONFLICT: 409, LOCKED: 423, ACTIVE_JOB: 409 }[error.code];
     return res.status(status).send({ code: error.code, message: error.message });

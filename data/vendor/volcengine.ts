@@ -1,692 +1,99 @@
 /**
- * Toonflow AI供应商模板 - 火山引擎(豆包)
- * @version 2.0
+ * 火山方舟标准按量语言接口。媒体模型位于 volcengineSd2。
+ * 目录与能力核对：2026-09-11
+ * https://www.volcengine.com/docs/82379/1330310
+ * https://www.volcengine.com/docs/82379/1449737
+ * @version 3.0
  */
-
-// ============================================================
-// 类型定义
-// ============================================================
-
-type VideoMode =
-  | "singleImage"
-  | "startEndRequired"
-  | "endFrameOptional"
-  | "startFrameOptional"
-  | "text"
-  | (`videoReference:${number}` | `imageReference:${number}` | `audioReference:${number}`)[];
-
 interface TextModel {
   name: string;
   modelName: string;
   type: "text";
   think: boolean;
+  thinkingMode?: "optional" | "required";
+  maxOutputTokens: number;
+  provider: string;
 }
-
-interface ImageModel {
-  name: string;
-  modelName: string;
-  type: "image";
-  mode: ("text" | "singleImage" | "multiReference")[];
-  associationSkills?: string;
-}
-
-interface VideoModel {
-  name: string;
-  modelName: string;
-  type: "video";
-  mode: VideoMode[];
-  associationSkills?: string;
-  audio: "optional" | false | true;
-  durationResolutionMap: { duration: number[]; resolution: string[] }[];
-}
-
-interface TTSModel {
-  name: string;
-  modelName: string;
-  type: "tts";
-  voices: { title: string; voice: string }[];
-}
-
-interface VendorConfig {
-  id: string;
-  version: string;
-  name: string;
-  author: string;
-  description?: string;
-  icon?: string;
-  inputs: { key: string; label: string; type: "text" | "password" | "url"; required: boolean; placeholder?: string }[];
-  inputValues: Record<string, string>;
-  models: (TextModel | ImageModel | VideoModel | TTSModel)[];
-}
-
-type ReferenceList =
-  | { type: "image"; sourceType: "base64"; base64: string }
-  | { type: "audio"; sourceType: "base64"; base64: string }
-  | { type: "video"; sourceType: "base64"; base64: string };
-
-interface ImageConfig {
-  prompt: string;
-  referenceList?: Extract<ReferenceList, { type: "image" }>[];
-  size: "1K" | "2K" | "4K";
-  aspectRatio: `${number}:${number}`;
-}
-
-interface VideoConfig {
-  duration: number;
-  resolution: string;
-  aspectRatio: "16:9" | "9:16";
-  prompt: string;
-  referenceList?: ReferenceList[];
-  audio?: boolean;
-  mode: VideoMode[];
-}
-
-interface TTSConfig {
-  text: string;
-  voice: string;
-  speechRate: number;
-  pitchRate: number;
-  volume: number;
-  referenceList?: Extract<ReferenceList, { type: "audio" }>[];
-}
-
-interface PollResult {
-  completed: boolean;
-  data?: string;
-  error?: string;
-}
-
-// ============================================================
-// 全局声明
-// ============================================================
-
-declare const axios: any;
-declare const logger: (msg: string) => void;
-declare const jsonwebtoken: any;
-declare const zipImage: (base64: string, size: number) => Promise<string>;
-declare const zipImageResolution: (base64: string, w: number, h: number) => Promise<string>;
-declare const mergeImages: (base64Arr: string[], maxSize?: string) => Promise<string>;
-declare const urlToBase64: (url: string) => Promise<string>;
-declare const pollTask: (fn: () => Promise<PollResult>, interval?: number, timeout?: number) => Promise<PollResult>;
-declare const createOpenAI: any;
-declare const createDeepSeek: any;
-declare const createZhipu: any;
-declare const createQwen: any;
-declare const createAnthropic: any;
 declare const createOpenAICompatible: any;
-declare const createXai: any;
-declare const createMinimax: any;
-declare const createGoogleGenerativeAI: any;
-declare const exports: {
-  vendor: VendorConfig;
-  textRequest: (m: TextModel, t: boolean, tl: 0 | 1 | 2 | 3) => any;
-  imageRequest: (c: ImageConfig, m: ImageModel) => Promise<string>;
-  videoRequest: (c: VideoConfig, m: VideoModel) => Promise<string>;
-  submitVideoTask: (c: VideoConfig, m: VideoModel) => Promise<{ taskId: string }>;
-  queryVideoTask: (taskId: string) => Promise<{ status: "pending" | "succeeded" | "failed"; outputUrl?: string; error?: string }>;
-  ttsRequest: (c: TTSConfig, m: TTSModel) => Promise<string>;
-  checkForUpdates?: () => Promise<{ hasUpdate: boolean; latestVersion: string; notice: string }>;
-  updateVendor?: () => Promise<string>;
-};
-
-// ============================================================
-// 供应商配置
-// ============================================================
-
-const vendor: VendorConfig = {
+declare const withVolcengineChatCompatibility: (model: any) => any;
+declare const exports: Record<string, any>;
+const textModel = (name: string, modelName: string, provider: string, maxOutputTokens: number, required = false): TextModel => ({
+  name, modelName, provider, type: "text", think: true, thinkingMode: required ? "required" : "optional", maxOutputTokens,
+});
+const vendor = {
   id: "volcengine",
-  version: "2.4",
+  version: "3.0",
   author: "leeqi",
   name: "火山引擎(豆包)",
-  description: "火山引擎豆包大模型，支持文本、图片生成、视频生成等能力。\n\n需要在[火山引擎控制台](https://console.volcengine.com/ark)获取API密钥。",
-  icon: "",
+  description: "火山方舟标准按量语言接口，覆盖字节跳动、DeepSeek、智谱的最新产品线型号。图片、视频请使用火山引擎sd2.0真人。\n\nGLM 5.3 Flash 始终启用思考，关闭思考时使用其最低思考档位。使用方舟 API Key；订阅 Agent/Coding Plan 型号不适用于此入口。",
   inputs: [
-    { key: "apiKey", label: "API密钥", type: "password", required: true, placeholder: "火山引擎API Key" },
-    { key: "baseUrl", label: "请求地址", type: "url", required: true, placeholder: "以v3结束，示例：https://ark.cn-beijing.volces.com/api/v3" },
+    { key: "apiKey", label: "API密钥", type: "password", required: true, placeholder: "火山方舟 API Key" },
+    { key: "baseUrl", label: "请求地址", type: "url", required: true, placeholder: "https://ark.cn-beijing.volces.com/api/v3" },
   ],
-  inputValues: {
-    apiKey: "",
-    baseUrl: "https://ark.cn-beijing.volces.com/api/v3",
-  },
+  inputValues: { apiKey: "", baseUrl: "https://ark.cn-beijing.volces.com/api/v3" },
   models: [
-    // ===================== 文本模型 - 推荐 =====================
-    { name: "Doubao-Seed-2.0-Pro", modelName: "doubao-seed-2-0-pro-260215", type: "text", think: true },
-    { name: "Doubao-Seed-2.0-Lite", modelName: "doubao-seed-2-0-lite-260215", type: "text", think: true },
-    { name: "Doubao-Seed-2.0-Mini", modelName: "doubao-seed-2-0-mini-260215", type: "text", think: true },
-    { name: "Doubao-Seed-2.0-Code-Preview", modelName: "doubao-seed-2-0-code-preview-260215", type: "text", think: true },
-    { name: "Doubao-Seed-Character", modelName: "doubao-seed-character-251128", type: "text", think: false },
-    // ===================== 文本模型 - 往期 =====================
-    { name: "Doubao-Seed-1.8", modelName: "doubao-seed-1-8-251228", type: "text", think: true },
-    { name: "Doubao-Seed-Code-Preview", modelName: "doubao-seed-code-preview-251028", type: "text", think: true },
-    { name: "Doubao-Seed-1.6-Lite", modelName: "doubao-seed-1-6-lite-251015", type: "text", think: true },
-    { name: "Doubao-Seed-1.6-Flash(0828)", modelName: "doubao-seed-1-6-flash-250828", type: "text", think: true },
-    { name: "Doubao-Seed-1.6-Vision", modelName: "doubao-seed-1-6-vision-250815", type: "text", think: true },
-    { name: "Doubao-Seed-1.6(1015)", modelName: "doubao-seed-1-6-251015", type: "text", think: true },
-    { name: "Doubao-Seed-1.6(0615)", modelName: "doubao-seed-1-6-250615", type: "text", think: true },
-    { name: "Doubao-Seed-1.6-Flash(0615)", modelName: "doubao-seed-1-6-flash-250615", type: "text", think: true },
-    { name: "Doubao-Seed-Translation", modelName: "doubao-seed-translation-250915", type: "text", think: false },
-    { name: "Doubao-1.5-Pro-32K", modelName: "doubao-1-5-pro-32k-250115", type: "text", think: false },
-    { name: "Doubao-1.5-Pro-32K-Character(0715)", modelName: "doubao-1-5-pro-32k-character-250715", type: "text", think: false },
-    { name: "Doubao-1.5-Pro-32K-Character(0228)", modelName: "doubao-1-5-pro-32k-character-250228", type: "text", think: false },
-    { name: "Doubao-1.5-Lite-32K", modelName: "doubao-1-5-lite-32k-250115", type: "text", think: false },
-    { name: "Doubao-1.5-Vision-Pro-32K", modelName: "doubao-1-5-vision-pro-32k-250115", type: "text", think: false },
-    // ===================== 文本模型 - 第三方(火山引擎托管) =====================
-    { name: "GLM-4-7", modelName: "glm-4-7-251222", type: "text", think: true },
-    { name: "DeepSeek-V3-2", modelName: "deepseek-v3-2-251201", type: "text", think: true },
-    { name: "DeepSeek-V3-1-Terminus", modelName: "deepseek-v3-1-terminus", type: "text", think: true },
-    { name: "DeepSeek-V3(0324)", modelName: "deepseek-v3-250324", type: "text", think: false },
-    { name: "DeepSeek-R1(0528)", modelName: "deepseek-r1-250528", type: "text", think: true },
-    { name: "Qwen3-32B", modelName: "qwen3-32b-20250429", type: "text", think: false },
-    { name: "Qwen3-14B", modelName: "qwen3-14b-20250429", type: "text", think: false },
-    { name: "Qwen3-8B", modelName: "qwen3-8b-20250429", type: "text", think: false },
-    { name: "Qwen3-0.6B", modelName: "qwen3-0-6b-20250429", type: "text", think: false },
-    { name: "Qwen2.5-72B", modelName: "qwen2-5-72b-20240919", type: "text", think: false },
-    { name: "GLM-4.5-Air", modelName: "glm-4-5-air", type: "text", think: false },
-    // ===================== 图片生成模型 =====================
-    {
-      name: "Seedream-5.0",
-      modelName: "doubao-seedream-5-0-260128",
-      type: "image",
-      mode: ["text", "singleImage", "multiReference"],
-    },
-    {
-      name: "Seedream-5.0-Lite",
-      modelName: "doubao-seedream-5-0-lite-260128",
-      type: "image",
-      mode: ["text", "singleImage", "multiReference"],
-    },
-    {
-      name: "Seedream-4.5",
-      modelName: "doubao-seedream-4-5-251128",
-      type: "image",
-      mode: ["text", "singleImage", "multiReference"],
-    },
-    {
-      name: "Seedream-4.0",
-      modelName: "doubao-seedream-4-0-250828",
-      type: "image",
-      mode: ["text", "singleImage", "multiReference"],
-    },
-    {
-      name: "Seedream-3.0-T2I",
-      modelName: "doubao-seedream-3-0-t2i-250415",
-      type: "image",
-      mode: ["text"],
-    },
-    // ===================== 视频生成模型 =====================
-    {
-      name: "Seedance-2.0(音画同生)",
-      modelName: "doubao-seedance-2-0-260128",
-      type: "video",
-      mode: ["text", "startFrameOptional", ["imageReference:9", "videoReference:3", "audioReference:3"]],
-      audio: "optional",
-      durationResolutionMap: [{ duration: [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], resolution: ["480p", "720p"] }],
-    },
-    {
-      name: "Seedance-2.0-Fast(音画同生)",
-      modelName: "doubao-seedance-2-0-fast-260128",
-      type: "video",
-      mode: ["text", "startFrameOptional", ["imageReference:9", "videoReference:3", "audioReference:3"]],
-      audio: "optional",
-      durationResolutionMap: [{ duration: [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], resolution: ["480p", "720p"] }],
-    },
-    {
-      name: "Seedance-1.5-Pro(音画同生)",
-      modelName: "doubao-seedance-1-5-pro-251215",
-      type: "video",
-      mode: ["text", "startFrameOptional"],
-      audio: "optional",
-      durationResolutionMap: [{ duration: [4, 5, 6, 7, 8, 9, 10, 11, 12], resolution: ["480p", "720p", "1080p"] }],
-    },
-    {
-      name: "Seedance-1.0-Pro",
-      modelName: "doubao-seedance-1-0-pro-250528",
-      type: "video",
-      mode: ["text", "startFrameOptional"],
-      audio: false,
-      durationResolutionMap: [{ duration: [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], resolution: ["480p", "720p", "1080p"] }],
-    },
-    {
-      name: "Seedance-1.0-Pro-Fast",
-      modelName: "doubao-seedance-1-0-pro-fast-251015",
-      type: "video",
-      mode: ["text", "singleImage"],
-      audio: false,
-      durationResolutionMap: [{ duration: [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], resolution: ["480p", "720p", "1080p"] }],
-    },
-    {
-      name: "Seedance-1.0-Lite-T2V",
-      modelName: "doubao-seedance-1-0-lite-t2v-250428",
-      type: "video",
-      mode: ["text"],
-      audio: false,
-      durationResolutionMap: [{ duration: [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], resolution: ["480p", "720p", "1080p"] }],
-    },
-    {
-      name: "Seedance-1.0-Lite-I2V",
-      modelName: "doubao-seedance-1-0-lite-i2v-250428",
-      type: "video",
-      mode: ["startFrameOptional", ["imageReference:4"]],
-      audio: false,
-      durationResolutionMap: [{ duration: [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], resolution: ["480p", "720p", "1080p"] }],
-    },
+    textModel("Doubao Seed 2.1 Pro", "doubao-seed-2-1-pro-260628", "字节跳动", 256000),
+    textModel("Doubao Seed 2.1 Turbo", "doubao-seed-2-1-turbo-260628", "字节跳动", 256000),
+    textModel("Doubao Seed Evolving", "doubao-seed-evolving", "字节跳动", 256000),
+    // Lite、Mini、Code、Character 各自保留最新版本，不能用旗舰版本号替代它们。
+    textModel("Doubao Seed 2.0 Lite", "doubao-seed-2-0-lite-260428", "字节跳动", 128000),
+    textModel("Doubao Seed 2.0 Mini", "doubao-seed-2-0-mini-260428", "字节跳动", 128000),
+    textModel("Doubao Seed 2.0 Code", "doubao-seed-2-0-code-preview-260215", "字节跳动", 128000),
+    textModel("Doubao Seed Character", "doubao-seed-character-260628", "字节跳动", 32000),
+    textModel("DeepSeek V4 Pro 正式版", "deepseek-v4-pro-ga-260813", "DeepSeek", 384000),
+    textModel("DeepSeek V4 Flash 正式版", "deepseek-v4-flash-ga-260731", "DeepSeek", 384000),
+    textModel("GLM 5.2", "glm-5-2-260617", "智谱AI", 128000),
+    textModel("GLM 5.3 Flash（始终思考）", "glm-5-3-flash-260828", "智谱AI", 128000, true),
   ],
 };
 
-// ============================================================
-// 辅助工具
-// ============================================================
-
-const getHeaders = () => {
-  if (!vendor.inputValues.apiKey) throw new Error("缺少API Key");
-  return {
-    "Content-Type": "application/json",
-    Authorization: `Bearer ${vendor.inputValues.apiKey.replace(/^Bearer\s+/i, "")}`,
-  };
+const getBaseUrl = () => {
+  const value = String(vendor.inputValues.baseUrl || "").trim().replace(/\/+$/, "");
+  let url: URL;
+  try { url = new URL(value); } catch { throw new Error("请填写有效的火山方舟请求地址"); }
+  if (!/^https?:$/.test(url.protocol) || url.username || url.password || url.search || url.hash || !url.pathname.endsWith("/api/v3")) {
+    throw new Error("火山方舟请求地址须以 /api/v3 结束，不能包含密钥、查询参数或片段");
+  }
+  return value;
 };
-
-const getBaseUrl = () => vendor.inputValues.baseUrl.replace(/\/+$/, "");
-
-// ============================================================
-// 适配器函数
-// ============================================================
 
 const textRequest = (model: TextModel, think: boolean, thinkLevel: 0 | 1 | 2 | 3) => {
-  if (!vendor.inputValues.apiKey) throw new Error("缺少API Key");
-  const apiKey = vendor.inputValues.apiKey.replace(/^Bearer\s+/i, "");
-
-  const effortMap: Record<number, string> = {
-    0: "minimal",
-    1: "low",
-    2: "medium",
-    3: "high",
-  };
-
-  return createOpenAICompatible({
+  const apiKey = String(vendor.inputValues.apiKey || "").trim().replace(/^Bearer(?:\s+|$)/i, "").trim();
+  if (!apiKey) throw new Error("缺少火山方舟 API Key");
+  const level = Number.isInteger(thinkLevel) && thinkLevel >= 0 && thinkLevel <= 3 ? thinkLevel : 0;
+  const required = model.thinkingMode === "required" || model.modelName === "glm-5-3-flash-260828";
+  const thinking = required || Boolean(think);
+  // 等级 0 表示最低的开启档位；不能传 minimal，否则豆包会关闭思考。
+  const effort = model.modelName.startsWith("deepseek-v4-") ? ["low", "low", "high", "max"][level]
+    : model.modelName.startsWith("glm-5-3-") ? ["low", "low", "high", "max"][level]
+    : model.modelName.startsWith("glm-5-2-") ? ["high", "high", "high", "max"][level]
+    : ["low", "low", "medium", "high"][level];
+  return withVolcengineChatCompatibility(createOpenAICompatible({
     name: "volcengine",
+    includeUsage: true,
     baseURL: getBaseUrl(),
     apiKey,
     fetch: async (url: string, options?: RequestInit) => {
-      const rawBody = JSON.parse((options?.body as string) ?? "{}");
-      const modifiedBody = {
-        ...rawBody,
-        thinking: {
-          type: "enabled",
-        },
-        reasoning_effort: effortMap[thinkLevel],
-      };
-      return await fetch(url, {
-        ...options,
-        body: JSON.stringify(modifiedBody),
-      });
+      if (typeof options?.body !== "string") return fetch(url, options);
+      const body = JSON.parse(options.body);
+      body.thinking = { type: thinking ? "enabled" : "disabled" };
+      if (thinking) body.reasoning_effort = required && !think ? "low" : effort;
+      else delete body.reasoning_effort;
+      // AI SDK maxOutputTokens 是整个请求的预算，包含推理；不能只限制回答正文。
+      if (body.max_tokens !== undefined && body.max_completion_tokens === undefined) {
+        body.max_completion_tokens = body.max_tokens;
+      }
+      delete body.max_tokens;
+      if (Number.isFinite(body.max_completion_tokens) && model.maxOutputTokens) {
+        body.max_completion_tokens = Math.min(body.max_completion_tokens, model.maxOutputTokens);
+      }
+      return fetch(url, { ...options, body: JSON.stringify(body) });
     },
-  }).chatModel(model.modelName);
+  }).chatModel(model.modelName));
 };
-
-const imageRequest = async (config: ImageConfig, model: ImageModel): Promise<string> => {
-  const baseUrl = getBaseUrl();
-  const headers = getHeaders();
-
-  const body: any = {
-    model: model.modelName,
-    prompt: config.prompt || "",
-    response_format: "url",
-    watermark: false,
-  };
-
-  const isOldModel = model.modelName.includes("seedream-3-0");
-  const is5Lite = model.modelName.includes("seedream-5-0-lite");
-
-  // sequential_image_generation 仅 seedream 5.0-lite/4.5/4.0 支持
-  if (!isOldModel) {
-    body.sequential_image_generation = "disabled";
-  }
-
-  // 参考图片：单图为 string，多图为 array（seedream-3.0-t2i 不支持 image 参数）
-  if (!isOldModel && config.referenceList && config.referenceList.length > 0) {
-    const images = config.referenceList.map((ref) => ref.base64);
-    body.image = images.length === 1 ? images[0] : images;
-  }
-
-  // 尺寸处理：优先使用推荐像素值，未匹配则直接传分辨率字符串让模型自行决定
-  const [w, h] = config.aspectRatio.split(":").map(Number);
-  const sizeTable: Record<string, Record<string, string>> = {
-    "1K": {
-      "1:1": "1024x1024",
-      "4:3": "1152x864",
-      "3:4": "864x1152",
-      "16:9": "1280x720",
-      "9:16": "720x1280",
-      "3:2": "1248x832",
-      "2:3": "832x1248",
-      "21:9": "1512x648",
-    },
-    "2K": {
-      "1:1": "2048x2048",
-      "4:3": "2304x1728",
-      "3:4": "1728x2304",
-      "16:9": "2848x1600",
-      "9:16": "1600x2848",
-      "3:2": "2496x1664",
-      "2:3": "1664x2496",
-      "21:9": "3136x1344",
-    },
-    "4K": {
-      "1:1": "4096x4096",
-      "4:3": "4704x3520",
-      "3:4": "3520x4704",
-      "16:9": "5504x3040",
-      "9:16": "3040x5504",
-      "3:2": "4992x3328",
-      "2:3": "3328x4992",
-      "21:9": "6240x2656",
-    },
-  };
-
-  const sizeKey = config.size || "2K";
-  const ratioKey = config.aspectRatio;
-  const table = sizeTable[sizeKey];
-
-  if (table && table[ratioKey]) {
-    // 推荐像素值匹配到了，但需要检查是否满足模型最低像素要求
-    const [pw, ph] = table[ratioKey].split("x").map(Number);
-    const totalPixels = pw * ph;
-    if (isOldModel) {
-      // seedream-3.0-t2i: 像素范围 [512x512, 2048x2048]
-      body.size = table[ratioKey];
-    } else if (totalPixels < 3686400) {
-      // 1K 像素值不满足新模型最低要求，直接传 "2K" 让模型自行决定
-      body.size = "2K";
-    } else if (is5Lite && totalPixels > 10404496) {
-      // seedream-5.0-lite 最高 10404496，4K 超限，回退传 "2K"
-      body.size = "2K";
-    } else {
-      body.size = table[ratioKey];
-    }
-  } else if (isOldModel) {
-    // seedream-3.0-t2i: 像素范围 [512x512, 2048x2048]，直接按比例计算
-    const base = sizeKey === "1K" ? 1024 : 2048;
-    const calcW = Math.min(2048, Math.round(base * Math.sqrt(w / h)));
-    const calcH = Math.min(2048, Math.round(base * Math.sqrt(h / w)));
-    body.size = `${Math.max(512, calcW)}x${Math.max(512, calcH)}`;
-  } else {
-    // 新模型未匹配推荐值时，直接传分辨率字符串（方式1），由模型根据 prompt 自行决定尺寸
-    // seedream 5.0-lite 支持 "2K"/"3K"，seedream 4.5 支持 "2K"/"4K"，seedream 4.0 支持 "1K"/"2K"/"4K"
-    if (is5Lite) {
-      body.size = sizeKey === "4K" ? "3K" : sizeKey === "1K" ? "2K" : sizeKey;
-    } else {
-      body.size = sizeKey === "1K" ? "2K" : sizeKey;
-    }
-  }
-
-  logger(`[图片生成] 请求模型: ${model.modelName}, 尺寸: ${body.size}`);
-  const res = await fetch(`${baseUrl}/images/generations`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const errorText = await res.text();
-    throw new Error(`图片生成请求失败: ${errorText}`);
-  }
-  const response = await res.json();
-  logger(response);
-
-  if (response?.error) {
-    throw new Error(`图片生成失败：${response.error.message || response.error.code}`);
-  }
-
-  // 从 data 数组中提取第一张成功的图片
-  if (response?.data && response.data.length > 0) {
-    for (const item of response.data) {
-      if (item.url) {
-        return await urlToBase64(item.url);
-      }
-      if (item.b64_json) {
-        return item.b64_json;
-      }
-      if (item.error) {
-        throw new Error(`图片生成失败：${item.error.message || item.error.code}`);
-      }
-    }
-  }
-
-  throw new Error("图片生成失败：未返回有效结果");
-};
-
-/** Builds and submits the same Seedance request used by videoRequest without polling it. */
-const submitVideoTask = async (config: VideoConfig, model: VideoModel): Promise<{ taskId: string }> => {
-  const baseUrl = getBaseUrl();
-  const headers = getHeaders();
-
-  const content: any[] = [];
-
-  if (config.prompt) {
-    content.push({ type: "text", text: config.prompt });
-  }
-
-  if (typeof config.mode === "string") {
-    switch (config.mode) {
-      case "singleImage": {
-        const firstImage = config.referenceList?.find((r) => r.type === "image");
-        if (firstImage) {
-          content.push({
-            type: "image_url",
-            image_url: { url: firstImage.base64 },
-            role: "first_frame",
-          });
-        }
-        break;
-      }
-      case "startFrameOptional": {
-        const images = config.referenceList?.filter((r) => r.type === "image") ?? [];
-        if (images.length > 0) {
-          content.push({
-            type: "image_url",
-            image_url: { url: images[0].base64 },
-            role: "first_frame",
-          });
-          if (images.length > 1) {
-            content.push({
-              type: "image_url",
-              image_url: { url: images[1].base64 },
-              role: "last_frame",
-            });
-          }
-        }
-        break;
-      }
-      case "startEndRequired": {
-        const images = config.referenceList?.filter((r) => r.type === "image") ?? [];
-        if (images.length >= 2) {
-          content.push({
-            type: "image_url",
-            image_url: { url: images[0].base64 },
-            role: "first_frame",
-          });
-          content.push({
-            type: "image_url",
-            image_url: { url: images[1].base64 },
-            role: "last_frame",
-          });
-        }
-        break;
-      }
-      case "endFrameOptional": {
-        const images = config.referenceList?.filter((r) => r.type === "image") ?? [];
-        if (images.length > 0) {
-          content.push({
-            type: "image_url",
-            image_url: { url: images[0].base64 },
-            role: "first_frame",
-          });
-          if (images.length > 1) {
-            content.push({
-              type: "image_url",
-              image_url: { url: images[1].base64 },
-              role: "last_frame",
-            });
-          }
-        }
-        break;
-      }
-      case "text":
-      default:
-        break;
-    }
-  } else if (Array.isArray(config.mode)) {
-    // 多模态参考模式：按类型分别提取并添加
-    const imageRefs = config.referenceList?.filter((r) => r.type === "image") ?? [];
-    const videoRefs = config.referenceList?.filter((r) => r.type === "video") ?? [];
-    const audioRefs = config.referenceList?.filter((r) => r.type === "audio") ?? [];
-
-    // Models may declare reference limits as a nested group, e.g.
-    // ["imageReference:9", "videoReference:3", "audioReference:3"].
-    // Flatten the declaration before dispatching each media type.
-    const referenceModes = config.mode.flatMap((refDef) => (Array.isArray(refDef) ? refDef : [refDef]));
-    for (const refDef of referenceModes) {
-      if (refDef.startsWith("imageReference:")) {
-        const maxCount = parseInt(refDef.split(":")[1], 10);
-        for (const ref of imageRefs.slice(0, maxCount)) {
-          content.push({
-            type: "image_url",
-            image_url: { url: ref.base64 },
-            role: "reference_image",
-          });
-        }
-      } else if (refDef.startsWith("videoReference:")) {
-        const maxCount = parseInt(refDef.split(":")[1], 10);
-        for (const ref of videoRefs.slice(0, maxCount)) {
-          content.push({
-            type: "video_url",
-            video_url: { url: ref.base64 },
-            role: "reference_video",
-          });
-        }
-      } else if (refDef.startsWith("audioReference:")) {
-        const maxCount = parseInt(refDef.split(":")[1], 10);
-        for (const ref of audioRefs.slice(0, maxCount)) {
-          content.push({
-            type: "audio_url",
-            audio_url: { url: ref.base64 },
-            role: "reference_audio",
-          });
-        }
-      }
-    }
-  }
-
-  const body: any = {
-    model: model.modelName,
-    content,
-    ratio: config.aspectRatio,
-    duration: config.duration,
-    resolution: config.resolution || "720p",
-    watermark: false,
-  };
-
-  if (model.audio === "optional") {
-    body.generate_audio = config.audio !== false;
-  } else if (model.audio === true) {
-    body.generate_audio = true;
-  } else {
-    body.generate_audio = false;
-  }
-
-  logger(`[视频生成] 提交任务, 模型: ${model.modelName}, 时长: ${config.duration}s, 分辨率: ${config.resolution}`);
-  const res = await fetch(`${baseUrl}/contents/generations/tasks`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body),
-  });
-
-  if (!res.ok) {
-    const errorText = await res.text();
-    throw new Error(`视频生成任务创建失败: ${errorText}`);
-  }
-  const createResponse = await res.json();
-  logger(createResponse);
-  const taskId = createResponse?.id;
-
-  if (!taskId) {
-    throw new Error("视频生成任务创建失败：未返回任务ID");
-  }
-
-  logger(`[视频生成] 任务已创建, ID: ${taskId}`);
-
-  return { taskId };
-};
-
-const queryVideoTask = async (taskId: string): Promise<{ status: "pending" | "succeeded" | "failed"; outputUrl?: string; error?: string }> => {
-  const queryRes = await fetch(`${getBaseUrl()}/contents/generations/tasks/${taskId}`, {
-    method: "GET",
-    headers: getHeaders(),
-  });
-  if (!queryRes.ok) {
-    const errorText = await queryRes.text();
-    throw new Error(`查询视频生成任务状态失败: ${errorText}`);
-  }
-  const task = await queryRes.json();
-  logger(`[视频生成] 任务状态: ${JSON.stringify(task)}`);
-  switch (task.status) {
-    case "succeeded":
-      return { status: "succeeded", outputUrl: task.content?.video_url };
-    case "failed":
-      return { status: "failed", error: task.error?.message || "视频生成失败" };
-    case "expired":
-      return { status: "failed", error: "视频生成任务超时" };
-    case "cancelled":
-      return { status: "failed", error: "视频生成任务已取消" };
-    default:
-      return { status: "pending" };
-  }
-};
-
-const videoRequest = async (config: VideoConfig, model: VideoModel): Promise<string> => {
-  const { taskId } = await submitVideoTask(config, model);
-  const result = await pollTask(
-    async (): Promise<PollResult> => {
-      const task = await queryVideoTask(taskId);
-      if (task.status === "pending") return { completed: false };
-      return task.status === "succeeded"
-        ? { completed: true, data: task.outputUrl }
-        : { completed: true, error: task.error };
-    },
-    10000,
-    600000 * 3,
-  );
-
-  if (result.error) {
-    throw new Error(result.error);
-  }
-
-  return result.data!;
-};
-
-const ttsRequest = async (config: TTSConfig, model: TTSModel): Promise<string> => {
-  return "";
-};
-
-const checkForUpdates = async (): Promise<{ hasUpdate: boolean; latestVersion: string; notice: string }> => {
-  return { hasUpdate: false, latestVersion: "2.0", notice: "" };
-};
-
-const updateVendor = async (): Promise<string> => {
-  return "";
-};
-
-// ============================================================
-// 导出
-// ============================================================
-
 exports.vendor = vendor;
 exports.textRequest = textRequest;
-exports.imageRequest = imageRequest;
-exports.videoRequest = videoRequest;
-exports.submitVideoTask = submitVideoTask;
-exports.queryVideoTask = queryVideoTask;
-exports.ttsRequest = ttsRequest;
-exports.checkForUpdates = checkForUpdates;
-exports.updateVendor = updateVendor;
-
-export {};
+const mediaUnsupported = async () => { throw new Error("此供应商仅保留语言模型，图片和视频请使用火山引擎sd2.0真人"); };
+exports.imageRequest = mediaUnsupported;
+exports.videoRequest = mediaUnsupported;
+exports.ttsRequest = mediaUnsupported;

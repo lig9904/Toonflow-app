@@ -7,6 +7,7 @@ import { videoPromptSystem } from "../lib/videoPromptContract";
 import { matchVideoGenerationDuration } from "../lib/videoGenerationTiming";
 import { promptDefinitions, readManagedPrompt } from "./promptRegistry";
 import { readBoundAudioReferences, type BoundAudioReference } from "./roleAudioWorkspace";
+import { resolveVideoMode, type VideoModeCapabilities, type VideoModeResolution, type VideoModeReference, type VideoReferencePurpose } from "./videoModeResolution";
 
 export interface VideoGenerationSettings { duration?: number; resolution?: string; audio?: boolean }
 export interface VideoPromptCapabilities { mode?: unknown[]; audio?: boolean | "optional"; durationResolutionMap?: Array<{ duration: number[]; resolution: string[] }> }
@@ -20,7 +21,7 @@ export interface VideoReferenceInventory {
   linkedAssets: any[];
   boundAudio: BoundAudioReference[];
 }
-export interface VideoPromptReferenceInput { id: number; sources: "storyboard" | "assets"; fileType: "image" | "video" | "audio" }
+export interface VideoPromptReferenceInput { id: number; sources: "storyboard" | "assets"; fileType: "image" | "video" | "audio"; purpose?: VideoReferencePurpose }
 
 /** One authoritative inventory for Workbench and builtin Agent, including current role-audio bindings. */
 export async function loadVideoReferenceInventory(db: Knex, input: { projectId: number; scriptId: number; trackIds?: readonly number[] }): Promise<VideoReferenceInventory> {
@@ -36,26 +37,35 @@ export async function loadVideoReferenceInventory(db: Knex, input: { projectId: 
   return { storyboards, linkedAssets, boundAudio };
 }
 
-/** Deterministically choose current usable references according to the selected model mode. */
-export function selectVideoPromptReferences(mode: unknown, inventory: VideoReferenceInventory, trackId: number): VideoPromptReferenceInput[] {
-  const parsed = parsePromptMode(mode);
-  if (parsed === "text") return [];
+export function buildVideoPromptReferenceCandidates(inventory: VideoReferenceInventory, trackId: number): VideoModeReference[] {
   const boards = inventory.storyboards.filter((row) => Number(row.trackId) === Number(trackId) && row.filePath);
-  if (parsed === "singleImage" || parsed === "endFrameOptional" || parsed === "startFrameOptional") return boards.length ? [{ id: Number(boards[0].id), sources: "storyboard", fileType: "image" }] : [];
-  if (parsed === "startEndRequired") return boards.length >= 2 ? [boards[0], boards[boards.length - 1]].map((row) => ({ id: Number(row.id), sources: "storyboard" as const, fileType: "image" as const })) : boards.map((row) => ({ id: Number(row.id), sources: "storyboard" as const, fileType: "image" as const }));
-  if (!Array.isArray(parsed)) throw new Error("视频参考模式无法识别");
   const boardIds = new Set(inventory.storyboards.filter((row) => Number(row.trackId) === Number(trackId)).map((row) => Number(row.id)));
   const linked = inventory.linkedAssets.filter((row) => boardIds.has(Number(row.storyboardId)));
-  const visualAssets = [...new Map(linked.filter((row) => row.filePath).map((row) => [Number(row.id), row])).values()].map((row) => ({ id: Number(row.id), sources: "assets" as const, fileType: resolveVideoReferenceMediaType(row.storedFileType, row.type, row.filePath) }));
+  const visualAssets = [...new Map(linked.filter((row) => row.filePath).map((row) => [Number(row.id), row])).values()].map((row) => { const fileType = resolveVideoReferenceMediaType(row.storedFileType, row.type, row.filePath); return { id: Number(row.id), sources: "assets" as const, fileType, purpose: fileType === "video" ? "motion_reference" as const : fileType === "audio" ? "audio_reference" as const : row.type === "role" ? "identity_reference" as const : "style_reference" as const }; });
   const roleIds = new Set(linked.filter((row) => row.type === "role").flatMap((row) => [Number(row.id), Number(row.assetsId)]));
-  const audioAssets = [...new Map(inventory.boundAudio.filter((row) => roleIds.has(row.roleAssetId)).map((row) => [row.id, row])).values()].map((row) => ({ id: row.id, sources: "assets" as const, fileType: "audio" as const }));
-  const candidates: VideoPromptReferenceInput[] = [...boards.map((row) => ({ id: Number(row.id), sources: "storyboard" as const, fileType: "image" as const })), ...visualAssets, ...audioAssets];
-  return (["image", "video", "audio"] as const).flatMap((type) => {
-    const declaration = parsed.find((item) => typeof item === "string" && item.toLowerCase().startsWith(`${type}reference:`));
-    const limit = declaration ? Number(String(declaration).split(":")[1]) : 0;
-    if (!Number.isSafeInteger(limit) || limit < 0) throw new Error("当前模型参考数量能力配置无效");
-    return candidates.filter((item) => item.fileType === type).slice(0, limit);
-  });
+  const audioAssets = [...new Map(inventory.boundAudio.filter((row) => roleIds.has(row.roleAssetId)).map((row) => [row.id, row])).values()].map((row) => ({ id: row.id, sources: "assets" as const, fileType: "audio" as const, purpose: "audio_reference" as const }));
+  const boardRefs = boards.map((row) => ({ id: Number(row.id), sources: "storyboard" as const, fileType: "image" as const,
+    purpose: boards.length === 1 ? "first_frame" as const : "style_reference" as const }));
+  return [...boardRefs, ...visualAssets, ...audioAssets];
+}
+
+export function resolveInventoryVideoMode(modeIntent: unknown, capabilities: VideoModeCapabilities, inventory: VideoReferenceInventory, trackId: number): VideoModeResolution {
+  const all = buildVideoPromptReferenceCandidates(inventory, trackId);
+  const parsed = parsePromptMode(modeIntent);
+  let references = all;
+  if (parsed !== "auto" && !Array.isArray(parsed)) {
+    if (parsed === "text") references = [];
+    else if (parsed === "singleImage") references = all.filter((item) => item.purpose === "first_frame").slice(0, 1);
+    else if (parsed === "startEndRequired") references = all.filter((item) => item.purpose === "first_frame" || item.purpose === "last_frame");
+    else if (parsed === "endFrameOptional") references = all.filter((item) => item.purpose === "first_frame" || item.purpose === "last_frame");
+    else if (parsed === "startFrameOptional") references = all.filter((item) => item.purpose === "first_frame" || item.purpose === "last_frame");
+  }
+  return resolveVideoMode({ trackId, modeIntent: parsed, capabilities, references });
+}
+
+/** Legacy wrapper. New callers should retain the returned resolvedMode beside these exact references. */
+export function selectVideoPromptReferences(mode: unknown, inventory: VideoReferenceInventory, trackId: number, capabilities: VideoModeCapabilities = { mode: [parsePromptMode(mode)] }): VideoPromptReferenceInput[] {
+  return resolveInventoryVideoMode(mode, capabilities, inventory, trackId).resolvedReferences;
 }
 export function parsePromptMode(mode: unknown): unknown { if (typeof mode !== "string") return mode; try { return JSON.parse(mode); } catch { return mode; } }
 export function actualVideoPromptMode(mode: unknown, referenceCount: number): VideoPromptComposition["context"]["actualMode"] {

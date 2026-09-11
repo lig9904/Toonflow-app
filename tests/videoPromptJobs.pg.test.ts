@@ -8,6 +8,7 @@ import { StructuredModelOutputError } from "../src/lib/structuredModelOutput";
 import { ensureImageReviewSchema } from "../src/services/imageReviews";
 import { executeVideoPromptJob, markVideoPromptPreparationFailed, prepareVideoPromptJob, ensureVideoPromptJobSchema } from "../src/services/videoPromptJobs";
 import { prepareVideoPromptForGeneration } from "../src/services/videoPromptCompositionService";
+import { saveVideoModeIntent, saveVideoReferences } from "../src/services/videoModeResolution";
 
 const options = { skip: !process.env.TOONFLOW_TEST_DATABASE_URL };
 
@@ -37,6 +38,23 @@ async function fixture() {
   ]);
   return { ...f, projectId, scriptId, firstTrack, secondTrack };
 }
+
+test("a pending prompt job cannot acknowledge or overwrite after its saved mode/reference revision changes", options, async () => {
+  const f = await fixture();
+  try {
+    const board = await f.db("o_storyboard").where({ trackId: f.secondTrack }).first();
+    const references = [{ id: Number(board.id), sources: "storyboard" as const, fileType: "image" as const, purpose: "first_frame" as const }];
+    await saveVideoReferences(f.db, { projectId: f.projectId, scriptId: f.scriptId, trackId: f.secondTrack, references, expectedRevision: 0, idempotencyKey: "prompt-race-refs" }, "human:1");
+    await saveVideoModeIntent(f.db, { projectId: f.projectId, scriptId: f.scriptId, trackId: f.secondTrack, modeIntent: "singleImage", expectedRevision: 1, idempotencyKey: "prompt-race-mode" }, "human:1");
+    const prepared = await prepareVideoPromptJob(f.db, { projectId: f.projectId, scriptId: f.scriptId, trackId: f.secondTrack, model: "fixture:model", mode: "singleImage", info: references, modeIntentSnapshot: { modeIntent: "singleImage", revision: 2 }, idempotencyKey: "pending-prompt-selection-race", expectedVersion: 0 });
+    await saveVideoModeIntent(f.db, { projectId: f.projectId, scriptId: f.scriptId, trackId: f.secondTrack, modeIntent: "auto", expectedRevision: 2, idempotencyKey: "prompt-race-mode-new" }, "human:2");
+    const completed = await executeVideoPromptJob(f.db, prepared.job.id, async () => "雪璃转身，@图片1 展示海岸远景");
+    assert.equal(completed.state, "failed"); assert.match(completed.reason ?? "", /参考身份已变化/);
+    assert.equal((await f.db("o_videoTrack").where({ id: f.secondTrack }).first()).prompt, "");
+    const selection = await f.db("ext_video_mode_intents").where({ trackId: f.secondTrack }).first();
+    assert.equal(Number(selection.promptReferenceRevision), 0, "late prompt must not acknowledge an unseen selection revision");
+  } finally { await f.destroy(); }
+});
 
 test("empty visual info still uses each track's complete source storyboard", options, async () => {
   const f = await fixture();

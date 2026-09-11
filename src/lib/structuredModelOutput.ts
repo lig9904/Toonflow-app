@@ -24,7 +24,7 @@ export class StructuredModelOutputError extends Error {
   constructor(readonly code: StructuredOutputErrorCode, readonly diagnostics: StructuredOutputDiagnostics) {
     const stage = labels[diagnostics.role] ?? "当前步骤";
     const reason = code === "MODEL_OUTPUT_LIMIT"
-      ? `模型输出达到本步上限${diagnostics.maxOutputTokens > 0 ? `（${diagnostics.maxOutputTokens} tokens）` : "（供应商限制）"}，没有得到完整结果。请检查模型配置的输出上限，或缩小本次任务范围；开启思考时也可关闭思考后重试。`
+      ? `模型输出达到本步上限${diagnostics.maxOutputTokens > 0 ? `（${diagnostics.maxOutputTokens} tokens）` : "（供应商限制）"}，没有得到完整结果。请检查模型配置的输出上限，或缩小本次任务范围；如模型支持，可降低或关闭思考后重试。`
       : code === "MODEL_OUTPUT_FORMAT" ? "模型返回的数据不符合本步格式要求，请重试这一阶段。"
         : code === "MODEL_OUTPUT_FILTERED" ? "模型服务拦截了本次输出，请调整内容后重试。"
           : "模型未正常结束，未取得完整结果，请稍后重试这一阶段。";

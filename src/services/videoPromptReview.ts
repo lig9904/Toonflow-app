@@ -9,6 +9,7 @@ import { parsePromptMode, validatePromptReferenceSelection, type VideoGeneration
 import { classifyVideoPromptReviewFailure } from "./videoPromptReviewRuntime";
 import { readCurrentImageReviewResults, type CurrentImageReviewResult } from "./imageReviews";
 import { isVolcengineTrustedModel, readPromptTrustedBindings } from "./volcengineReferenceRuntime";
+import { readVideoModeIntent } from "./videoModeResolution";
 
 export const videoPromptReviewSchema = z.object({
   findings: z.array(z.object({ code: z.string().min(1).max(100), severity: z.enum(["error", "warning", "info"]), message: z.string().min(1).max(2000), shotId: z.number().int().positive().optional(), field: z.string().max(100).optional() })).max(100),
@@ -56,7 +57,7 @@ export async function reviewGeneratedVideoPrompt(job: VideoPromptJob, draft: str
 const json = (value: any) => typeof value === "string" ? JSON.parse(value) : value;
 
 /** Refresh the same authoritative identity/reference shape captured by prompt preparation. */
-export async function currentPromptReferences(db: Knex, projectId: number, scriptId: number, source: Array<{ id: number }>, saved: any): Promise<any> {
+export async function currentPromptReferences(db: Knex, projectId: number, scriptId: number, source: Array<{ id: number }>, saved: any, trackId?: number): Promise<any> {
   const info = saved?.info ?? [];
   const storyboardIds = info.filter((item: any) => item.sources === "storyboard").map((item: any) => Number(item.id));
   const assetIds = info.filter((item: any) => item.sources === "assets").map((item: any) => Number(item.id));
@@ -70,7 +71,8 @@ export async function currentPromptReferences(db: Knex, projectId: number, scrip
   ]);
   const withVersion = (entityType: "storyboard" | "asset", row: any) => ({ ...row, version: Number((entityType === "storyboard" ? storyboardStates : assetStates).find((state) => Number(state.entityId) === Number(row.id))?.version ?? 0) });
   const trustedAssets = Object.hasOwn(saved ?? {}, "trustedAssets") ? await readPromptTrustedBindings(db, projectId, scriptId, info) : undefined;
-  return { info, selectedStoryboards: info.filter((item: any) => item.sources === "storyboard").map((item: any) => storyboards.find((row) => Number(row.id) === Number(item.id))).filter(Boolean).map((row: any) => withVersion("storyboard", row)), selectedAssets: info.filter((item: any) => item.sources === "assets").map((item: any) => assets.find((row) => Number(row.id) === Number(item.id))).filter(Boolean).map((row: any) => withVersion("asset", row)), linkedAssets: linkedAssets.map((row) => withVersion("asset", row)), ...(trustedAssets ? { trustedAssets } : {}) };
+  const modeIntent = saved?.modeIntent && Number.isSafeInteger(trackId) && Number(trackId) > 0 ? await readVideoModeIntent(db, { projectId, scriptId, trackId: Number(trackId) }).catch(() => null) : null;
+  return { info, selectedStoryboards: info.filter((item: any) => item.sources === "storyboard").map((item: any) => storyboards.find((row) => Number(row.id) === Number(item.id))).filter(Boolean).map((row: any) => withVersion("storyboard", row)), selectedAssets: info.filter((item: any) => item.sources === "assets").map((item: any) => assets.find((row) => Number(row.id) === Number(item.id))).filter(Boolean).map((row: any) => withVersion("asset", row)), linkedAssets: linkedAssets.map((row) => withVersion("asset", row)), ...(modeIntent ? { modeIntent: { modeIntent: modeIntent.modeIntent, revision: modeIntent.revision } } : {}), ...(trustedAssets ? { trustedAssets } : {}) };
 }
 
 export async function readCurrentVideoPromptReview(db: Knex, input: { projectId: number; scriptId: number; trackId: number; prompt: string; model?: string; mode?: unknown; generation?: VideoGenerationSettings; info?: Array<{ id: number; sources: string; fileType?: string }> }): Promise<VideoPromptReviewReport | null> {
@@ -85,9 +87,9 @@ export async function readCurrentVideoPromptReview(db: Knex, input: { projectId:
     if (input.model !== undefined && input.model !== row.model) continue;
     if (input.mode !== undefined && videoPromptReviewHash(parsePromptMode(input.mode)) !== videoPromptReviewHash(parsePromptMode(row.mode))) continue;
     if (input.generation !== undefined && videoPromptReviewHash(input.generation) !== videoPromptReviewHash(compositionSnapshot?.context.generation)) continue;
-    const normalizeInfo = (items: any[]) => items.map((item) => ({ id: Number(item.id), sources: item.sources, fileType: item.fileType ?? "image" }));
+    const normalizeInfo = (items: any[]) => items.map((item) => ({ id: Number(item.id), sources: item.sources, fileType: item.fileType ?? "image", purpose: item.purpose ?? null }));
     if (input.info !== undefined && videoPromptReviewHash(normalizeInfo(input.info)) !== videoPromptReviewHash(normalizeInfo(referenceSnapshot?.info ?? []))) continue;
-    const currentReferences = await currentPromptReferences(db, input.projectId, input.scriptId, source, { ...referenceSnapshot, ...(isVolcengineTrustedModel(row.model) ? { trustedAssets: referenceSnapshot?.trustedAssets ?? [] } : {}) });
+    const currentReferences = await currentPromptReferences(db, input.projectId, input.scriptId, source, { ...referenceSnapshot, ...(isVolcengineTrustedModel(row.model) ? { trustedAssets: referenceSnapshot?.trustedAssets ?? [] } : {}) }, input.trackId);
     if (row.reviewBinding === promptReviewBinding({ sourceSnapshot: source, referenceSnapshot: currentReferences, compositionSnapshot, model: row.model, mode: row.mode }, input.prompt)) return json(row.reviewReport);
   }
   return null;

@@ -43,6 +43,7 @@ test("SDK length completion exposes a generic throwing getter; wrapper preserves
   await assert.rejects(readStructuredModelOutput(request, (onFinish) => generateText({ model: provider, prompt: "fixture", output: Output.object({ schema }), maxOutputTokens: request.maxOutputTokens, maxRetries: 0, onFinish })), (error: unknown) => {
     assert(error instanceof StructuredModelOutputError);
     assert.equal(error.code, "MODEL_OUTPUT_LIMIT");
+    assert.match(error.message, /如模型支持，可降低或关闭思考后重试/);
     assert.equal(error.diagnostics.finishReason, "length");
     assert.equal(error.diagnostics.outputTokens, 5100);
     assert.equal(error.diagnostics.reasoningTokens, 100);

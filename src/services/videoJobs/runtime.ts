@@ -9,6 +9,7 @@ import { rename, rm } from "node:fs/promises";
 import path from "node:path";
 import isPathInside from "is-path-inside";
 import { revalidateTrustedVideoReferences } from "../volcengineReferenceRuntime";
+import { claimVideoModeSelectionForSubmission, type VideoModeSelectionSnapshot } from "../videoModeResolution";
 
 let singleton: VideoJobService | undefined;
 
@@ -16,7 +17,11 @@ export function getRuntimeVideoJobService(): VideoJobService {
   if (!singleton) {
     singleton = new VideoJobService(u.db, {
       providerFor: (modelKey) => getPersistentVideoTaskProvider(modelKey as `${string}:${string}`),
-      beforeSubmit: (job, config) => revalidateTrustedVideoReferences(u.db, job.modelKey, config, (filePath) => u.oss.getImageBase64(filePath)),
+      beforeSubmit: async (job, config) => {
+        const snapshot = config && typeof config === "object" ? (config as { toonflowModeSelection?: VideoModeSelectionSnapshot }).toonflowModeSelection : undefined;
+        await revalidateTrustedVideoReferences(u.db, job.modelKey, config, (filePath) => u.oss.getImageBase64(filePath));
+        if (snapshot) await claimVideoModeSelectionForSubmission(u.db, { jobId: job.id, projectId: job.projectId, scriptId: job.scriptId, trackId: job.trackId, snapshot }, (filePath) => u.oss.getImageBase64(filePath));
+      },
       download: async (url, outputPath, job) => {
         const bytes = await fetchVideoBytes(url);
         if (!job?.modelKey.startsWith("agentsYun:")) {

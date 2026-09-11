@@ -13,6 +13,7 @@ import { requireProjectAccess, TeamSecurityError } from "./team";
 import { getRouteAuthorization } from "./team/authorization";
 import { resolveImageFlowOwner, ImageFlowWorkspaceError } from "./imageFlowWorkspace";
 import { assertImageMediaProject, MediaOwnershipError } from "../lib/mediaOwnership";
+import { VideoModeResolutionError } from "./videoModeResolution";
 
 export async function requireProductionOwner(req: Request, projectId: number, db: Knex): Promise<TrustedActor> {
   const userId = Number((req as Request & { user?: { id?: number } }).user?.id);
@@ -24,6 +25,7 @@ export async function requireProductionOwner(req: Request, projectId: number, db
   return { id: `human:${userId}`, kind: "human" };
 }
 export function sendProductionError(res: Response, error: unknown) {
+  if (error instanceof VideoModeResolutionError) return res.status(error.status).json({ code: error.code, message: error.message });
   if (error instanceof ImageFlowWorkspaceError || error instanceof MediaOwnershipError) {
     const status = error.code === "NOT_FOUND" ? 404 : error.code === "PROJECT_MISMATCH" ? 403 : error.code === "INVALID_INPUT" ? 400 : 409;
     return res.status(status).json({ code: error.code, message: error.message });

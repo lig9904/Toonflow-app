@@ -7,7 +7,7 @@ import { ensureBuiltinAgentRuntimeSchema, BuiltinAgentRuntime } from "../src/ser
 import { createImageGenerationService, ensureProductionImageJobSchema } from "../src/services/imageJobs/runtime";
 import { VideoJobService, ensureVideoJobsSchema } from "../src/services/videoJobs";
 import { createProductionAgentExecutor } from "../src/services/builtinAgent/productionExecutor";
-import { createProductionMediaCapabilities, validateVideoParameters, defaultVideoSettings } from "../src/services/builtinAgent/media";
+import { agentVideoReferenceSelection, createProductionMediaCapabilities, validateVideoParameters, defaultVideoSettings } from "../src/services/builtinAgent/media";
 import { defaultBuiltinRunLimits } from "../src/services/builtinAgent/contracts";
 import type { StructuredScriptModel } from "../src/services/builtinAgent/scriptExecutor";
 import { ensureCreativeWorkspaceSchema } from "../src/services/creativeWorkspace";
@@ -74,10 +74,18 @@ for (const withSavedPrompt of [true,false]) test(`production runtime creates ima
 });
 
 test("unsupported video combinations fail before a provider submission", () => {
-  assert.deepEqual(defaultVideoSettings(videoModel), { mode: "endFrameOptional", resolution: "480p", audio: false });
+  assert.deepEqual(defaultVideoSettings(videoModel), { mode: "auto", resolution: "480p", audio: false });
   assert.throws(() => validateVideoParameters(videoModel, { mode: "text", duration: 5, resolution: "480p" }), /模式/);
   assert.throws(() => validateVideoParameters(videoModel, { mode: "endFrameOptional", duration: 6, resolution: "480p" }), /时长/);
   assert.throws(() => validateVideoParameters({ ...videoModel, audio: false }, { mode: "endFrameOptional", duration: 5, resolution: "480p", audio: true }), /音频/);
+});
+
+test("Agent uses the persisted per-track reference selection instead of rebuilding the default inventory", () => {
+  const inventory = { storyboards: [{ id: 1, trackId: 9, filePath: "/default.png" }], linkedAssets: [], boundAudio: [] };
+  const persisted = { trackId: 9, modeIntent: "startFrameOptional", references: [{ id: 22, sources: "storyboard" as const, fileType: "image" as const, purpose: "last_frame" as const }], referencesInitialized: true, promptReferenceRevision: 1, revision: 1, source: "track" as const };
+  assert.deepEqual(agentVideoReferenceSelection(persisted, inventory, 9), persisted.references);
+  assert.deepEqual(agentVideoReferenceSelection({ ...persisted, modeIntent: "text", references: [] }, inventory, 9), []);
+  assert.deepEqual(agentVideoReferenceSelection({ ...persisted, referencesInitialized: false, references: [] }, inventory, 9).map((item) => item.id), [1]);
 });
 
 test("interrupted media step resumes its durable job without consuming another generation allowance", options, async () => {

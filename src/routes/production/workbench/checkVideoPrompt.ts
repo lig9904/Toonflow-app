@@ -6,9 +6,9 @@ import { success } from "@/lib/responseFormat";
 import { validateFields } from "@/middleware/middleware";
 import { ensureVideoPromptJobSchema } from "@/services/videoPromptJobs";
 const router = express.Router();
-const infoSchema = z.object({ id: z.number().int().positive(), sources: z.enum(["storyboard", "assets"]), fileType: z.enum(["image", "video", "audio"]).optional() });
-const reviewInputSchema = z.object({ trackId: z.number().int().positive(), model: z.string().min(1), mode: z.union([z.string(), z.array(z.unknown())]),
-  generation: z.object({ duration: z.number().finite().positive().optional(), resolution: z.string().min(1).optional(), audio: z.boolean().optional() }), info: z.array(infoSchema) });
+const infoSchema = z.object({ id: z.number().int().positive(), sources: z.enum(["storyboard", "assets"]), fileType: z.enum(["image", "video", "audio"]).optional(), purpose: z.enum(["first_frame", "last_frame", "identity_reference", "style_reference", "motion_reference", "audio_reference"]).optional() });
+const reviewInputSchema = z.object({ trackId: z.number().int().positive(), model: z.string().min(1), mode: z.union([z.string(), z.array(z.unknown())]).optional(), resolvedMode: z.union([z.string(), z.array(z.unknown())]).optional(), modeIntentRevision: z.number().int().nonnegative().optional(),
+  generation: z.object({ duration: z.number().finite().positive().optional(), resolution: z.string().min(1).optional(), audio: z.boolean().optional() }), info: z.array(infoSchema).optional(), references: z.array(infoSchema).optional() }).refine((value) => value.mode !== undefined || value.resolvedMode !== undefined, "缺少已解析视频模式");
 
 export default router.post(
   "/",
@@ -37,7 +37,7 @@ export default router.post(
     const state = (value: string): string => value === "succeeded" ? "已完成" : value === "failed" ? "生成失败" : value === "queued" || value === "running" ? "生成中" : value;
     const promptList = await Promise.all(tracks.map(async (track) => {
       const reviewInput = reviewInputs.find((item: { trackId: number }) => Number(item.trackId) === Number(track.id));
-      const promptReview = reviewInput ? await readCurrentVideoPromptReview(u.db, { projectId, scriptId, trackId: Number(track.id), prompt: track.prompt ?? "", model: reviewInput.model, mode: reviewInput.mode, generation: reviewInput.generation, info: reviewInput.info }) : null;
+      const promptReview = reviewInput ? await readCurrentVideoPromptReview(u.db, { projectId, scriptId, trackId: Number(track.id), prompt: track.prompt ?? "", model: reviewInput.model, mode: reviewInput.resolvedMode ?? reviewInput.mode, generation: reviewInput.generation, info: reviewInput.references ?? reviewInput.info ?? [] }) : null;
       const job = jobsByTrack.get(Number(track.id));
       return job
         ? { promptReview, id: Number(track.id), jobId: String(job.id), idempotencyKey: String(job.idempotencyKey), state: state(String(job.state)), reason: job.reason ?? "", prompt: track.prompt ?? "", version: versionByTrack.get(Number(track.id)) ?? 0 }

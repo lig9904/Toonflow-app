@@ -74,6 +74,7 @@ add("POST", ["/api/script/extractAssets"], project("edit", "projectId", [{ table
 add("POST", ["/api/production/assets/batchGenerateAssetsImage"], project("edit", "projectId", [{ table: "o_script", field: "scriptId" }, { table: "o_assets", field: "assetIds", many: true }]));
 add("POST", ["/api/production/storyboard/batchGenerateImage"], project("edit", "projectId", [{ table: "o_script", field: "scriptId" }, { table: "o_storyboard", field: "storyboardIds", many: true }]));
 add("POST", ["/api/production/workbench/checkVideoPrompt"], project("read", "projectId", [{ table: "o_script", field: "scriptId" }, { table: "o_videoTrack", field: "trackIds", many: true }]));
+add("POST", ["/api/production/workbench/resolveVideoMode"], project("read", "projectId", [{ table: "o_script", field: "scriptId" }, { table: "o_videoTrack", field: "trackId" }]));
 add("POST", ["/api/production/workbench/checkVideoStateList"], project("read", "projectId", [{ table: "o_script", field: "scriptId" }, { table: "o_video", field: "videoIds", many: true }]));
 
 add("POST", ["/api/general/getSingleProject"], resource("read", "o_project", "id"));
@@ -133,6 +134,7 @@ add("POST", ["/api/production/getFlowData"], project("read", "projectId", [{ tab
 add("POST", ["/api/production/workbench/getEditTimeline"], project("read", "projectId", [{ table: "o_script", field: "scriptId" }]));
 add("POST", ["/api/production/workbench/saveEditTimeline"], project("edit", "projectId", [{ table: "o_script", field: "scriptId" }]));
 add("POST", ["/api/production/workbench/generateVideoPrompt"], project("edit", "projectId", [{ table: "o_script", field: "scriptId" }, { table: "o_videoTrack", field: "trackId" }]));
+add("POST", ["/api/production/workbench/setVideoModeIntent", "/api/production/workbench/setVideoReferences"], project("edit", "projectId", [{ table: "o_script", field: "scriptId" }, { table: "o_videoTrack", field: "trackId" }]));
 add("POST", ["/api/production/workbench/batchGeneratePrompt"], project("edit", "projectId", [{ table: "o_script", field: "scriptId" }, { table: "o_videoTrack", field: "trackData", many: true, nestedIdField: "trackId" }]));
 add("POST", ["/api/production/saveFlowData"], project("edit", "projectId", [{ table: "o_script", field: "episodesId" }]));
 add("POST", ["/api/production/editImage/uploadImage", "/api/production/workbench/addTrack", "/api/production/workbench/batchGenerateVideo", "/api/production/workbench/generateVideo", "/api/production/workbench/retryVideoDownload"], project("edit", "projectId", [{ table: "o_script", field: "scriptId" }]));

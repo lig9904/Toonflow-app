@@ -8,6 +8,8 @@ import { resolveVideoReferenceMediaType } from "@/lib/videoPromptReferences";
 import { getCreativeState } from "@/services/creativeWorkspace";
 import { loadVideoReferenceInventory } from "@/services/videoPromptComposition";
 import { sortTracksByStoryboardIndex } from "@/services/trackOrdering";
+import { getConfiguredMediaModel } from "@/utils/ai";
+import { ensureVideoModeIntentSchema, readVideoModeIntent, resolveStoredVideoMode, VideoModeResolutionError } from "@/services/videoModeResolution";
 const router = express.Router();
 
 interface VideoItem {
@@ -36,6 +38,12 @@ interface TrackItem {
   selectVideoId?: number;
   medias: TrackMedia[];
   videoList: VideoItem[];
+  modeIntent: unknown;
+  modeIntentRevision: number;
+  promptReferenceRevision: number;
+  references: unknown[];
+  referencesInitialized: boolean;
+  modeResolution: unknown;
 }
 
 export default router.post(
@@ -57,7 +65,8 @@ export default router.post(
     } catch (e) {
       videoMode = projectData?.mode ?? "";
     }
-    const isRef = Array.isArray(videoMode) ? true : false;
+    await ensureVideoModeIntentSchema(u.db);
+    const capabilities = await getConfiguredMediaModel(projectData.videoModel, "video");
 
     const storyboardList = await u.db("o_storyboard").where({ scriptId, projectId }).orderBy("index", "asc");
     await Promise.all(
@@ -89,17 +98,12 @@ export default router.post(
         ];
       }
     });
+    for (const medias of Object.values(storyboardTrackRecord)) medias.forEach((item, index) => { item.purpose = medias.length === 1 && index === 0 ? "first_frame" : "style_reference"; });
     // 按 storyboardId 分组的资产数据，key 为 storyboardId
     const otherDataMap: Record<number, any[]> = {};
     // 解析 videoMode 中 audioReference 的数量，例如 'audioReference:3' => 3
-    const audioReferenceCount = (() => {
-      if (!Array.isArray(videoMode)) return 0;
-      const item = (videoMode as string[]).find((v) => v.toLowerCase().startsWith("audioreference:"));
-      if (!item) return 0;
-      const num = parseInt(item.split(":")[1], 10);
-      return isNaN(num) ? 0 : num;
-    })();
-    if (isRef) {
+    const audioReferenceCount = Number.MAX_SAFE_INTEGER;
+    {
       const storyIds = storyboardList.map((s) => s.id);
 
       const inventory = await loadVideoReferenceInventory(u.db, { projectId, scriptId });
@@ -117,6 +121,7 @@ export default router.post(
             fileType: "audio" as const,
             sources: "assets",
             prompt: i.prompt,
+            purpose: "audio_reference",
             src: await u.oss.getFileUrl(i.filePath),
           });
         }),
@@ -131,6 +136,7 @@ export default router.post(
             type: i.type,
             fileType: resolveVideoReferenceMediaType(i.storedFileType, i.type, i.filePath),
             sources: "assets",
+            purpose: resolveVideoReferenceMediaType(i.storedFileType, i.type, i.filePath) === "video" ? "motion_reference" : i.type === "role" ? "identity_reference" : "style_reference",
             src: i.filePath ? await u.oss.getSmallImageUrl(i.filePath) : "",
           };
           const sid = i.storyboardId as number;
@@ -156,6 +162,17 @@ export default router.post(
     const trackIdMap = [...new Set<number>(trackData.map((t) => t.id!))];
     for (const trackId of trackIdMap) {
       const item = trackData.find((t) => t.id === trackId);
+      const modeSelection = await readVideoModeIntent(u.db, { projectId, scriptId, trackId });
+      const currentMedias = (() => {
+        const storyboardMedias = storyboardTrackRecord[trackId] ?? [];
+        const assetMedias = storyboardMedias.flatMap((s) => otherDataMap[s.id] ?? []);
+        const uniqueAssets = [...new Map(assetMedias.map((asset) => [`${asset.sources}:${asset.id}`, asset])).values()];
+        return [...uniqueAssets.filter((asset) => asset.src), ...storyboardMedias, ...uniqueAssets.filter((asset) => !asset.src)];
+      })();
+      const defaultReferences = currentMedias.filter((media) => media.src && Number.isSafeInteger(Number(media.id))).map(({ id, sources, fileType, purpose }) => ({ id: Number(id), sources, fileType, purpose }));
+      let modeResolution: any;
+      try { modeResolution = await resolveStoredVideoMode(u.db, { projectId, scriptId, trackId, model: projectData.videoModel, capabilities, references: modeSelection.referencesInitialized ? modeSelection.references : defaultReferences, expectedIntentRevision: modeSelection.revision }); }
+      catch (error) { modeResolution = { trackId, modeIntent: modeSelection.modeIntent, modeIntentRevision: modeSelection.revision, resolvedMode: null, resolvedReferences: modeSelection.referencesInitialized ? modeSelection.references : defaultReferences, referenceSummary: null, compatibility: { ok: false, code: error instanceof VideoModeResolutionError ? error.code : "VIDEO_MODE_INCOMPATIBLE", message: error instanceof Error ? error.message : "视频生成方式无法匹配" } }; }
       trackList.push({
         id: trackId,
         version: (await getCreativeState(u.db, "track", trackId, projectId)).version,
@@ -167,34 +184,13 @@ export default router.post(
         state: (item?.state as "未生成" | "生成中" | "已完成" | "生成失败") ?? "未生成",
         reason: item?.reason ?? "",
         selectVideoId: Number(item?.videoId)!,
-        medias: (() => {
-          const storyboardMedias = storyboardTrackRecord[trackId] ?? [];
-          const assetMedias = storyboardMedias.flatMap((s) => otherDataMap[s.id] ?? []);
-
-          const seenAssetIds = new Set<number>();
-          const uniqueAssets = assetMedias.filter((a) => {
-            if (seenAssetIds.has(a.id)) return false;
-            seenAssetIds.add(a.id);
-            return true;
-          });
-
-          // 有 audioReference 时，按数量截取 audio 类型资产
-          const audioCountMap: Record<string, number> = {};
-          const filteredAssets = uniqueAssets.filter((a) => {
-            if (a.fileType !== "audio") return true;
-            if (audioReferenceCount === 0) return false;
-            const key = String(a.id);
-            audioCountMap[key] = (audioCountMap[key] ?? 0) + 1;
-            // 统计当前 track 内 audio 总数，超过上限则过滤
-            const totalAudio = Object.values(audioCountMap).reduce((s, n) => s + n, 0);
-            return totalAudio <= audioReferenceCount;
-          });
-
-          const hasImageAssetData = filteredAssets.filter((i) => i.src);
-          const notHasImageAssetData = filteredAssets.filter((i) => !i.src);
-
-          return [...hasImageAssetData, ...storyboardMedias, ...notHasImageAssetData];
-        })(),
+        medias: currentMedias,
+        modeIntent: modeSelection.modeIntent,
+        modeIntentRevision: modeSelection.revision,
+        promptReferenceRevision: modeSelection.promptReferenceRevision,
+        references: modeSelection.referencesInitialized ? modeSelection.references : defaultReferences,
+        referencesInitialized: modeSelection.referencesInitialized,
+        modeResolution,
         videoList: await Promise.all(
           videoList
             .filter((v) => v.videoTrackId === trackId)

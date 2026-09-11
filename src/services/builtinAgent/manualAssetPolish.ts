@@ -1,5 +1,6 @@
 import type {Knex} from 'knex';
 import {z} from 'zod';
+import pLimit from 'p-limit';
 import type {BuiltinExecutionContext} from '../builtinAgentRuntime';
 import {BuiltinRuntimeError} from '../builtinAgentRuntime';
 import type {BuiltinRunView} from './contracts';
@@ -9,7 +10,7 @@ import {getCreativeState} from '../creativeWorkspace';
 import {updateAsset} from '../assetWorkspace';
 import {assetPromptSystem} from '../../lib/creativePromptPolicy';
 export interface PolishItem {assetsId:number;expectedVersion:number;name:string;describe:string;type:string;system:string}
-export interface PolishContext {projectId:number;items:PolishItem[];otherTextPrompt:string}
+export interface PolishContext {projectId:number;items:PolishItem[];otherTextPrompt:string;concurrentCount?:number}
 export async function ensureManualPolishSchema(db:Knex){if(!await db.schema.hasColumn('o_assets','promptRunId'))await db.schema.alterTable('o_assets',t=>t.uuid('promptRunId').nullable());}
 export async function initializeManualPolish(trx:Knex.Transaction,run:BuiltinRunView){
  const c=(run.intent as any)?.context as PolishContext;
@@ -27,7 +28,8 @@ export function createManualPolishExecutor(deps:{db:Knex;model:StructuredScriptM
   if(!c||c.projectId!==ctx.run.projectId)throw new BuiltinRuntimeError('INVALID_INPUT','素材润色上下文无效');
   const items=await ctx.step('polish.snapshot',{},async()=>c.items),results:any[]=[];
   const schema=z.object({prompt:z.string().min(1).max(50000)}).strict();
-  for(const item of items){
+  const limit=pLimit(Math.max(1,Math.min(20,c.concurrentCount??1)));
+  await Promise.all(items.map(item=>limit(async()=>{
    await ctx.assertActive();
    try{
     const generated=await ctx.step(`polish.model:${item.assetsId}`,{item,otherTextPrompt:c.otherTextPrompt},async()=>{
@@ -41,7 +43,7 @@ export function createManualPolishExecutor(deps:{db:Knex;model:StructuredScriptM
      await trx('o_assets').where({id:item.assetsId,promptRunId:ctx.run.id}).update({promptState:'已完成',promptErrorReason:null});return {assetId:item.assetsId,prompt:result.asset.prompt,version:result.asset.version};
     });results.push(saved);await ctx.emit('artifact.saved',{kind:'assetPrompt',ids:[item.assetsId],...saved});
    }catch(error){await ctx.assertActive();await deps.db('o_assets').where({id:item.assetsId,projectId:c.projectId,promptRunId:ctx.run.id}).update({promptState:'生成失败',promptErrorReason:error instanceof Error?error.message:'提示词生成失败'});results.push({assetId:item.assetsId,error:error instanceof Error?error.message:'提示词生成失败'});}
-  }
+  })));
   return {outcome:results.some(r=>r.error)?'partial':'complete',results};
  };
 }

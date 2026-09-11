@@ -6,6 +6,7 @@ import { buildStoryboardVideoPrompt } from "../lib/storyboardVisualContract";
 import { VideoJobError } from "./videoJobs";
 import type { VideoPromptJob } from "./videoPromptJobs";
 import { parsePromptMode, validatePromptReferenceSelection, type VideoGenerationSettings } from "./videoPromptComposition";
+import { classifyVideoPromptReviewFailure } from "./videoPromptReviewRuntime";
 
 export const videoPromptReviewSchema = z.object({
   findings: z.array(z.object({ code: z.string().min(1).max(100), severity: z.enum(["error", "warning", "info"]), message: z.string().min(1).max(2000), shotId: z.number().int().positive().optional(), field: z.string().max(100).optional() })).max(100),
@@ -45,8 +46,9 @@ export async function reviewGeneratedVideoPrompt(job: VideoPromptJob, draft: str
     if (candidate && candidate !== draft && (deterministic.length || response.findings.some((finding) => finding.severity === "error")) && deterministicPromptFindings(job, candidate).length === 0 && preservesExplicitIntent(job, draft, candidate)) { prompt = candidate; revised = true; }
     const findings = [...deterministicPromptFindings(job, prompt), ...response.findings.map((finding) => ({ ...finding, ...(revised ? { message: `原稿发现（已应用一次最小修正，修正后待语义复核）：${finding.message}` } : {}) }))];
     return { prompt, review: { status: findings.length ? "issues" : "passed", findings, summary: revised ? `${response.summary} 已应用一次最小修正；原发现保留，修正效果未经再次语义复核。` : response.summary, revised, reviewedAt } };
-  } catch {
-    return { prompt: draft, review: { status: "failed", findings: [...deterministic, { code: "SEMANTIC_REVIEW_FAILED", severity: "warning", message: "语义复核未完成，已保留提示词；不会自动重试或触发媒体生成" }], summary: "语义复核失败，确定性检查仍有效", revised: false, reviewedAt } };
+  } catch (error) {
+    const failure = classifyVideoPromptReviewFailure(error);
+    return { prompt: draft, review: { status: "failed", findings: [...deterministic, { code: "SEMANTIC_REVIEW_FAILED", severity: "warning", message: `语义复核未完成（${failure.code}），已保留提示词；不会自动重试或触发媒体生成` }], summary: "语义复核失败，确定性检查仍有效", revised: false, reviewedAt, failure } };
   }
 }
 const json = (value: any) => typeof value === "string" ? JSON.parse(value) : value;

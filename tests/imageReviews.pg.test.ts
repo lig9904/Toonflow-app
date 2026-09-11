@@ -108,12 +108,22 @@ test("unsupported model is skipped and a failed or timed out review never fails 
     await f.reviews.runDue();
     const failed = (await f.reviews.list({ projectId: f.projectId }))[0];
     assert.equal(failed.status, "failed"); assert(!failed.summary.includes("secret"));
+    assert.equal(failed.diagnostics?.code, "REVIEW_FAILED"); assert.equal(failed.diagnostics?.errorName, "Error"); assert(!JSON.stringify(failed).includes("secret provider error"));
     assert.equal((await f.jobs.get({ projectId: f.projectId, jobId: receipt.jobId })).status, "succeeded");
     assert.equal((await f.db("o_storyboard").where({ id: f.targetId }).first()).state, "已完成");
     f.reviewOptions.timeoutMs = 10; f.reviewOptions.generate = async () => new Promise(() => undefined);
     await f.db("ext_image_reviews").where({ jobId: receipt.jobId }).update({ status: "queued", model: null, attempts: 0, invocationStartedAt: null });
     await f.reviews.runDue();
-    assert.equal((await f.reviews.list({ projectId: f.projectId }))[0].status, "failed");
+    const timedOut = (await f.reviews.list({ projectId: f.projectId }))[0];
+    assert.equal(timedOut.status, "failed"); assert.equal(timedOut.diagnostics?.code, "REVIEW_TIMEOUT");
+    f.reviewOptions.timeoutMs = 1000;
+    f.reviewOptions.generate = async () => ({ kind: "image-review-model-response", text: '{"summary":"private wrong schema"}', finishReason: "stop", usage: { outputTokens: 20 } });
+    await f.db("ext_image_reviews").where({ jobId: receipt.jobId }).update({ status: "queued", model: null, attempts: 0, invocationStartedAt: null });
+    await f.reviews.runDue();
+    const malformed = (await f.reviews.list({ projectId: f.projectId }))[0];
+    assert.equal(malformed.status, "failed"); assert.equal(malformed.diagnostics?.code, "REVIEW_OUTPUT_SCHEMA");
+    assert.equal(malformed.diagnostics?.finishReason, "stop"); assert.equal(malformed.diagnostics?.fields?.[0].path, "findings");
+    assert(!JSON.stringify(malformed).includes("private wrong schema"));
   } finally { await f.destroy(); }
 });
 

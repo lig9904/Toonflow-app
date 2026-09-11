@@ -6,11 +6,12 @@ import { assertImageMediaProject, canonicalMediaPath } from "../../lib/mediaOwne
 import { imageReferencesMatch, type ImageReferenceSnapshot } from "../imageJobs/referenceSnapshot";
 import type { PrepareImageGenerationInput } from "../imageJobs/runtime";
 import { encodeReviewImage, imageDigest, inlineReferenceHash, MAX_REVIEW_REFERENCES, MAX_REVIEW_TOTAL_BYTES } from "./media";
+import { diagnoseImageReviewFailure, imageReviewFailureSummary, ImageReviewDiagnosticError, parseImageReviewOutput, type ImageReviewDiagnostics } from "./output";
 
 const TABLE = "ext_image_reviews";
 export const imageReviewResultSchema = z.object({
   summary: z.string().min(1).max(4000),
-  findings: z.array(z.object({ code: z.string().min(1).max(80), severity: z.enum(["info", "warning", "error"]), message: z.string().min(1).max(2000), referenceLabel: z.string().max(200).optional(), confidence: z.number().min(0).max(1).optional() }).strict()).max(50),
+  findings: z.array(z.object({ code: z.string().min(1).max(80), severity: z.enum(["info", "warning", "error"]), message: z.string().min(1).max(2000), referenceLabel: z.string().max(200).nullable().optional(), confidence: z.number().min(0).max(1).nullable().optional() }).strict()).max(50),
 }).strict();
 export type ImageReviewFinding = z.infer<typeof imageReviewResultSchema>["findings"][number];
 export type ImageReviewStatus = "queued" | "running" | "passed" | "issues" | "failed" | "skipped";
@@ -31,6 +32,7 @@ export interface ImageReviewReport {
   artifactPath: string; artifactHash: string | null; status: ImageReviewStatus; summary: string; findings: ImageReviewFinding[];
   reviewedAt: number | null; selected: boolean; stale: boolean; referenceCoverage: "complete" | "partial" | "none";
   promptVersion: string | number; modelName: string | null; createdAt: number; updatedAt: number;
+  diagnostics?: ImageReviewDiagnostics | null;
 }
 export interface ImageReviewOptions {
   db: Knex;
@@ -63,7 +65,7 @@ export async function ensureImageReviewSchema(db: Knex): Promise<void> {
     await db.raw(`CREATE TABLE IF NOT EXISTS "${TABLE}" (
       id text PRIMARY KEY, "jobId" bigint NOT NULL UNIQUE, "projectId" bigint NOT NULL, "scriptId" bigint,
       "targetKind" text NOT NULL, "targetId" text NOT NULL, "artifactPath" text NOT NULL, "artifactHash" text,
-      fingerprint text NOT NULL, snapshot text NOT NULL, model text, status text NOT NULL,
+      fingerprint text NOT NULL, snapshot text NOT NULL, model text, diagnostics text, status text NOT NULL,
       summary text NOT NULL DEFAULT '', findings text NOT NULL DEFAULT '[]', "referenceCoverage" text NOT NULL DEFAULT 'none',
       attempts integer NOT NULL DEFAULT 0, "leaseToken" text, "leaseUntil" bigint, "invocationStartedAt" bigint,
       "reviewedAt" bigint, "createdAt" bigint NOT NULL, "updatedAt" bigint NOT NULL
@@ -72,17 +74,19 @@ export async function ensureImageReviewSchema(db: Knex): Promise<void> {
     await db.raw(`CREATE INDEX IF NOT EXISTS ext_image_reviews_project_idx ON "${TABLE}" ("projectId", "scriptId", "createdAt")`);
     await db.raw(`CREATE INDEX IF NOT EXISTS ext_image_reviews_artifact_idx ON "${TABLE}" ("projectId", "targetKind", "targetId", "artifactPath", "createdAt")`);
     await db.raw(`ALTER TABLE "${TABLE}" ADD COLUMN IF NOT EXISTS "invocationStartedAt" bigint`);
+    await db.raw(`ALTER TABLE "${TABLE}" ADD COLUMN IF NOT EXISTS diagnostics text`);
   } else if (!(await db.schema.hasTable(TABLE))) {
     await db.schema.createTable(TABLE, (t) => {
       t.text("id").primary(); t.integer("jobId").notNullable().unique(); t.integer("projectId").notNullable(); t.integer("scriptId");
       for (const column of ["targetKind", "targetId", "artifactPath", "fingerprint", "snapshot", "status"]) t.text(column).notNullable();
-      t.text("artifactHash"); t.text("model"); t.text("summary").notNullable().defaultTo(""); t.text("findings").notNullable().defaultTo("[]"); t.text("referenceCoverage").notNullable().defaultTo("none");
+      t.text("artifactHash"); t.text("model"); t.text("diagnostics"); t.text("summary").notNullable().defaultTo(""); t.text("findings").notNullable().defaultTo("[]"); t.text("referenceCoverage").notNullable().defaultTo("none");
       t.integer("attempts").notNullable().defaultTo(0); t.text("leaseToken"); t.bigInteger("leaseUntil"); t.bigInteger("invocationStartedAt"); t.bigInteger("reviewedAt"); t.bigInteger("createdAt").notNullable(); t.bigInteger("updatedAt").notNullable();
       t.index(["projectId", "scriptId", "createdAt"]);
       t.index(["projectId", "targetKind", "targetId", "artifactPath", "createdAt"]);
     });
   }
   if (!isPostgres(db) && !(await db.schema.hasColumn(TABLE, "invocationStartedAt"))) await db.schema.alterTable(TABLE, (t) => { t.bigInteger("invocationStartedAt"); });
+  if (!isPostgres(db) && !(await db.schema.hasColumn(TABLE, "diagnostics"))) await db.schema.alterTable(TABLE, (t) => { t.text("diagnostics"); });
 }
 
 export class ImageReviewService {
@@ -235,14 +239,17 @@ export class ImageReviewService {
     });
     if (!row) return;
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.options.timeoutMs ?? 180_000);
+    const timeout = setTimeout(() => controller.abort(new ImageReviewDiagnosticError({ code: "REVIEW_TIMEOUT", phase: "worker", errorName: "TimeoutError" })), this.options.timeoutMs ?? 180_000);
     const heartbeat = setInterval(() => {
       void this.options.db(TABLE).where({ id: row.id, status: "running", leaseToken: row.leaseToken }).update({ leaseUntil: this.now() + this.leaseMs, updatedAt: this.now() })
         .then((count) => { if (!count) controller.abort(); }).catch(() => controller.abort());
     }, Math.max(250, Math.floor(this.leaseMs / 3)));
     heartbeat.unref?.();
     try { await this.execute(row, controller.signal); }
-    catch { await this.finish(row, "failed", { summary: "视觉核验未完成（模型请求失败、超时或返回格式无效）；生成图片已保留", findings: [{ code: "REVIEW_FAILED", severity: "warning", message: "未形成有效视觉结论，可继续在画布编辑图片" }] }); }
+    catch (error) {
+      const diagnostics = diagnoseImageReviewFailure(controller.signal.aborted && controller.signal.reason instanceof ImageReviewDiagnosticError ? controller.signal.reason : error);
+      await this.finish(row, "failed", { summary: imageReviewFailureSummary(diagnostics), findings: [{ code: diagnostics.code, severity: "warning", message: "未形成有效视觉结论，可继续在画布编辑图片；具体失败类别见核验诊断" }] }, "none", diagnostics);
+    }
     finally { clearTimeout(timeout); clearInterval(heartbeat); }
   }
 
@@ -268,7 +275,9 @@ export class ImageReviewService {
       artifact = await this.options.readImage(row.artifactPath);
       if (imageDigest(artifact) !== row.artifactHash) throw new Error("changed");
     } catch { await this.finish(row, "skipped", { summary: "生成图片已变化或不可读取，本次核验未使用替换后的图片", findings: [{ code: "ARTIFACT_CHANGED", severity: "warning", message: "图片与任务保存快照不一致，不能作为原任务的视觉结论" }] }); return; }
-    const output = await encodeReviewImage(artifact);
+    let output: Awaited<ReturnType<typeof encodeReviewImage>>;
+    try { output = await encodeReviewImage(artifact); }
+    catch { throw new ImageReviewDiagnosticError({ code: "REVIEW_IMAGE_DECODE", phase: "media", errorName: "Error" }); }
     let bytes = artifact.length;
     const content: Array<{ type: "text"; text: string } | { type: "image"; image: string }> = [
       { type: "text", text: JSON.stringify({ target: { kind: row.targetKind, id: row.targetId }, generationPrompt: snapshot.generationPrompt, targetContext: snapshot.targetContext, referenceCount: snapshot.referenceCount }) },
@@ -299,17 +308,18 @@ export class ImageReviewService {
     if (!canInvoke) return;
     const raw = await abortable(this.options.generate({ model, system: snapshot.prompt.content + "\n仅返回 JSON，使用本次调用 schema；不重画、不调用工具、不修改选中图片、不等待人工。\nOUTPUT_JSON_SCHEMA\n" + JSON.stringify(z.toJSONSchema(imageReviewResultSchema)), content, signal }), signal);
     if (signal.aborted) throw new Error("aborted");
-    const result = imageReviewResultSchema.parse(typeof raw === "string" ? JSON.parse(raw.replace(/^```(?:json)?\s*|\s*```$/g, "")) : raw);
+    const parsed = parseImageReviewOutput(raw, imageReviewResultSchema);
+    const result = parsed.value;
     for (const finding of result.findings) {
       if (finding.confidence != null && finding.confidence < 0.6 && finding.severity === "error") finding.severity = "warning";
     }
     result.findings.push(...limitations);
     const status = result.findings.some((finding) => finding.severity !== "info") ? "issues" : "passed";
-    await this.finish(row, status, result, coverage);
+    await this.finish(row, status, result, coverage, parsed.diagnostics);
   }
 
-  private async finish(row: any, status: ImageReviewStatus, result: z.infer<typeof imageReviewResultSchema>, coverage = "none"): Promise<void> {
-    const count = await this.options.db(TABLE).where({ id: row.id, status: "running", leaseToken: row.leaseToken }).update({ status, summary: result.summary, findings: JSON.stringify(result.findings), referenceCoverage: coverage, leaseToken: null, leaseUntil: null, reviewedAt: this.now(), updatedAt: this.now() });
+  private async finish(row: any, status: ImageReviewStatus, result: z.infer<typeof imageReviewResultSchema>, coverage = "none", diagnostics?: ImageReviewDiagnostics): Promise<void> {
+    const count = await this.options.db(TABLE).where({ id: row.id, status: "running", leaseToken: row.leaseToken }).update({ status, summary: result.summary, findings: JSON.stringify(result.findings), diagnostics: diagnostics ? JSON.stringify(diagnostics) : null, referenceCoverage: coverage, leaseToken: null, leaseUntil: null, reviewedAt: this.now(), updatedAt: this.now() });
     if (count) this.options.onChanged?.({ projectId: Number(row.projectId), ...(row.scriptId == null ? {} : { scriptId: Number(row.scriptId) }), ...(row.targetKind === "storyboard" ? { storyboardId: Number(row.targetId) } : {}) });
   }
 
@@ -329,7 +339,7 @@ export class ImageReviewService {
     const referencesCurrent = await imageReferencesMatch(this.options.db, Number(row.projectId), references).catch(() => false);
     return { id: row.id, jobId: Number(row.jobId), projectId: Number(row.projectId), scriptId: row.scriptId == null ? null : Number(row.scriptId), targetKind: row.targetKind, targetId: row.targetId, artifactPath: row.artifactPath, artifactHash: row.artifactHash,
       status: row.status, summary: row.summary, findings: JSON.parse(row.findings), reviewedAt: row.reviewedAt == null ? null : Number(row.reviewedAt), selected, stale: !selected || targetChanged || !referencesCurrent,
-      referenceCoverage: row.referenceCoverage, promptVersion: snapshot.prompt.version, modelName: row.model ? JSON.parse(row.model).modelName : null, createdAt: Number(row.createdAt), updatedAt: Number(row.updatedAt) };
+      referenceCoverage: row.referenceCoverage, promptVersion: snapshot.prompt.version, modelName: row.model ? JSON.parse(row.model).modelName : null, createdAt: Number(row.createdAt), updatedAt: Number(row.updatedAt), diagnostics: row.diagnostics ? JSON.parse(row.diagnostics) : null };
   }
 }
 

@@ -3,11 +3,24 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import sharp from "sharp";
 import { canonicalMediaPath } from "../../lib/mediaOwnership";
+import { ImageReviewDiagnosticError } from "./output";
 
 export const MAX_REVIEW_IMAGE_BYTES = 20 * 1024 * 1024;
 export const MAX_REVIEW_REFERENCES = 8;
 export const MAX_REVIEW_TOTAL_BYTES = 80 * 1024 * 1024;
 export const imageDigest = (bytes: Buffer | string): string => createHash("sha256").update(bytes).digest("hex");
+
+/** Pass bytes to AI SDK. A data: string can enter its remote URL downloader. */
+export function imageReviewSdkContent(content: Array<{ type: "text"; text: string } | { type: "image"; image: string }>): Array<{ type: "text"; text: string } | { type: "image"; image: Uint8Array; mediaType: "image/jpeg" }> {
+  return content.map((part) => {
+    if (part.type === "text") return part;
+    const match = /^data:image\/jpeg;base64,([A-Za-z0-9+/]+={0,2})$/.exec(part.image);
+    if (!match || match[1].length > Math.ceil(MAX_REVIEW_IMAGE_BYTES / 3) * 4) throw new ImageReviewDiagnosticError({ code: "REVIEW_IMAGE_TRANSPORT", phase: "media", errorName: "Error" });
+    const bytes = Buffer.from(match[1], "base64");
+    if (!bytes.length || bytes.toString("base64") !== match[1]) throw new ImageReviewDiagnosticError({ code: "REVIEW_IMAGE_TRANSPORT", phase: "media", errorName: "Error" });
+    return { type: "image", image: bytes, mediaType: "image/jpeg" };
+  });
+}
 
 /** Only local/NAS media below the configured media root. No URL fetch or symlink escape. */
 export function localReviewImageReader(rootDirectory: string): (filePath: string) => Promise<Buffer> {

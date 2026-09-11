@@ -1,9 +1,9 @@
-import { Output } from "ai";
 import u from "../utils";
-import { getConfiguredMediaModel } from "../utils/ai";
+import { getConfiguredMediaModel, getConfiguredTextOutputLimit } from "../utils/ai";
 import { composeVideoPrompt } from "./videoPromptComposition";
 import { prepareVideoPromptJob, type VideoPromptJob, type VideoPromptJobInput } from "./videoPromptJobs";
 import { reviewGeneratedVideoPrompt } from "./videoPromptReview";
+import { invokeVideoPromptReview } from "./videoPromptReviewRuntime";
 
 /** Resolve all effective rules inside preparation, after the durable replay lookup. */
 export async function prepareRuntimeVideoPromptJob(input: VideoPromptJobInput) {
@@ -20,8 +20,7 @@ export async function generateRuntimeVideoPrompt(job: VideoPromptJob) {
     ...(job.compositionSnapshot.visualManual ? [{ role: "assistant" as const, content: job.compositionSnapshot.visualManual }] : []),
     { role: "user", content: job.promptInput },
   ] });
-  return reviewGeneratedVideoPrompt(job, response.text, async ({ system, input, schema }) => {
-    const reviewed = await u.Ai.Text("universalAi").invoke({ system, prompt: JSON.stringify(input), output: Output.object({ schema }), maxRetries: 0 });
-    return reviewed.output;
-  });
+  return reviewGeneratedVideoPrompt(job, response.text, async (request) => invokeVideoPromptReview(
+    request, (options) => u.Ai.Text("universalAi", false).invoke(options), await getConfiguredTextOutputLimit("universalAi"),
+  ));
 }

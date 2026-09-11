@@ -1,3 +1,5 @@
+import type { VideoPromptReviewFailure } from "../services/videoPromptReviewRuntime";
+
 /** Server-owned input/output protocol, shared by every model and mode. */
 export function videoPromptSystem(reference?: string): string {
   return `${reference ?? ""}\n\n执行协议：输入为本片段全部源分镜、语义身份、实际参考映射及参数，不要求旧 XML。只返回最终视频提示词正文，不输出解释、示例或生成成功声明。
@@ -13,6 +15,7 @@ export interface VideoPromptReviewReport {
   summary: string;
   revised: boolean;
   reviewedAt: number;
+  failure?: VideoPromptReviewFailure;
 }
 const normalize = (text: string) => text.normalize("NFKC").replace(/[\p{P}\p{Z}\s]/gu, "").toLowerCase();
 const escaped = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");

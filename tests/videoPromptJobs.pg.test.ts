@@ -4,6 +4,7 @@ import { createPostgresFixture, migratePostgresFixture } from "../src/lib/postgr
 import { insertRowsReturningIds } from "../src/lib/insertRows";
 import { ensureTrackWorkspaceSchema, updateTrackPrompt } from "../src/services/trackWorkspace";
 import { getCreativeState } from "../src/services/creativeWorkspace";
+import { StructuredModelOutputError } from "../src/lib/structuredModelOutput";
 import { executeVideoPromptJob, markVideoPromptPreparationFailed, prepareVideoPromptJob, ensureVideoPromptJobSchema } from "../src/services/videoPromptJobs";
 
 const options = { skip: !process.env.TOONFLOW_TEST_DATABASE_URL };
@@ -191,13 +192,17 @@ test("failed semantic review stays durable, retries do not repeat the model call
     const input = { projectId: f.projectId, scriptId: f.scriptId, trackId: f.firstTrack, model: "fixture:model", mode: "text", info: [], generation: { duration: 4, resolution: "480p", audio: false }, idempotencyKey: "review-failure-durable" };
     const prepared = await prepareVideoPromptJob(f.db, input, { compose: async () => frozenComposition() });
     let generationCalls = 0, reviewCalls = 0;
-    const generate = async (job: typeof prepared.job) => { generationCalls += 1; return reviewGeneratedVideoPrompt(job, "灵兽说：我已知道", async () => { reviewCalls += 1; throw new Error("fixture timeout"); }); };
+    const generate = async (job: typeof prepared.job) => { generationCalls += 1; return reviewGeneratedVideoPrompt(job, "灵兽说：我已知道", async () => { reviewCalls += 1; throw new StructuredModelOutputError("MODEL_OUTPUT_LIMIT", { role: "universalAi", finishReason: "length", maxOutputTokens: 512, outputTokens: 512, textCharacters: 224 }); }); };
     const completed = await executeVideoPromptJob(f.db, prepared.job.id, generate);
     assert.equal(completed.state, "succeeded"); assert.equal(completed.promptReview?.status, "failed");
     await executeVideoPromptJob(f.db, prepared.job.id, generate);
     assert.equal(generationCalls, 1); assert.equal(reviewCalls, 1);
     const report = await preflightVideoPrompt(f.db, { ...input, prompt: completed.resultPrompt! });
     assert.equal(report.status, "failed"); assert.equal(reviewCalls, 1);
+    assert.equal(report.failure?.code, "MODEL_OUTPUT_LIMIT");
+    assert.equal(report.failure?.outputTokens, 512);
+    const stored = await f.db("ext_video_prompt_jobs").where({ id: prepared.job.id }).first();
+    assert.deepEqual(stored.reviewReport.failure, report.failure);
     assert.equal((await readCurrentVideoPromptReview(f.db, { ...input, prompt: completed.resultPrompt! }))?.status, "failed");
     assert.equal(await readCurrentVideoPromptReview(f.db, { ...input, prompt: "人工改词" }), null);
     assert.equal(await readCurrentVideoPromptReview(f.db, { ...input, prompt: completed.resultPrompt!, generation: { ...input.generation, duration: 6 } }), null);

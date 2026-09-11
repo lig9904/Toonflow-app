@@ -33,7 +33,7 @@ export default router.post(
     const promptList = tracks.map((track) => {
       const job = jobsByTrack.get(Number(track.id));
       return job
-        ? { id: Number(track.id), jobId: String(job.id), state: state(String(job.state)), reason: job.reason ?? "", prompt: track.prompt ?? "", version: versionByTrack.get(Number(track.id)) ?? 0 }
+        ? { id: Number(track.id), jobId: String(job.id), idempotencyKey: String(job.idempotencyKey), state: state(String(job.state)), reason: job.reason ?? "", prompt: track.prompt ?? "", version: versionByTrack.get(Number(track.id)) ?? 0 }
         : { ...track, version: versionByTrack.get(Number(track.id)) ?? 0 };
     });
     res.status(200).send(success(promptList));

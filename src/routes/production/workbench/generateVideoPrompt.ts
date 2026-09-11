@@ -52,13 +52,21 @@ export default router.post(
       const system = await promptSystem(model, mode);
       const visualManual = u.getArtPrompt(project.artStyle || "无", "art_skills", "art_storyboard_video");
       const prepared = await prepareVideoPromptJob(u.db, { projectId, scriptId, trackId, model, mode, info, idempotencyKey });
-      const result = await executeVideoPromptJob(u.db, prepared.job.id, async (job) => {
+      if (prepared.job.state === "failed") return res.status(400).send(error(prepared.job.reason ?? "提示词生成失败"));
+      if (prepared.job.state === "succeeded") {
+        const current = await u.db("o_videoTrack as track").leftJoin("ext_creative_state as state", function () {
+          this.on("state.entityId", "=", "track.id").andOn("state.projectId", "=", "track.projectId").andOn("state.entityType", "=", u.db.raw("?", ["track"]));
+        }).where({ "track.id": trackId, "track.projectId": projectId, "track.scriptId": scriptId }).select("track.prompt", "state.version").first();
+        if (!current) return res.status(404).send(error("当前片段已删除，请刷新"));
+        return res.status(200).send({ ...success(current.prompt ?? ""), version: Number(current.version ?? 0) });
+      }
+      // A durable receipt lets the UI follow this exact job immediately,
+      // instead of keeping a model request open while polling older jobs.
+      res.status(202).send(success({ state: prepared.job.state, jobId: prepared.job.id }));
+      void executeVideoPromptJob(u.db, prepared.job.id, async (job) => {
         const response = await u.Ai.Text("universalAi").invoke({ system: videoPromptSystem(system), messages: [{ role: "assistant", content: visualManual }, { role: "user", content: `模型：${model}\n${job.promptInput}` }] });
         return response.text;
-      });
-      if (result.state === "running" || result.state === "queued") return res.status(202).send(success({ state: result.state, jobId: result.id }));
-      if (result.state === "failed") return res.status(400).send(error(result.reason ?? "提示词生成失败"));
-      return res.status(200).send(success(result.resultPrompt ?? ""));
+      }).catch(() => undefined); // The job records its failure for polling.
     } catch (e) {
       await markVideoPromptPreparationFailed(u.db, { projectId, scriptId, trackId }, u.error(e).message).catch(() => undefined);
       return res.status(400).send(error(u.error(e).message));

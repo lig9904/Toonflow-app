@@ -1,3 +1,4 @@
+import {canUseScriptAsset} from "./scriptReferenceAccess";
 import { createHash, createHmac } from "node:crypto";
 import type { Knex } from "knex";
 import { z } from "zod";
@@ -177,7 +178,7 @@ export async function readLocalVolcengineReferenceSource(db: Knex | Knex.Transac
   if (!row) throw new VolcengineTrustedAssetError("PROJECT_MISMATCH", "素材不属于当前项目", 403);
   if (target.scriptId != null) {
     if (!(await db("o_script").where({ id: target.scriptId, projectId: target.projectId }).first())) throw new VolcengineTrustedAssetError("PROJECT_MISMATCH", "剧集不属于当前项目", 403);
-    if (!(await db("o_scriptAssets").where({ scriptId: target.scriptId, assetId: target.targetId }).first())) throw new VolcengineTrustedAssetError("PROJECT_MISMATCH", "素材未关联到当前剧集", 403);
+    if (!(await canUseScriptAsset(db,target.projectId,target.scriptId,target.targetId))) throw new VolcengineTrustedAssetError("PROJECT_MISMATCH", "素材未关联到当前剧集", 403);
   }
   const state = await db("ext_creative_state").where({ entityType: "asset", entityId: target.targetId, projectId: target.projectId }).first("version");
   return { scriptId: target.scriptId == null ? null : Number(target.scriptId), version: Number(state?.version ?? 0), filePath: String(row.filePath ?? ""), mediaType: resolveVideoReferenceMediaType(row.storedFileType, row.type, row.filePath) };

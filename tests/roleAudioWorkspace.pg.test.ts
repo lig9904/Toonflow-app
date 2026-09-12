@@ -200,3 +200,24 @@ test("derived characters inherit the fixed voice unless explicitly given their o
   assert.equal((await readRoleVoiceCasting(f.db,f.projectId,[f.derivedRoleId]))[0].audioId,f.secondAudio.childId);
  }finally{await f.destroy();}
 });
+
+import {canUseScriptAsset} from '../src/services/scriptReferenceAccess';
+import {resolveVideoReferencePurposes} from '../src/services/videoModeResolution';
+import {loadOwnedVideoReferences} from '../src/services/videoJobs/request';
+test('fixed voice is usable by its character episode without granting unrelated audio access',options,async()=>{
+ const f=await fixture();try{
+  const [script]=await f.db('o_script').insert({projectId:f.projectId,name:'voice episode'}).returning('id');
+  const [other]=await f.db('o_script').insert({projectId:f.projectId,name:'unrelated episode'}).returning('id');
+  await f.db('o_scriptAssets').insert({scriptId:script.id,assetId:f.roleId});
+  await saveRoleAudioBinding(f.db,{projectId:f.projectId,roleAssetId:f.roleId,expectedVersion:1,audioIds:[f.firstAudio.childId],audioVersions:[{id:f.firstAudio.childId,expectedVersion:1}],idempotencyKey:'episode-voice-bind'},actor);
+  assert.equal(await canUseScriptAsset(f.db,f.projectId,Number(script.id),f.firstAudio.childId),true);
+  assert.equal(await canUseScriptAsset(f.db,f.projectId,Number(other.id),f.firstAudio.childId),false);
+  assert.equal(await canUseScriptAsset(f.db,f.projectId,Number(script.id),f.secondAudio.childId),false);
+  assert.equal(await canUseScriptAsset(f.db,f.otherProjectId,Number(script.id),f.firstAudio.childId),false);
+  const references=[{id:f.firstAudio.childId,sources:'assets' as const,fileType:'audio' as const,purpose:'audio_reference' as const}];
+  const resolved=await resolveVideoReferencePurposes(f.db,{projectId:f.projectId,scriptId:Number(script.id),trackId:1,references});assert.equal(resolved[0].fileType,'audio');
+  const sent=await loadOwnedVideoReferences(f.db,f.projectId,Number(script.id),references,async path=>'loaded:'+path);assert.equal(sent[0].type,'audio');assert.equal((sent[0] as any).base64,'loaded:/voice-a.mp3');
+  await saveRoleAudioBinding(f.db,{projectId:f.projectId,roleAssetId:f.roleId,expectedVersion:2,audioIds:[],audioVersions:[],idempotencyKey:'episode-voice-unbind'},actor);
+  assert.equal(await canUseScriptAsset(f.db,f.projectId,Number(script.id),f.firstAudio.childId),false);
+ }finally{await f.destroy();}
+});

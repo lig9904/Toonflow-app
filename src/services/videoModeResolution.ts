@@ -1,3 +1,4 @@
+import {canUseScriptAsset} from "./scriptReferenceAccess";
 import { createHash } from "node:crypto";
 import type { Knex } from "knex";
 import { z } from "zod";
@@ -113,8 +114,9 @@ export async function resolveVideoReferencePurposes(db: Knex | Knex.Transaction,
   for (const reference of references) { const key = `${reference.sources}:${reference.id}`; const old = unique.get(key); if (old && old.purpose !== reference.purpose) throw new VideoModeResolutionError("INVALID_INPUT", "同一视频素材不能声明两个不同用途"); unique.set(key, reference); }
   const values = [...unique.values()], boardIds = values.filter((item) => item.sources === "storyboard").map((item) => item.id), assetIds = values.filter((item) => item.sources === "assets").map((item) => item.id);
   const boards = boardIds.length ? await db("o_storyboard").where({ projectId: input.projectId, scriptId: input.scriptId }).whereIn("id", boardIds).select("id", "trackId", "index", "filePath") : [];
-  const assets = assetIds.length ? await db("o_assets as asset").join("o_scriptAssets as scriptAsset", "scriptAsset.assetId", "asset.id").leftJoin("o_image as image", "image.id", "asset.imageId")
-    .where({ "asset.projectId": input.projectId, "scriptAsset.scriptId": input.scriptId }).whereIn("asset.id", assetIds).select("asset.id", "asset.type", "image.type as storedFileType", "image.filePath") : [];
+  const owned = assetIds.length ? await db("o_assets as asset").leftJoin("o_image as image", "image.id", "asset.imageId")
+    .where("asset.projectId",input.projectId).whereIn("asset.id",assetIds).select("asset.id","asset.type","image.type as storedFileType","image.filePath") : [];
+  const assets = (await Promise.all(owned.map(async row=>await canUseScriptAsset(db,input.projectId,input.scriptId,Number(row.id))?row:null))).filter((r):r is NonNullable<typeof r>=>r!==null);
   const boardMap = new Map(boards.map((row) => [Number(row.id), row])), assetMap = new Map(assets.map((row) => [Number(row.id), row]));
   const selectedBoards = values.filter((item) => item.sources === "storyboard").map((item) => boardMap.get(item.id)).filter(Boolean).sort((a: any, b: any) => Number(a.index) - Number(b.index) || Number(a.id) - Number(b.id));
   return values.map((reference) => {
@@ -268,8 +270,7 @@ async function captureReferenceSources(db: Knex | Knex.Transaction, input: { pro
       row = await db("o_storyboard").where({ id: reference.id, projectId: input.projectId, scriptId: input.scriptId }).first("id", "trackId", "filePath");
       version = await db.schema.hasTable("ext_entity_state") ? Number((await db("ext_entity_state").where({ projectId: input.projectId, entityType: "storyboard", entityId: reference.id }).first("version"))?.version ?? 0) : 0;
     } else {
-      row = await db("o_assets as asset").join("o_scriptAssets as scriptAsset", "scriptAsset.assetId", "asset.id").leftJoin("o_image as image", "image.id", "asset.imageId")
-        .where({ "asset.id": reference.id, "asset.projectId": input.projectId, "scriptAsset.scriptId": input.scriptId }).first("asset.id", "asset.imageId", "image.filePath");
+      row = await canUseScriptAsset(db,input.projectId,input.scriptId,reference.id) ? await db("o_assets as asset").leftJoin("o_image as image","image.id","asset.imageId").where({"asset.id":reference.id,"asset.projectId":input.projectId}).first("asset.id","asset.imageId","image.filePath") : null;
       version = await db.schema.hasTable("ext_creative_state") ? Number((await db("ext_creative_state").where({ projectId: input.projectId, entityType: "asset", entityId: reference.id }).first("version"))?.version ?? 0) : 0;
     }
     if (!row?.filePath) throw new VideoModeResolutionError("REFERENCE_UNAVAILABLE", `视频参考素材 ${reference.id} 已变化或没有当前媒体`);

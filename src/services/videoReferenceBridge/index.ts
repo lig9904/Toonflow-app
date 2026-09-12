@@ -1,3 +1,4 @@
+import {canUseScriptAsset} from "../scriptReferenceAccess";
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import fs from "node:fs/promises";
 import type { Stats } from "node:fs";
@@ -236,13 +237,7 @@ async function resolveSource(db: Knex, source: BridgeReferenceSource): Promise<{
     await assertProjectPathOwnership(db, projectId, filePath);
     return { filePath, mediaType: "image" };
   }
-  const row = await db("o_assets")
-    .join("o_scriptAssets as scriptAsset", "scriptAsset.assetId", "o_assets.id")
-    .join("o_script as script", "script.id", "scriptAsset.scriptId")
-    .leftJoin("o_image", "o_assets.imageId", "o_image.id")
-    .where("o_assets.id", id).where("o_assets.projectId", projectId)
-    .where("script.id", scriptId).where("script.projectId", projectId)
-    .select("o_image.filePath", "o_image.type").first();
+  const row = await canUseScriptAsset(db,projectId,scriptId,id) ? await db("o_assets").leftJoin("o_image","o_assets.imageId","o_image.id").where({"o_assets.id":id,"o_assets.projectId":projectId}).select("o_image.filePath","o_image.type").first() : null;
   if (!row?.filePath) throw new VideoReferenceBridgeError("PROJECT_MISMATCH", "资产引用不属于当前项目或没有媒体文件");
   const filePath = canonicalPath(row.filePath);
   await assertProjectPathOwnership(db, projectId, filePath);
@@ -274,7 +269,7 @@ async function assertLeaseSourceStillOwned(db: Knex, lease: VideoReferenceLeaseR
     if (!(await db("o_storyboard").where({ id: lease.sourceId, projectId: lease.projectId, scriptId: lease.scriptId }).first())) throw new VideoReferenceBridgeError("PROJECT_MISMATCH", "媒体租约所属分镜已不存在或归属已变化");
   } else {
     const asset = await db("o_assets").where({ id: lease.sourceId, projectId: lease.projectId }).first();
-    const linked = await db("o_scriptAssets").where({ scriptId: lease.scriptId, assetId: lease.sourceId }).first();
+    const linked = await canUseScriptAsset(db,lease.projectId,lease.scriptId,lease.sourceId);
     if (!asset || !linked) throw new VideoReferenceBridgeError("PROJECT_MISMATCH", "媒体租约所属资产已不存在或归属已变化");
   }
   await assertProjectPathOwnership(db, lease.projectId, lease.filePath);

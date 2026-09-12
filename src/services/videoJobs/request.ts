@@ -1,3 +1,4 @@
+import {canUseScriptAsset} from "../scriptReferenceAccess";
 import type { Knex } from "knex";
 import { resolveVideoReferenceMediaType } from "@/lib/videoPromptReferences";
 import { issueVideoReferenceLease, type VideoReferenceLeaseOptions, type VideoReferenceSource } from "@/services/videoReferenceBridge";
@@ -82,13 +83,7 @@ export async function loadOwnedVideoReferences(
       if (!row?.filePath) throw new VideoJobError("PROJECT_MISMATCH", "分镜引用不属于当前项目或没有媒体文件");
       return { type: "image" as const, base64: await toBase64(row.filePath) };
     }
-    const row = await db("o_assets")
-      .join("o_scriptAssets as scriptAsset", "scriptAsset.assetId", "o_assets.id")
-      .join("o_script as script", "script.id", "scriptAsset.scriptId")
-      .leftJoin("o_image", "o_assets.imageId", "o_image.id")
-      .where("o_assets.id", item.id).where("o_assets.projectId", projectId)
-      .where("script.id", scriptId).where("script.projectId", projectId)
-      .select("o_image.filePath", "o_image.type").first();
+    const row = await canUseScriptAsset(db,projectId,scriptId,item.id) ? await db("o_assets").leftJoin("o_image","o_assets.imageId","o_image.id").where({"o_assets.id":item.id,"o_assets.projectId":projectId}).select("o_image.filePath","o_image.type").first() : null;
     if (!row?.filePath) throw new VideoJobError("PROJECT_MISMATCH", "资产引用不属于当前项目或没有媒体文件");
     return {
       type: resolveVideoReferenceMediaType(item.fileType, row.type, row.filePath),

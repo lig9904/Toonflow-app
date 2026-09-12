@@ -229,14 +229,14 @@ test("one failed upstream item does not discard another saved batch candidate", 
     const secondId = await asset(f, { name: "second" });
     const p: PersistentAsyncImageTaskProvider = {
       fingerprint: "seedream-relay-v1",
-      submit: async (config) => ({ taskId: String((config as { prompt: string }).prompt).includes("名称:first") ? "batch-ok" : "batch-failed" }),
+      submit: async (config) => ({ taskId: String((config as { prompt: string }).prompt).includes("first prompt") ? "batch-ok" : "batch-failed" }),
       query: async (taskId) => taskId === "batch-ok" ? { status: "succeeded", outputUrl: "https://relay.invalid/one.jpg" } : { status: "failed", error: "provider rejected second" },
     };
     const service = jobs(f.db, p);
     const common = { projectId: f.projectId, type: "role" as const, prompt: "batch", model: "zhenzhen:seedream-v5", resolution: "1K", expectedVersion: 0 };
     const [one, two] = await Promise.all([
-      generateRootAssetImage(f.db, service, { ...common, assetId: firstId, name: "first", generationKey: "partial-first-key" }),
-      generateRootAssetImage(f.db, service, { ...common, assetId: secondId, name: "second", generationKey: "partial-second-key" }),
+      generateRootAssetImage(f.db, service, { ...common, assetId: firstId, name: "first", prompt:"first prompt", generationKey: "partial-first-key" }),
+      generateRootAssetImage(f.db, service, { ...common, assetId: secondId, name: "second", prompt:"second prompt", generationKey: "partial-second-key" }),
     ]);
     assert.equal(one.status, "succeeded");
     assert.equal(two.status, "failed");

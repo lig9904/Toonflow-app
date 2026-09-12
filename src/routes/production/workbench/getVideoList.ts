@@ -13,17 +13,13 @@ export default router.post(
   }),
   async (req, res) => {
     const { projectId, scriptId } = req.body;
-    const storyboardList = await u.db("o_storyboard").where({ scriptId, projectId }).orderBy("index", "asc");
-    const videoList = await u.db("o_video").whereIn(
-      "videoTrackId",
-      storyboardList.map((s) => s.trackId),
-    );
+    const videoList = await u.db("o_video").where({projectId,scriptId});
     res.status(200).send(
       success(
         await Promise.all(
           videoList.map(async (s) => ({
             ...s,
-            src: s.filePath ? await u.oss.getSmallImageUrl(s.filePath) : "",
+            src: s.filePath ? await u.oss.getFileUrl(s.filePath) : "",
           })),
         ),
       ),

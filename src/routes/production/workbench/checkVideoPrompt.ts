@@ -27,7 +27,10 @@ export default router.post(
       .where("projectId", projectId)
       .where("scriptId", scriptId)
       .whereIn("id", trackIds)
-      .select("id", "state", "reason", "prompt");
+      .select("id", "state", "reason", "prompt", "videoId");
+    const videos=await u.db("o_video").where({projectId,scriptId}).whereIn("videoTrackId",trackIds).orderBy("id");
+    const videoJobs=videos.length?await u.db("ext_video_jobs").whereIn("videoId",videos.map(v=>String(v.id))).select("id","videoId","status","upstreamTaskId","resultUrl"):[];
+    const histories=await Promise.all(videos.map(async v=>{const job=videoJobs.find(j=>Number(j.videoId)===Number(v.id));return {id:Number(v.id),trackId:Number(v.videoTrackId),state:v.state==="生成成功"?"已完成":v.state,src:v.filePath?await u.oss.getFileUrl(v.filePath):"",errorReason:v.errorReason??"",...(job?{jobId:Number(job.id),downloadRetryable:!!job.upstreamTaskId&&!!job.resultUrl&&["DOWNLOADING","RECONCILIATION_REQUIRED"].includes(job.status)}:{})};}));
     const latestJobs = await u.db("ext_video_prompt_jobs").where({ projectId, scriptId }).whereIn("trackId", trackIds).orderBy("createdAt", "desc");
     const versions = await u.db("ext_creative_state").where({ projectId, entityType: "track" }).whereIn("entityId", trackIds).select("entityId", "version");
     const versionByTrack = new Map(versions.map((row) => [Number(row.entityId), Number(row.version)]));
@@ -38,10 +41,11 @@ export default router.post(
     const promptList = await Promise.all(tracks.map(async (track) => {
       const reviewInput = reviewInputs.find((item: { trackId: number }) => Number(item.trackId) === Number(track.id));
       const promptReview = reviewInput ? await readCurrentVideoPromptReview(u.db, { projectId, scriptId, trackId: Number(track.id), prompt: track.prompt ?? "", model: reviewInput.model, mode: reviewInput.resolvedMode ?? reviewInput.mode, generation: reviewInput.generation, info: reviewInput.references ?? reviewInput.info ?? [] }) : null;
+      const videoList=histories.filter(v=>v.trackId===Number(track.id));
       const job = jobsByTrack.get(Number(track.id));
       return job
-        ? { promptReview, id: Number(track.id), jobId: String(job.id), idempotencyKey: String(job.idempotencyKey), state: state(String(job.state)), reason: job.reason ?? "", prompt: track.prompt ?? "", version: versionByTrack.get(Number(track.id)) ?? 0 }
-        : { ...track, promptReview, version: versionByTrack.get(Number(track.id)) ?? 0 };
+        ? { videoList, selectVideoId:track.videoId, promptReview, id: Number(track.id), jobId: String(job.id), idempotencyKey: String(job.idempotencyKey), state: state(String(job.state)), reason: job.reason ?? "", prompt: track.prompt ?? "", version: versionByTrack.get(Number(track.id)) ?? 0 }
+        : { ...track, videoList, selectVideoId:track.videoId, promptReview, version: versionByTrack.get(Number(track.id)) ?? 0 };
     }));
     res.status(200).send(success(promptList));
   },

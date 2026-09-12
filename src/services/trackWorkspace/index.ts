@@ -170,10 +170,13 @@ async function updateTrackField(db: Knex, input: any, actor: TrustedActor, field
     if (replay) return { ...replay, reused: true };
     const track = await mutationContext(trx, projectId, scriptId, trackId);
     await advance(trx, trackId, projectId, expectedVersion, actor);
-    const updated = await trx("o_videoTrack").where({ id: trackId, projectId, scriptId }).update({ [field]: value });
+    const patch = field === "prompt"
+      ? { prompt: value, state: String(value).trim() ? "已完成" : "未生成", reason: null }
+      : { duration: value };
+    const updated = await trx("o_videoTrack").where({ id: trackId, projectId, scriptId }).update(patch);
     if (updated !== 1) throw new TrackWorkspaceError("VERSION_CONFLICT", "轨道已被其他成员修改，请刷新后重试");
     if (field === "prompt") await acknowledgeVideoPromptReferences(trx, { projectId, scriptId, trackId, expectedRevision: Number.isSafeInteger(input.modeIntentRevision) ? Number(input.modeIntentRevision) : undefined }, who);
-    const result = { track: { ...(await view(trx, track)), [field]: value } };
+    const result = { track: { ...(await view(trx, track)), ...patch } };
     await saveReceipt(trx, who, projectId, idempotencyKey, requestHash, result);
     return { ...result, reused: false };
   });

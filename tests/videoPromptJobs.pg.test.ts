@@ -188,11 +188,29 @@ test("late prompt result preserves a human edit after CAS version advance", opti
   const f = await fixture();
   try {
     const prepared = await prepareVideoPromptJob(f.db, { projectId: f.projectId, scriptId: f.scriptId, trackId: f.firstTrack, model: "fixture:model", mode: "text", info: [], idempotencyKey: "prompt-cas-human", expectedVersion: 0 });
+    let markStarted!: () => void;
+    let releaseGeneration!: () => void;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    const release = new Promise<void>((resolve) => { releaseGeneration = resolve; });
+    const execution = executeVideoPromptJob(f.db, prepared.job.id, async () => {
+      markStarted();
+      await release;
+      return "late model result；灵兽说：我已知道";
+    });
+    await started;
     const version = (await getCreativeState(f.db, "track", f.firstTrack, f.projectId)).version;
     await updateTrackPrompt(f.db, { projectId: f.projectId, scriptId: f.scriptId, trackId: f.firstTrack, expectedVersion: version, prompt: "human edit", idempotencyKey: "prompt-human-edit" }, { kind: "human", id: "human:1" });
-    const result = await executeVideoPromptJob(f.db, prepared.job.id, async () => "late model result；灵兽说：我已知道");
+    const savedBeforeLateResult = await f.db("o_videoTrack").where({ id: f.firstTrack }).first();
+    assert.equal(savedBeforeLateResult.state, "已完成");
+    assert.equal(savedBeforeLateResult.reason, null);
+    releaseGeneration();
+    const result = await execution;
     assert.equal(result.state, "failed");
-    assert.equal((await f.db("o_videoTrack").where({ id: f.firstTrack }).first()).prompt, "human edit");
+    const saved = await f.db("o_videoTrack").where({ id: f.firstTrack }).first();
+    assert.equal(saved.prompt, "human edit");
+    assert.equal(saved.state, "已完成");
+    assert.equal(saved.reason, null);
+    assert.equal((await f.db("ext_video_prompt_jobs").where({ id: prepared.job.id }).first()).resultPrompt, "late model result；灵兽说：我已知道");
     assert.match(String(result.reason), /人工修改/);
   } finally { await f.destroy(); }
 });

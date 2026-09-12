@@ -162,6 +162,7 @@ test("track creation is project scoped and reuses the same database id for one i
 test("track prompt and duration updates use CAS and idempotent receipts", options, async () => {
   const f = await fixture();
   try {
+    await f.db("o_videoTrack").where({ id: f.trackId }).update({ state: "生成失败", reason: "旧任务失败" });
     const promptResult = await updateTrackPrompt(f.db, {
       id: f.trackId,
       projectId: f.projectId,
@@ -171,7 +172,12 @@ test("track prompt and duration updates use CAS and idempotent receipts", option
       idempotencyKey: "track-prompt-update",
     }, editorActor);
     assert.equal(promptResult.track.prompt, "keep this edit");
+    assert.equal(promptResult.track.state, "已完成");
+    assert.equal(promptResult.track.reason, null);
     assert.equal(promptResult.track.version, 1);
+    const manuallySaved = await f.db("o_videoTrack").where({ id: f.trackId }).first();
+    assert.equal(manuallySaved.state, "已完成");
+    assert.equal(manuallySaved.reason, null);
 
     const replay = await updateTrackPrompt(f.db, {
       id: f.trackId,
@@ -207,6 +213,23 @@ test("track prompt and duration updates use CAS and idempotent receipts", option
   } finally {
     await f.destroy();
   }
+});
+
+test("saving an empty manual prompt resets only the current prompt state", options, async () => {
+  const f = await fixture();
+  try {
+    await f.db("o_videoTrack").where({ id: f.trackId }).update({ prompt: "old", state: "生成失败", reason: "old failure" });
+    const result = await updateTrackPrompt(f.db, {
+      projectId: f.projectId, scriptId: f.scriptId, trackId: f.trackId, prompt: "  ",
+      expectedVersion: 0, idempotencyKey: "track-prompt-empty",
+    }, editorActor);
+    assert.equal(result.track.state, "未生成");
+    assert.equal(result.track.reason, null);
+    const saved = await f.db("o_videoTrack").where({ id: f.trackId }).first();
+    assert.equal(saved.prompt, "  ");
+    assert.equal(saved.state, "未生成");
+    assert.equal(saved.reason, null);
+  } finally { await f.destroy(); }
 });
 
 test("track deletion refuses storyboard references and uncertain jobs, then atomically removes terminal history", options, async () => {

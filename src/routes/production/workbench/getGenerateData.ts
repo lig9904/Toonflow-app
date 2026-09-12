@@ -10,6 +10,7 @@ import { loadVideoReferenceInventory } from "@/services/videoPromptComposition";
 import { sortTracksByStoryboardIndex } from "@/services/trackOrdering";
 import { getConfiguredMediaModel } from "@/utils/ai";
 import { ensureVideoModeIntentSchema, readVideoModeIntent, resolveStoredVideoMode, VideoModeResolutionError } from "@/services/videoModeResolution";
+import { archivedTrackIds, listArchivedSharedTracks } from "@/services/storyboardTrackIndependence";
 const router = express.Router();
 
 interface VideoItem {
@@ -44,6 +45,12 @@ interface TrackItem {
   references: unknown[];
   referencesInitialized: boolean;
   modeResolution: unknown;
+  storyboardIds: number[];
+  storyboardCount: number;
+  cardKind: "storyboard" | "custom";
+  deleteAction: "deleteStoryboard" | "deleteTrack";
+  migrationRequired: boolean;
+  mutationBlockedReason: string | null;
 }
 
 export default router.post(
@@ -69,6 +76,7 @@ export default router.post(
     const capabilities = await getConfiguredMediaModel(projectData.videoModel, "video");
 
     const storyboardList = await u.db("o_storyboard").where({ scriptId, projectId }).orderBy("index", "asc");
+    const storyboardStates = await u.db.schema.hasTable("ext_entity_state") ? await u.db("ext_entity_state").where({ projectId, entityType: "storyboard" }).whereIn("entityId", storyboardList.map((item) => Number(item.id))).select("entityId", "version") : [];
     await Promise.all(
       storyboardList.map(async (i) => {
         i.filePath = i.filePath ? await u.oss.getSmallImageUrl(i.filePath) : "";
@@ -149,7 +157,7 @@ export default router.post(
     }
 
     const trackData = sortTracksByStoryboardIndex(
-      await u.db("o_videoTrack").where({ projectId, scriptId }),
+      await (async () => { const query = u.db("o_videoTrack").where({ projectId, scriptId }); const archived = await archivedTrackIds(u.db, projectId, scriptId); if (archived.length) query.whereNotIn("id", archived); return query; })(),
       storyboardList,
     );
     const videoList = await u.db("o_video").whereIn(
@@ -162,6 +170,8 @@ export default router.post(
     const trackIdMap = [...new Set<number>(trackData.map((t) => t.id!))];
     for (const trackId of trackIdMap) {
       const item = trackData.find((t) => t.id === trackId);
+      const trackStoryboardIds = storyboardList.filter((storyboard) => Number(storyboard.trackId) === Number(trackId)).map((storyboard) => Number(storyboard.id));
+      const migrationRequired = trackStoryboardIds.length > 1;
       const modeSelection = await readVideoModeIntent(u.db, { projectId, scriptId, trackId });
       const currentMedias = (() => {
         const storyboardMedias = storyboardTrackRecord[trackId] ?? [];
@@ -191,6 +201,12 @@ export default router.post(
         references: modeSelection.referencesInitialized ? modeSelection.references : defaultReferences,
         referencesInitialized: modeSelection.referencesInitialized,
         modeResolution,
+        storyboardIds: trackStoryboardIds,
+        storyboardCount: trackStoryboardIds.length,
+        cardKind: trackStoryboardIds.length === 1 ? "storyboard" : "custom",
+        deleteAction: trackStoryboardIds.length === 1 ? "deleteStoryboard" : "deleteTrack",
+        migrationRequired,
+        mutationBlockedReason: migrationRequired ? "该历史片段仍包含多条分镜，请先完成一镜一片段迁移" : null,
         videoList: await Promise.all(
           videoList
             .filter((v) => v.videoTrackId === trackId)
@@ -204,15 +220,18 @@ export default router.post(
         ),
       });
     }
+    const archivedSharedTracks = await Promise.all((await listArchivedSharedTracks(u.db, projectId, scriptId)).map(async (archive) => ({ ...archive, videos: await Promise.all(archive.videos.map(async (video: any) => ({ id: video.id, state: video.state, errorReason: video.errorReason, src: video.filePath ? await u.oss.getFileUrl(video.filePath) : "" }))) })));
     res.status(200).send(
       success({
         storyboardList: await Promise.all(
           storyboardList.map(async (s) => ({
             ...s,
+            version: Number(storyboardStates.find((state) => Number(state.entityId) === Number(s.id))?.version ?? 0),
             src: s.filePath,
           })),
         ),
         trackList,
+        archivedSharedTracks,
       }),
     );
   },

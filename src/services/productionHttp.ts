@@ -99,6 +99,7 @@ export function createProductionHandlers(db: Knex, getUrl: (path: string) => Pro
       const scriptId = await service.guardStoryboardMutations({ projectId: data.projectId, storyboardIds: [data.id],
         expectedVersions: { [data.id]: data.expectedVersion }, actor, mutate: async (trx, contexts) => {
           const row = contexts[0].storyboard;
+          if (row.trackId) throw new ProductionFlowError("该分镜已关联视频片段，请使用明确的“删除分镜”操作以同步处理轨道和生成记录", 409);
           await trx("o_assets2Storyboard").where({ storyboardId: data.id }).delete();
           await trx("o_storyboard").where({ id: data.id }).delete();
           await removeUnusedFlow(trx, data.projectId, row.flowId);
@@ -114,6 +115,7 @@ export function createProductionHandlers(db: Knex, getUrl: (path: string) => Pro
       const actor = await requireProductionOwner(req, data.projectId, db);
       const scripts = await service.guardStoryboardMutations({ projectId: data.projectId, storyboardIds: data.ids,
         expectedVersions: data.expectedVersions, actor, mutate: async (trx, contexts) => {
+          if (contexts.some(({ storyboard }) => storyboard.trackId)) throw new ProductionFlowError("批量删除包含已关联视频片段的分镜；请使用带轨道版本和操作编号的新删除接口", 409);
           await trx("o_assets2Storyboard").whereIn("storyboardId", data.ids).delete();
           await trx("o_storyboard").whereIn("id", data.ids).delete();
           for (const { storyboard: row } of contexts) {

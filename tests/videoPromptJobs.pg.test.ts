@@ -49,7 +49,8 @@ test("a pending prompt job cannot acknowledge or overwrite after its saved mode/
     const prepared = await prepareVideoPromptJob(f.db, { projectId: f.projectId, scriptId: f.scriptId, trackId: f.secondTrack, model: "fixture:model", mode: "singleImage", info: references, modeIntentSnapshot: { modeIntent: "singleImage", revision: 2 }, idempotencyKey: "pending-prompt-selection-race", expectedVersion: 0 });
     await saveVideoModeIntent(f.db, { projectId: f.projectId, scriptId: f.scriptId, trackId: f.secondTrack, modeIntent: "auto", expectedRevision: 2, idempotencyKey: "prompt-race-mode-new" }, "human:2");
     const completed = await executeVideoPromptJob(f.db, prepared.job.id, async () => "雪璃转身，@图片1 展示海岸远景");
-    assert.equal(completed.state, "failed"); assert.match(completed.reason ?? "", /参考身份已变化/);
+    assert.equal(completed.state, "failed"); assert.match(completed.reason ?? "", /参考身份已变化/); assert.equal(completed.resultPrompt, "雪璃转身，@图片1 展示海岸远景");
+    assert.equal((await f.db("ext_video_prompt_jobs").where({ id: prepared.job.id }).first()).resultPrompt, "雪璃转身，@图片1 展示海岸远景");
     assert.equal((await f.db("o_videoTrack").where({ id: f.secondTrack }).first()).prompt, "");
     const selection = await f.db("ext_video_mode_intents").where({ trackId: f.secondTrack }).first();
     assert.equal(Number(selection.promptReferenceRevision), 0, "late prompt must not acknowledge an unseen selection revision");

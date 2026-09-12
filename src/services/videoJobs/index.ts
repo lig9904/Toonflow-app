@@ -3,6 +3,7 @@ import type { Knex } from "knex";
 import { lockProjectTransaction } from "@/lib/dbTransaction";
 import { insertRowsReturningIds } from "@/lib/insertRows";
 import { renewVideoReferenceConfigLeases } from "@/services/videoReferenceBridge";
+import { assertTrackWritable } from "../storyboardTrackIndependence";
 import getPath from "@/utils/getPath";
 import type { VideoSubmissionOutcome } from "@/lib/persistentVideoAdapter";
 
@@ -704,6 +705,8 @@ export class VideoJobService {
     if (!script) throw new VideoJobError("PROJECT_MISMATCH", "剧集不属于当前项目");
     const track = await trx("o_videoTrack").where({ id: payload.trackId, projectId: payload.projectId, scriptId: payload.scriptId }).first();
     if (!track) throw new VideoJobError("PROJECT_MISMATCH", "视频轨道不属于当前项目或剧集");
+    await assertTrackWritable(trx, payload.projectId, payload.trackId).catch(() => { throw new VideoJobError("CONFLICT", "历史共享轨道已归档，不能继续生成"); });
+    if (Number((await trx("o_storyboard").where({ projectId: payload.projectId, scriptId: payload.scriptId, trackId: payload.trackId }).count("id as count").first())?.count ?? 0) > 1) throw new VideoJobError("CONFLICT", "该历史片段仍包含多条分镜，请先完成一镜一片段迁移");
   }
 
   /** New reservations are blocked by a locked storyboard; accepted jobs keep their normal lifecycle. */

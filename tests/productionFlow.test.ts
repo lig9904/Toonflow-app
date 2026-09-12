@@ -57,20 +57,23 @@ describe("production flow relational source of truth", () => {
     await assert.rejects(addProductionStoryboards(f.db, 200, 10, [newStoryboard()]), (error: unknown) => error instanceof ProductionFlowError && error.status === 404);
   });
 
-  it("adds storyboards, asset links, and one track atomically", async () => {
+  it("adds storyboards, asset links, and one independent track per shot atomically", async () => {
     const ids = await addProductionStoryboards(f.db, 100, 10, [
       newStoryboard({ duration: 3, associateAssetsIds: [1, 2] }),
       newStoryboard({ duration: 4, associateAssetsIds: [1] }),
     ]);
     assert.equal(ids.length, 2);
-    assert.equal(await f.db("o_videoTrack").where({ scriptId: 10, projectId: 100 }).count<{ count: number }>("* as count").first().then((row) => Number(row?.count)), 1);
+    assert.equal(await f.db("o_videoTrack").where({ scriptId: 10, projectId: 100 }).count<{ count: number }>("* as count").first().then((row) => Number(row?.count)), 2);
     const rows = await f.db("o_storyboard").whereIn("id", ids).orderBy("index");
     assert.deepEqual(rows.map((row) => row.index), [0, 1]);
-    assert.equal(rows[0].trackId, rows[1].trackId);
-    assert.equal(Number((await f.db("o_videoTrack").where({ id: rows[0].trackId }).first()).duration), 7);
+    assert.notEqual(rows[0].trackId, rows[1].trackId);
+    assert.deepEqual(await f.db("o_videoTrack").whereIn("id", rows.map((row) => row.trackId)).orderBy("duration").then((tracks) => tracks.map((track) => Number(track.duration))), [3, 4]);
     assert.deepEqual(await f.db("o_assets2Storyboard").whereIn("storyboardId", ids).orderBy(["storyboardId", "assetId"]), [
       { storyboardId: ids[0], assetId: 1 }, { storyboardId: ids[0], assetId: 2 }, { storyboardId: ids[1], assetId: 1 },
     ]);
+    await f.db("ext_creative_state").insert({ entityType: "track", entityId: rows[0].trackId, projectId: 100, version: 4, updatedBy: "human:1", updatedAt: 1 });
+    const flow = await readProductionFlow(f.db, 100, 10, productionUrl);
+    assert.deepEqual(flow.storyboard.map((item) => item.trackVersion), [4, 0]);
   });
 
   it("rolls back all writes when any referenced asset belongs to another project", async () => {
@@ -80,7 +83,7 @@ describe("production flow relational source of truth", () => {
     assert.equal(await f.db("o_videoTrack").count<{ count: number }>("* as count").first().then((row) => Number(row?.count)), 0);
   });
 
-  it("reuses a track without rewriting an existing locked storyboard", async () => {
+  it("creates a new track without rewriting or reusing an existing locked storyboard track", async () => {
     await f.db("o_videoTrack").insert({ id: 7, scriptId: 10, projectId: 100, duration: 5 });
     await f.db("o_storyboard").insert({
       id: 701, projectId: 100, scriptId: 10, index: 4, duration: "5", prompt: "locked original", filePath: "/locked.png",
@@ -93,8 +96,9 @@ describe("production flow relational source of truth", () => {
     assert.equal(original.filePath, "/locked.png");
     assert.equal(original.trackId, 7);
     const added = await f.db("o_storyboard").where({ id: newId }).first();
-    assert.equal(added.trackId, 7);
-    assert.equal(await f.db("o_videoTrack").where({ id: 7 }).first().then((row: any) => Number(row.duration)), 7);
+    assert.notEqual(added.trackId, 7);
+    assert.equal(await f.db("o_videoTrack").where({ id: 7 }).first().then((row: any) => Number(row.duration)), 5);
+    assert.equal(await f.db("o_videoTrack").where({ id: added.trackId }).first().then((row: any) => Number(row.duration)), 2);
     assert.equal((await f.db("ext_entity_state").where({ entityId: 701 }).first()).locked, 1);
   });
 

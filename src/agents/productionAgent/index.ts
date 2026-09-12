@@ -175,7 +175,7 @@ async function createSubAgent(parentCtx: AgentContext) {
   //         "你必须使用如下XML格式写入工作区：\n```",
   //         "拍摄计划：<scriptPlan>内容</scriptPlan>",
   //         "分镜表：<storyboardTable>内容</storyboardTable>",
-  //         "分镜面板：<storyboardItem videoDesc='视频描述' prompt=提示词内容 track='分组' duration='视频推荐时间' associateAssetsIds='[该分镜所需的资产ID列表]'></storyboardItem>",
+  //         "分镜面板：<storyboardItem videoDesc='视频描述' prompt=提示词内容 track='分类标签' duration='视频推荐时间' associateAssetsIds='[该分镜所需的资产ID列表]'></storyboardItem>",
   //         "```",
   //       ].join("\n");
 
@@ -298,14 +298,14 @@ async function createSubAgent(parentCtx: AgentContext) {
 
   //分镜面板写入
   const run_sub_agent_storyboard_panel = tool({
-    description: "运行执行subAgent来完成分镜面板写入相关任务",
+    description: "运行执行subAgent逐镜写入分镜面板，一镜一独立视频生成片段，分类标签不用于合并",
     inputSchema: jsonSchema<{ prompt: string }>(promptInput),
     execute: async ({ prompt }) => {
       const skill = path.join(u.getPath("skills"), "production_execution_storyboard_panel.md");
       const systemPrompt = await fs.promises.readFile(skill, "utf-8");
 
       const addPrompt =
-        "\n你必须使用如下XML格式写入工作区：\n```\n<storyboardItem videoDesc='视频描述' prompt=提示词内容 track='分组' shouldGenerateImage='true/false' duration='视频推荐时间' associateAssetsIds='[该分镜所需的资产ID列表]'></storyboardItem>\n```";
+        "\n每条分镜单独输出一个storyboardItem；一镜一独立视频生成片段，track仅作分类标签，不合并同标签分镜，不累计组时长。你必须使用如下XML格式写入工作区：\n```\n<storyboardItem videoDesc='视频描述' prompt=提示词内容 track='分类标签' shouldGenerateImage='true/false' duration='视频推荐时间' associateAssetsIds='[该分镜所需的资产ID列表]'></storyboardItem>\n```";
 
       return runAgent({
         key: "productionAgent:storyboardPanelAgent",
@@ -324,13 +324,13 @@ async function createSubAgent(parentCtx: AgentContext) {
 
   //分镜表写入
   const run_sub_agent_storyboard_table = tool({
-    description: "运行执行subAgent来完成分镜表构建相关任务",
+    description: "运行执行subAgent构建逐镜分镜表，每行对应独立视频生成片段，分类与剪辑组合不改变每镜独立性",
     inputSchema: jsonSchema<{ prompt: string }>(promptInput),
     execute: async ({ prompt }) => {
       const skill = path.join(u.getPath("skills"), "production_execution_storyboard_table.md");
       const systemPrompt = await fs.promises.readFile(skill, "utf-8");
 
-      const addPrompt = "\n你必须使用如下XML格式写入工作区：\n```\n<storyboardTable>内容</storyboardTable>\n```";
+      const addPrompt = "\n分镜表每条数据行只描述一个镜头，后续逐镜生成独立片段；track/场次/分组只作分类，成片由后期剪辑组合。你必须使用如下XML格式写入工作区：\n```\n<storyboardTable>内容</storyboardTable>\n```";
 
       return runAgent({
         key: "productionAgent:storyboardTableAgent",

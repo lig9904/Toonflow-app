@@ -9,6 +9,6 @@ function sendError(res: Response, error: unknown) { if (error instanceof VideoMo
 export default express.Router().post("/", async (req: Request, res: Response) => {
   try {
     const actor = await requireProductionOwner(req, Number(req.body?.projectId), u.db);
-    return res.send(success(await saveVideoReferences(u.db, req.body, actor.id)));
+    return res.send(success(await saveVideoReferences(u.db, req.body, actor.id, (filePath) => u.oss.getImageBase64(filePath))));
   } catch (error) { return sendError(res, error); }
 });

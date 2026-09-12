@@ -3,6 +3,8 @@ import type { Knex } from "knex";
 import { z } from "zod";
 import { isPostgres, lockProjectTransaction } from "../lib/dbTransaction";
 import { isSeedance2Model, resolveVideoReferenceMediaType } from "../lib/videoPromptReferences";
+import { assertTrackWritable } from "./storyboardTrackIndependence";
+import { readBoundAudioReferences } from "./roleAudioWorkspace";
 
 const INTENTS = "ext_video_mode_intents";
 const RECEIPTS = "ext_video_mode_intent_requests";
@@ -27,7 +29,7 @@ export interface VideoModeResolution {
 }
 
 export class VideoModeResolutionError extends Error {
-  constructor(public readonly code: "VIDEO_MODE_INCOMPATIBLE" | "REFERENCE_UNAVAILABLE" | "MODE_INTENT_CONFLICT" | "IDEMPOTENCY_CONFLICT" | "PROJECT_MISMATCH" | "INVALID_INPUT", message: string, public readonly status = 400) { super(message); this.name = "VideoModeResolutionError"; }
+  constructor(public readonly code: "VIDEO_MODE_INCOMPATIBLE" | "REFERENCE_UNAVAILABLE" | "MODE_INTENT_CONFLICT" | "IDEMPOTENCY_CONFLICT" | "PROJECT_MISMATCH" | "INVALID_INPUT" | "MIGRATION_REQUIRED" | "ARCHIVED_TRACK", message: string, public readonly status = 400) { super(message); this.name = "VideoModeResolutionError"; }
 }
 
 function hash(value: unknown): string { return createHash("sha256").update(stable(value)).digest("hex"); }
@@ -132,17 +134,18 @@ export async function resolveVideoReferencePurposes(db: Knex | Knex.Transaction,
   });
 }
 
-export interface StoredVideoModeSelection { trackId: number; modeIntent: VideoModeIntent; references: Array<z.infer<typeof referenceSchema>>; referencesInitialized: boolean; promptReferenceRevision: number; revision: number; source: "track" | "default" }
+export interface StoredVideoModeSelection { trackId: number; modeIntent: VideoModeIntent; references: Array<z.infer<typeof referenceSchema>>; referencesInitialized: boolean; referenceSourceSnapshot: unknown[]; promptReferenceRevision: number; revision: number; source: "track" | "default" }
 
 export async function ensureVideoModeIntentSchema(db: Knex): Promise<void> {
   await db.transaction(async (trx) => {
     if (isPostgres(trx)) await trx.raw("SELECT pg_advisory_xact_lock(hashtextextended(?,0))", ["toonflow:video-mode-intents"]);
     const fresh = !(await trx.schema.hasTable(INTENTS));
-    if (fresh) await trx.schema.createTable(INTENTS, (table) => { table.bigInteger("projectId"); table.bigInteger("scriptId"); table.bigInteger("trackId"); table.integer("revision").notNullable(); table.text("modeIntent").notNullable(); table.text("references").notNullable().defaultTo("[]"); table.boolean("referencesInitialized").notNullable().defaultTo(false); table.integer("promptReferenceRevision").notNullable().defaultTo(0); table.text("updatedBy").notNullable(); table.bigInteger("updatedAt").notNullable(); table.primary(["projectId", "trackId"]); table.index(["projectId", "scriptId"]); });
+    if (fresh) await trx.schema.createTable(INTENTS, (table) => { table.bigInteger("projectId"); table.bigInteger("scriptId"); table.bigInteger("trackId"); table.integer("revision").notNullable(); table.text("modeIntent").notNullable(); table.text("references").notNullable().defaultTo("[]"); table.boolean("referencesInitialized").notNullable().defaultTo(false); table.text("referenceSourceSnapshot").notNullable().defaultTo("[]"); table.integer("promptReferenceRevision").notNullable().defaultTo(0); table.text("updatedBy").notNullable(); table.bigInteger("updatedAt").notNullable(); table.primary(["projectId", "trackId"]); table.index(["projectId", "scriptId"]); });
     else {
       if (!(await trx.schema.hasColumn(INTENTS, "references"))) await trx.schema.alterTable(INTENTS, (table) => table.text("references").notNullable().defaultTo("[]"));
       if (!(await trx.schema.hasColumn(INTENTS, "referencesInitialized"))) await trx.schema.alterTable(INTENTS, (table) => table.boolean("referencesInitialized").notNullable().defaultTo(false));
       if (!(await trx.schema.hasColumn(INTENTS, "promptReferenceRevision"))) await trx.schema.alterTable(INTENTS, (table) => table.integer("promptReferenceRevision").notNullable().defaultTo(0));
+      if (!(await trx.schema.hasColumn(INTENTS, "referenceSourceSnapshot"))) await trx.schema.alterTable(INTENTS, (table) => table.text("referenceSourceSnapshot").notNullable().defaultTo("[]"));
     }
     if (!(await trx.schema.hasTable(RECEIPTS))) await trx.schema.createTable(RECEIPTS, (table) => { table.text("actorId"); table.bigInteger("projectId"); table.text("idempotencyKey"); table.text("requestHash"); table.text("result"); table.bigInteger("createdAt"); table.primary(["actorId", "projectId", "idempotencyKey"]); });
     if (!(await trx.schema.hasTable(SUBMISSION_CLAIMS))) await trx.schema.createTable(SUBMISSION_CLAIMS, (table) => { table.bigInteger("jobId").primary(); table.bigInteger("projectId").notNullable(); table.bigInteger("scriptId").notNullable(); table.bigInteger("trackId").notNullable(); table.integer("selectionRevision").notNullable(); table.text("snapshotHash").notNullable(); table.bigInteger("claimedAt").notNullable(); table.index(["projectId", "trackId"]); });
@@ -152,9 +155,9 @@ export async function ensureVideoModeIntentSchema(db: Knex): Promise<void> {
 }
 
 export async function readVideoModeIntent(db: Knex | Knex.Transaction, input: { projectId: number; scriptId: number; trackId: number }): Promise<StoredVideoModeSelection> {
-  if (!(await db.schema.hasTable(INTENTS))) return { trackId: input.trackId, modeIntent: "auto", references: [], referencesInitialized: false, promptReferenceRevision: 0, revision: 0, source: "default" };
+  if (!(await db.schema.hasTable(INTENTS))) return { trackId: input.trackId, modeIntent: "auto", references: [], referencesInitialized: false, referenceSourceSnapshot: [], promptReferenceRevision: 0, revision: 0, source: "default" };
   const row = await db(INTENTS).where({ projectId: input.projectId, scriptId: input.scriptId, trackId: input.trackId }).first();
-  return row ? { trackId: input.trackId, modeIntent: normalizeIntent(row.modeIntent), references: z.array(referenceSchema).parse(parseJson(row.references ?? "[]")), referencesInitialized: Boolean(row.referencesInitialized), promptReferenceRevision: Number(row.promptReferenceRevision ?? 0), revision: Number(row.revision), source: "track" } : { trackId: input.trackId, modeIntent: "auto", references: [], referencesInitialized: false, promptReferenceRevision: 0, revision: 0, source: "default" };
+  return row ? { trackId: input.trackId, modeIntent: normalizeIntent(row.modeIntent), references: z.array(referenceSchema).parse(parseJson(row.references ?? "[]")), referencesInitialized: Boolean(row.referencesInitialized), referenceSourceSnapshot: Array.isArray(parseJson(row.referenceSourceSnapshot ?? "[]")) ? parseJson(row.referenceSourceSnapshot ?? "[]") as unknown[] : [], promptReferenceRevision: Number(row.promptReferenceRevision ?? 0), revision: Number(row.revision), source: "track" } : { trackId: input.trackId, modeIntent: "auto", references: [], referencesInitialized: false, referenceSourceSnapshot: [], promptReferenceRevision: 0, revision: 0, source: "default" };
 }
 
 export async function saveVideoModeIntent(db: Knex, raw: unknown, actorId: string) {
@@ -166,15 +169,16 @@ export async function saveVideoModeIntent(db: Knex, raw: unknown, actorId: strin
     await lockProjectTransaction(trx, input.projectId);
     const old = await trx(RECEIPTS).where(receiptKey).first(); if (old) { if (old.requestHash !== requestHash) throw new VideoModeResolutionError("IDEMPOTENCY_CONFLICT", "操作编号已用于不同视频生成方式", 409); return { ...JSON.parse(old.result), reused: true }; }
     const track = await trx("o_videoTrack").where({ id: input.trackId, projectId: input.projectId, scriptId: input.scriptId }).first(); if (!track) throw new VideoModeResolutionError("PROJECT_MISMATCH", "视频片段不属于当前项目或剧集", 403);
+    await assertTrackWritable(trx, input.projectId, input.trackId).catch(() => { throw new VideoModeResolutionError("ARCHIVED_TRACK", "历史共享轨道只能查看", 409); });
     const current = await trx(INTENTS).where({ projectId: input.projectId, trackId: input.trackId }).forUpdate().first(); if (Number(current?.revision ?? 0) !== input.expectedRevision) throw new VideoModeResolutionError("MODE_INTENT_CONFLICT", "视频生成方式已被修改，请刷新", 409);
-    const references = current ? z.array(referenceSchema).parse(parseJson(current.references ?? "[]")) : [], referencesInitialized = Boolean(current?.referencesInitialized);
+    const references = current ? z.array(referenceSchema).parse(parseJson(current.references ?? "[]")) : [], referencesInitialized = Boolean(current?.referencesInitialized), referenceSourceSnapshot = current ? parseJson(current.referenceSourceSnapshot ?? "[]") : [];
     const promptReferenceRevision = Number(current?.promptReferenceRevision ?? 0), result = { trackId: input.trackId, modeIntent, references, referencesInitialized, promptReferenceRevision, revision: input.expectedRevision + 1 };
-    await trx(INTENTS).insert({ projectId: input.projectId, scriptId: input.scriptId, trackId: input.trackId, revision: result.revision, modeIntent: JSON.stringify(modeIntent), references: JSON.stringify(references), referencesInitialized, promptReferenceRevision, updatedBy: actorId, updatedAt: Date.now() }).onConflict(["projectId", "trackId"]).merge();
+    await trx(INTENTS).insert({ projectId: input.projectId, scriptId: input.scriptId, trackId: input.trackId, revision: result.revision, modeIntent: JSON.stringify(modeIntent), references: JSON.stringify(references), referencesInitialized, referenceSourceSnapshot: JSON.stringify(referenceSourceSnapshot), promptReferenceRevision, updatedBy: actorId, updatedAt: Date.now() }).onConflict(["projectId", "trackId"]).merge();
     await trx(RECEIPTS).insert({ ...receiptKey, requestHash, result: JSON.stringify(result), createdAt: Date.now() }); return { ...result, reused: false };
   });
 }
 
-export async function saveVideoReferences(db: Knex, raw: unknown, actorId: string) {
+export async function saveVideoReferences(db: Knex, raw: unknown, actorId: string, hashSource?: (filePath: string) => Promise<string>) {
   await ensureVideoModeIntentSchema(db);
   const input = z.object({ projectId: z.number().int().positive(), scriptId: z.number().int().positive(), trackId: z.number().int().positive(), references: z.array(referenceSchema).max(100), expectedRevision: z.number().int().nonnegative(), idempotencyKey: z.string().min(8).max(150).regex(/^[\w:.-]+$/) }).strict().parse(raw);
   const requestHash = hash(input), receiptKey = { actorId, projectId: input.projectId, idempotencyKey: input.idempotencyKey };
@@ -183,10 +187,46 @@ export async function saveVideoReferences(db: Knex, raw: unknown, actorId: strin
     await lockProjectTransaction(trx, input.projectId);
     const old = await trx(RECEIPTS).where(receiptKey).first(); if (old) { if (old.requestHash !== requestHash) throw new VideoModeResolutionError("IDEMPOTENCY_CONFLICT", "操作编号已用于不同视频参考素材", 409); return { ...JSON.parse(old.result), reused: true }; }
     const track = await trx("o_videoTrack").where({ id: input.trackId, projectId: input.projectId, scriptId: input.scriptId }).first(); if (!track) throw new VideoModeResolutionError("PROJECT_MISMATCH", "视频片段不属于当前项目或剧集", 403);
+    await assertTrackWritable(trx, input.projectId, input.trackId).catch(() => { throw new VideoModeResolutionError("ARCHIVED_TRACK", "历史共享轨道只能查看", 409); });
     const current = await trx(INTENTS).where({ projectId: input.projectId, trackId: input.trackId }).forUpdate().first(); if (Number(current?.revision ?? 0) !== input.expectedRevision) throw new VideoModeResolutionError("MODE_INTENT_CONFLICT", "视频生成方式或参考素材已被修改，请刷新", 409);
     const references = await resolveVideoReferencePurposes(trx, { ...input, references: input.references });
+    const referenceSourceSnapshot = await captureReferenceSources(trx, { ...input, references }, hashSource);
     const modeIntent = current ? normalizeIntent(current.modeIntent) : "auto", promptReferenceRevision = Number(current?.promptReferenceRevision ?? 0), result = { trackId: input.trackId, modeIntent, references, referencesInitialized: true, promptReferenceRevision, revision: input.expectedRevision + 1 };
-    await trx(INTENTS).insert({ projectId: input.projectId, scriptId: input.scriptId, trackId: input.trackId, revision: result.revision, modeIntent: JSON.stringify(modeIntent), references: JSON.stringify(references), referencesInitialized: true, promptReferenceRevision, updatedBy: actorId, updatedAt: Date.now() }).onConflict(["projectId", "trackId"]).merge();
+    await trx(INTENTS).insert({ projectId: input.projectId, scriptId: input.scriptId, trackId: input.trackId, revision: result.revision, modeIntent: JSON.stringify(modeIntent), references: JSON.stringify(references), referencesInitialized: true, referenceSourceSnapshot: JSON.stringify(referenceSourceSnapshot), promptReferenceRevision, updatedBy: actorId, updatedAt: Date.now() }).onConflict(["projectId", "trackId"]).merge();
+    await trx(RECEIPTS).insert({ ...receiptKey, requestHash, result: JSON.stringify(result), createdAt: Date.now() }); return { ...result, reused: false };
+  });
+}
+
+export async function reloadStoryboardTrackReferences(db: Knex, raw: unknown, actorId: string, hashSource?: (filePath: string) => Promise<string>) {
+  await ensureVideoModeIntentSchema(db);
+  const input = z.object({ projectId: z.number().int().positive(), scriptId: z.number().int().positive(), trackId: z.number().int().positive(), storyboardId: z.number().int().positive(), expectedTrackVersion: z.number().int().nonnegative(), expectedStoryboardVersion: z.number().int().nonnegative(), expectedModeIntentRevision: z.number().int().nonnegative(), idempotencyKey: z.string().min(8).max(150).regex(/^[\w:.-]+$/) }).strict().parse(raw);
+  const requestHash = hash({ operation: "reloadStoryboardTrackReferences", ...input }), receiptKey = { actorId, projectId: input.projectId, idempotencyKey: input.idempotencyKey };
+  const replay = await db(RECEIPTS).where(receiptKey).first(); if (replay) { if (replay.requestHash !== requestHash) throw new VideoModeResolutionError("IDEMPOTENCY_CONFLICT", "操作编号已用于不同重新载入请求", 409); return { ...JSON.parse(replay.result), reused: true }; }
+  return db.transaction(async (trx) => {
+    await lockProjectTransaction(trx, input.projectId); const oldReceipt = await trx(RECEIPTS).where(receiptKey).first(); if (oldReceipt) { if (oldReceipt.requestHash !== requestHash) throw new VideoModeResolutionError("IDEMPOTENCY_CONFLICT", "操作编号已用于不同重新载入请求", 409); return { ...JSON.parse(oldReceipt.result), reused: true }; }
+    const track = await trx("o_videoTrack").where({ id: input.trackId, projectId: input.projectId, scriptId: input.scriptId }).first(); if (!track) throw new VideoModeResolutionError("PROJECT_MISMATCH", "视频片段不属于当前项目或剧集", 403);
+    await assertTrackWritable(trx, input.projectId, input.trackId).catch(() => { throw new VideoModeResolutionError("ARCHIVED_TRACK", "历史共享轨道只能查看", 409); });
+    const boards = await trx("o_storyboard").where({ trackId: input.trackId }).orderBy("id");
+    if (boards.some((board) => Number(board.projectId) !== input.projectId || Number(board.scriptId) !== input.scriptId)) throw new VideoModeResolutionError("PROJECT_MISMATCH", "轨道存在跨项目或跨剧集分镜引用", 403);
+    if (boards.length !== 1 || Number(boards[0].id) !== input.storyboardId) throw new VideoModeResolutionError("MIGRATION_REQUIRED", "重新载入仅支持已独立的一镜一片段", 409);
+    const trackVersion = await trx.schema.hasTable("ext_creative_state") ? Number((await trx("ext_creative_state").where({ projectId: input.projectId, entityType: "track", entityId: input.trackId }).first("version"))?.version ?? 0) : 0;
+    const boardState = await trx("ext_entity_state").where({ projectId: input.projectId, entityType: "storyboard", entityId: input.storyboardId }).first();
+    if (trackVersion !== input.expectedTrackVersion || Number(boardState?.version ?? 0) !== input.expectedStoryboardVersion) throw new VideoModeResolutionError("MODE_INTENT_CONFLICT", "分镜或片段已变化，请刷新后重新载入", 409);
+    if (boardState?.locked) throw new VideoModeResolutionError("MODE_INTENT_CONFLICT", "锁定分镜不能重新载入视频参考", 423);
+    if (await trx.schema.hasTable("ext_video_prompt_jobs") && await trx("ext_video_prompt_jobs").where({ projectId: input.projectId, scriptId: input.scriptId, trackId: input.trackId }).whereIn("state", ["queued", "running"]).first()) throw new VideoModeResolutionError("MODE_INTENT_CONFLICT", "视频提示词仍在生成，不能替换参考素材", 409);
+    const current = await trx(INTENTS).where({ projectId: input.projectId, scriptId: input.scriptId, trackId: input.trackId }).forUpdate().first();
+    if (Number(current?.revision ?? 0) !== input.expectedModeIntentRevision) throw new VideoModeResolutionError("MODE_INTENT_CONFLICT", "视频生成方式或参考素材已变化，请刷新", 409);
+    const linked = await trx("o_assets2Storyboard as link").join("o_assets as asset", "asset.id", "link.assetId").leftJoin("o_image as image", "image.id", "asset.imageId").where({ "link.storyboardId": input.storyboardId, "asset.projectId": input.projectId }).orderBy("link.id").select("asset.id", "asset.assetsId", "asset.type", "image.type as storedFileType", "image.filePath");
+    const visual = linked.filter((row) => row.filePath).map((row) => { const fileType = resolveVideoReferenceMediaType(row.storedFileType, row.type, row.filePath); return { id: Number(row.id), sources: "assets" as const, fileType, purpose: fileType === "video" ? "motion_reference" as const : fileType === "audio" ? "audio_reference" as const : row.type === "role" ? "identity_reference" as const : "style_reference" as const }; });
+    const roleIds = [...new Set(linked.filter((row) => row.type === "role").flatMap((row) => [Number(row.id), Number(row.assetsId)]).filter((id) => Number.isSafeInteger(id) && id > 0))];
+    const audio = roleIds.length ? await readBoundAudioReferences(trx as unknown as Knex, input.projectId, roleIds) : [];
+    const nextReferences = [...(boards[0].filePath ? [{ id: input.storyboardId, sources: "storyboard" as const, fileType: "image" as const, purpose: "first_frame" as const }] : []), ...visual, ...audio.map((row) => ({ id: row.id, sources: "assets" as const, fileType: "audio" as const, purpose: "audio_reference" as const }))];
+    const references = [...new Map(nextReferences.map((reference) => [`${reference.sources}:${reference.id}`, reference])).values()];
+    const referenceSourceSnapshot = await captureReferenceSources(trx, { ...input, references }, hashSource), previous = current ? z.array(referenceSchema).parse(parseJson(current.references ?? "[]")) : [], previousSources = current ? parseJson(current.referenceSourceSnapshot ?? "[]") : [];
+    const changed = !Boolean(current?.referencesInitialized) || stable(previous) !== stable(references) || stable(previousSources) !== stable(referenceSourceSnapshot), revision = input.expectedModeIntentRevision + (changed ? 1 : 0);
+    const modeIntent = current ? normalizeIntent(current.modeIntent) : "auto", promptReferenceRevision = Number(current?.promptReferenceRevision ?? 0);
+    if (changed) await trx(INTENTS).insert({ projectId: input.projectId, scriptId: input.scriptId, trackId: input.trackId, revision, modeIntent: JSON.stringify(modeIntent), references: JSON.stringify(references), referencesInitialized: true, referenceSourceSnapshot: JSON.stringify(referenceSourceSnapshot), promptReferenceRevision, updatedBy: actorId, updatedAt: Date.now() }).onConflict(["projectId", "trackId"]).merge();
+    const result = { trackId: input.trackId, storyboardId: input.storyboardId, modeIntent, references, referencesInitialized: true, revision, promptReferenceRevision, changed, needsReview: changed && Boolean(String(track.prompt ?? "").trim()) && promptReferenceRevision !== revision };
     await trx(RECEIPTS).insert({ ...receiptKey, requestHash, result: JSON.stringify(result), createdAt: Date.now() }); return { ...result, reused: false };
   });
 }
@@ -196,7 +236,7 @@ export async function acknowledgeVideoPromptReferences(db: Knex | Knex.Transacti
   if (!row) {
     if (input.expectedRevision === undefined) return null;
     if (input.expectedRevision !== 0) throw new VideoModeResolutionError("MODE_INTENT_CONFLICT", "视频参考素材已变化，请刷新提示词后再保存", 409);
-    await db(INTENTS).insert({ projectId: input.projectId, scriptId: input.scriptId, trackId: input.trackId, revision: 0, modeIntent: JSON.stringify("auto"), references: "[]", referencesInitialized: false, promptReferenceRevision: 0, updatedBy: actorId, updatedAt: Date.now() });
+    await db(INTENTS).insert({ projectId: input.projectId, scriptId: input.scriptId, trackId: input.trackId, revision: 0, modeIntent: JSON.stringify("auto"), references: "[]", referencesInitialized: false, referenceSourceSnapshot: "[]", promptReferenceRevision: 0, updatedBy: actorId, updatedAt: Date.now() });
     return 0;
   }
   const revision = Number(row.revision);
@@ -209,6 +249,8 @@ export async function acknowledgeVideoPromptReferences(db: Knex | Knex.Transacti
 export async function resolveStoredVideoMode(db: Knex, input: { projectId: number; scriptId: number; trackId: number; model: string; capabilities: VideoModeCapabilities; references: unknown; expectedIntentRevision?: number; legacyMode?: unknown }): Promise<VideoModeResolution> {
   await ensureVideoModeIntentSchema(db);
   if (!(await db("o_videoTrack").where({ id: input.trackId, projectId: input.projectId, scriptId: input.scriptId }).first("id"))) throw new VideoModeResolutionError("PROJECT_MISMATCH", "视频片段不属于当前项目或剧集", 403);
+  await assertTrackWritable(db, input.projectId, input.trackId).catch(() => { throw new VideoModeResolutionError("ARCHIVED_TRACK", "历史共享轨道只能查看", 409); });
+  if (Number((await db("o_storyboard").where({ projectId: input.projectId, scriptId: input.scriptId, trackId: input.trackId }).count("id as count").first())?.count ?? 0) > 1) throw new VideoModeResolutionError("MIGRATION_REQUIRED", "该历史片段仍包含多条分镜，请先完成一镜一片段迁移", 409);
   const saved = await readVideoModeIntent(db, input);
   if (input.expectedIntentRevision !== undefined && input.expectedIntentRevision !== saved.revision) throw new VideoModeResolutionError("MODE_INTENT_CONFLICT", "视频生成方式已变化，请刷新", 409);
   const modeIntent = saved.source === "default" && input.expectedIntentRevision === undefined && input.legacyMode !== undefined ? normalizeIntent(input.legacyMode) : saved.modeIntent;

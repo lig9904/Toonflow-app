@@ -10,6 +10,7 @@ import type { AiType } from "../../utils/ai";
 import type { StructuredModelRequest, StructuredScriptModel } from "./scriptExecutor";
 import { createAssetExtractionHelper } from "./assetExtraction";
 import { getCreativeState } from "../creativeWorkspace";
+import { archivedTrackIds } from "../storyboardTrackIndependence";
 import pLimit from "p-limit";
 import { builtinThinkLevelFromIntent, hasIndependentProductionOutput, hasUnlimitedMediaBudget } from "./contracts";
 import { productionActionLabels, productionDecisionPrompt, productionStageContract, explicitProductionTextScope, isExplicitVideoOnlyRequest, explicitVideoSettings } from "./productionPrompts";
@@ -172,7 +173,9 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
       return { id: projectId, scriptId, scriptVersion: scriptVersion.version, name: row.name ?? "", directorManual: row.directorManual ?? "", directorGuide: deps.directorGuide?.(row.directorManual ?? "") ?? "", artStyle: row.artStyle ?? "", visualStyleGuide: deps.visualStyleGuide?.(row.artStyle ?? "") ?? "", visualStyleGuideConfigured: Boolean(deps.visualStyleGuide), imageModel: row.imageModel ?? "", videoModel: row.videoModel ?? row.videoModelKey ?? "", imageQuality: row.imageQuality ?? "1K", videoRatio: row.videoRatio ?? "16:9", videoMode: row.mode ?? row.videoMode, videoResolution: row.videoResolution ?? row.resolution, audio: row.generateAudio ?? row.audio, script: episode.content ?? "" };
     });
     const initialTracks = await ctx.step(`production.tracks:r${revision}`, {projectId,scriptId}, async () => {
-      const tracks = await deps.db("o_videoTrack").where({projectId,scriptId}).select("id","prompt");
+      const archived = await archivedTrackIds(deps.db,projectId,scriptId);
+      const trackQuery = deps.db("o_videoTrack").where({projectId,scriptId}); if(archived.length)trackQuery.whereNotIn("id",archived);
+      const tracks = await trackQuery.select("id","prompt");
       return Promise.all(tracks.map(async track => ({ id:Number(track.id),prompt:String(track.prompt??""),version:(await getCreativeState(deps.db,"track",Number(track.id),projectId)).version })));
     });
     const assertSourceCurrent = async (db: Knex | Knex.Transaction, checkMedia = false) => {
@@ -357,6 +360,7 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
           if (existingIds.length) {
             const states = new ProductionStateService(trx as unknown as Knex);
             await states.guardStoryboardMutations({ projectId, storyboardIds: existingIds, expectedVersions: Object.fromEntries(existingIds.map((id) => [id, Number(knownStoryboards.get(id)!.collaboration?.version ?? 0)])), actor: { id: `agent:${run.id}`, kind: "agent" }, mutate: async (guardedTrx) => {
+              const affectedTrackIds = new Set<number>();
               for (const item of storyboard.items.filter((candidate) => candidate.id != null)) {
                 const assetIds = [...new Set(item.associateAssetsIds)];
                 // Existing storyboard IDs are the stable identity. Preserve
@@ -367,9 +371,14 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
                 const existing = knownStoryboards.get(Number(item.id));
                 const existingTrackId = Number(existing?.trackId);
                 const trackId = Number.isSafeInteger(existingTrackId) && existingTrackId > 0 ? existingTrackId : existing?.trackId ?? null;
+                if (Number.isSafeInteger(Number(trackId)) && Number(trackId) > 0) affectedTrackIds.add(Number(trackId));
                 await guardedTrx("o_storyboard").where({ id: item.id, projectId, scriptId }).update({ prompt: item.prompt, videoDesc: item.videoDesc, duration: String(item.duration), track: item.track, trackId, shouldGenerateImage: item.shouldGenerateImage });
                 await guardedTrx("o_assets2Storyboard").where({ storyboardId: item.id }).del();
                 if (assetIds.length) await guardedTrx("o_assets2Storyboard").insert(assetIds.map((assetId) => ({ assetId, storyboardId: item.id })));
+              }
+              for (const trackId of affectedTrackIds) {
+                const total = await guardedTrx("o_storyboard").where({ projectId, scriptId, trackId }).sum("duration as total").first();
+                await guardedTrx("o_videoTrack").where({ id: trackId, projectId, scriptId }).update({ duration: Number(total?.total) || 0 });
               }
               return undefined;
             }});

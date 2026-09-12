@@ -81,3 +81,17 @@ test("HTTP lock protects edits, image replacement and atomic batch deletion", as
     assert.equal(await f.db("o_storyboard").where({ id: 101 }).first(), undefined);
   } finally { await f.close(); }
 });
+
+test("legacy canvas deletion endpoints refuse linked tracks without the new track CAS and idempotency contract", async () => {
+  const f = await fixture();
+  try {
+    const [track] = await f.db("o_videoTrack").insert({ projectId: 100, scriptId: 10, duration: 2 }).returning("id");
+    await f.db("o_storyboard").where({ id: 101 }).update({ trackId: Number(track.id) });
+    const state = await f.db("ext_entity_state").where({ projectId: 100, entityType: "storyboard", entityId: 101 }).first();
+    const expectedVersion = Number(state?.version ?? 0);
+    assert.equal((await f.post("removeFrame", { projectId: 100, id: 101, expectedVersion })).status, 409);
+    assert.equal((await f.post("batchDelete", { projectId: 100, ids: [101], expectedVersions: { 101: expectedVersion } })).status, 409);
+    assert.ok(await f.db("o_storyboard").where({ id: 101 }).first());
+    assert.ok(await f.db("o_videoTrack").where({ id: Number(track.id) }).first());
+  } finally { await f.close(); }
+});

@@ -180,7 +180,7 @@ export default (toolCpnfig: ToolConfig) => {
       },
     }),
     add_flowData_storyboard: tool({
-      description: "新增分镜面板到工作区",
+      description: "新增一条分镜到工作区，并创建该镜独立的视频生成片段；批量逐镜调用，不因分类标签相同合并",
       inputSchema: jsonSchema<{
         videoDesc: string;
         prompt: string | null;
@@ -193,8 +193,8 @@ export default (toolCpnfig: ToolConfig) => {
           .object({
             videoDesc: z.string().describe("画面描述、场景、关联资产名称、时长、景别、运镜、角色动作、情绪、光影氛围、台词、音效、关联资产ID"),
             prompt: z.string().nullable().describe("分镜图片提示词"),
-            track: z.string().describe("分组"),
-            duration: z.number().describe("视频推荐时间"),
+            track: z.string().describe("分类标签，仅用于分类；相同或缺省标签不合并分镜，每镜独立片段"),
+            duration: z.number().describe("当前这一镜的视频时长（秒），不取场次或分组累计时长"),
             associateAssetsIds: z.array(z.number()).nullable().describe("该分镜所需的资产ID列表"),
             shouldGenerateImage: z.enum(["true", "false"]).describe("是否需要生成分镜图片"),
           })

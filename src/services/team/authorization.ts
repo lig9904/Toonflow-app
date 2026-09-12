@@ -75,6 +75,7 @@ add("POST", ["/api/production/assets/batchGenerateAssetsImage"], project("edit",
 add("POST", ["/api/production/storyboard/batchGenerateImage"], project("edit", "projectId", [{ table: "o_script", field: "scriptId" }, { table: "o_storyboard", field: "storyboardIds", many: true }]));
 add("POST", ["/api/production/workbench/checkVideoPrompt"], project("read", "projectId", [{ table: "o_script", field: "scriptId" }, { table: "o_videoTrack", field: "trackIds", many: true }]));
 add("POST", ["/api/production/workbench/resolveVideoMode"], project("read", "projectId", [{ table: "o_script", field: "scriptId" }, { table: "o_videoTrack", field: "trackId" }]));
+add("POST", ["/api/production/workbench/planIndependentTracks"], project("read", "projectId", [{ table: "o_script", field: "scriptId", optional: true }]));
 add("POST", ["/api/production/workbench/checkVideoStateList"], project("read", "projectId", [{ table: "o_script", field: "scriptId" }, { table: "o_video", field: "videoIds", many: true }]));
 
 add("POST", ["/api/general/getSingleProject"], resource("read", "o_project", "id"));
@@ -102,6 +103,10 @@ add("POST", ["/api/production/storyboard/pollingImage"], resource("read", "o_sto
 add("POST", ["/api/production/storyboard/getState"], project("read", "projectId", [{ table: "o_storyboard", field: "id" }]));
 add("POST", ["/api/production/storyboard/editStoryboardInfo", "/api/production/storyboard/removeFrame", "/api/production/storyboard/updateStoryboardUrl"], project("edit", "projectId", [{ table: "o_storyboard", field: "id" }]));
 add("POST", ["/api/production/storyboard/batchDelete"], project("delete", "projectId", [{ table: "o_storyboard", field: "ids", many: true }]));
+// Resource ownership is checked transactionally by the deletion service. A
+// project-only precheck is required so a completed deletion can replay its
+// actor/project-scoped receipt after the storyboard and track no longer exist.
+add("POST", ["/api/production/storyboard/deleteStoryboardTracks"], project("delete", "projectId"));
 add("POST", ["/api/production/storyboard/setLock", "/api/production/storyboard/setReviewState"], project("review", "projectId", [{ table: "o_storyboard", field: "id" }]));
 add("POST", ["/api/production/workbench/delVideo"], project("delete", "projectId"));
 add("POST", ["/api/production/workbench/updateVideoDuration", "/api/production/workbench/updateVideoPrompt"], resource("edit", "o_videoTrack", "id"));
@@ -135,6 +140,10 @@ add("POST", ["/api/production/workbench/getEditTimeline"], project("read", "proj
 add("POST", ["/api/production/workbench/saveEditTimeline"], project("edit", "projectId", [{ table: "o_script", field: "scriptId" }]));
 add("POST", ["/api/production/workbench/generateVideoPrompt"], project("edit", "projectId", [{ table: "o_script", field: "scriptId" }, { table: "o_videoTrack", field: "trackId" }]));
 add("POST", ["/api/production/workbench/setVideoModeIntent", "/api/production/workbench/setVideoReferences"], project("edit", "projectId", [{ table: "o_script", field: "scriptId" }, { table: "o_videoTrack", field: "trackId" }]));
+add("POST", ["/api/production/workbench/reloadStoryboardTrackReferences"], project("edit", "projectId", [{ table: "o_script", field: "scriptId" }, { table: "o_videoTrack", field: "trackId" }, { table: "o_storyboard", field: "storyboardId" }]));
+add("POST", ["/api/production/workbench/applyIndependentTracks"], project("edit", "projectId", [{ table: "o_script", field: "scriptId", optional: true }]));
+add("POST", ["/api/production/workbench/deleteStoryboardTrack"], project("delete", "projectId", [{ table: "o_script", field: "scriptId" }]));
+add("POST", ["/api/production/workbench/clearTrackVideos"], project("delete", "projectId", [{ table: "o_script", field: "scriptId" }, { table: "o_videoTrack", field: "trackId" }]));
 add("POST", ["/api/production/workbench/batchGeneratePrompt"], project("edit", "projectId", [{ table: "o_script", field: "scriptId" }, { table: "o_videoTrack", field: "trackData", many: true, nestedIdField: "trackId" }]));
 add("POST", ["/api/production/saveFlowData"], project("edit", "projectId", [{ table: "o_script", field: "episodesId" }]));
 add("POST", ["/api/production/editImage/uploadImage", "/api/production/workbench/addTrack", "/api/production/workbench/batchGenerateVideo", "/api/production/workbench/generateVideo", "/api/production/workbench/retryVideoDownload"], project("edit", "projectId", [{ table: "o_script", field: "scriptId" }]));

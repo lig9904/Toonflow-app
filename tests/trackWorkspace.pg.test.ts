@@ -4,7 +4,10 @@ import { createPostgresFixture, migratePostgresFixture } from "../src/lib/postgr
 import { ensureTeamSchema, requireProjectAccess } from "../src/services/team";
 import { ensureVideoJobsSchema, VideoJobService, type VideoJobPayload, type VideoTaskProvider } from "../src/services/videoJobs";
 import {
+  batchDeleteStoryboardTracks,
   createTrack,
+  clearTrackVideos,
+  deleteStoryboardTrack,
   deleteTrack,
   deleteTrackVideo,
   ensureTrackWorkspaceSchema,
@@ -14,6 +17,7 @@ import {
   updateTrackDuration,
   updateTrackPrompt,
 } from "../src/services/trackWorkspace";
+import { ensureVideoModeIntentSchema } from "../src/services/videoModeResolution";
 
 const options = { skip: !process.env.TOONFLOW_TEST_DATABASE_URL };
 const editorActor = { id: "human:2", kind: "human" as const };
@@ -264,4 +268,64 @@ test("track deletion refuses storyboard references and uncertain jobs, then atom
     jobs.stop();
     await f.destroy();
   }
+});
+
+test("clear video results preserves prompt state, references and images, and its idempotency key cannot replay as delete", options, async () => {
+  const f = await fixture();
+  try {
+    await ensureVideoModeIntentSchema(f.db);
+    await f.db("o_videoTrack").where({ id: f.trackId }).update({ videoId: f.goodId, selectVideoId: f.goodId, prompt: "人工提示词", state: "已完成", reason: "保留复核说明" });
+    await f.db("ext_video_mode_intents").insert({ projectId: f.projectId, scriptId: f.scriptId, trackId: f.trackId, revision: 2, modeIntent: JSON.stringify("auto"), references: JSON.stringify([]), referencesInitialized: true, promptReferenceRevision: 1, updatedBy: "human:2", updatedAt: 1 });
+    const cleared = await clearTrackVideos(f.db, { projectId: f.projectId, scriptId: f.scriptId, trackId: f.trackId, expectedTrackVersion: 0, idempotencyKey: "clear-videos-same-key" }, editorActor);
+    assert.equal(cleared.clearedVideoCount, 2); const track = await f.db("o_videoTrack").where({ id: f.trackId }).first();
+    assert.equal(track.videoId, null); assert.equal(track.selectVideoId, null); assert.equal(track.prompt, "人工提示词"); assert.equal(track.state, "已完成"); assert.equal(track.reason, "保留复核说明");
+    assert.equal((await f.db("ext_video_mode_intents").where({ trackId: f.trackId }).first()).revision, 2); assert.equal(await f.db("o_video").where({ videoTrackId: f.trackId }).first(), undefined);
+    await assert.rejects(deleteTrack(f.db, { projectId: f.projectId, scriptId: f.scriptId, trackId: f.trackId, expectedVersion: 1, idempotencyKey: "clear-videos-same-key" }, editorActor), (error: any) => error.code === "IDEMPOTENCY_CONFLICT");
+  } finally { await f.destroy(); }
+});
+
+test("delete storyboard uses board and track CAS and removes one linked card without deleting NAS history", options, async () => {
+  const f = await fixture();
+  try {
+    const [board] = await f.db("o_storyboard").insert({ projectId: f.projectId, scriptId: f.scriptId, trackId: f.trackId, index: 0, duration: "2", prompt: "shot", filePath: "/keep-on-nas.png" }).returning("id");
+    const boardVersion = Number((await f.db("ext_entity_state").where({ entityType: "storyboard", entityId: Number(board.id), projectId: f.projectId }).first())?.version ?? 0);
+    const deleted = await deleteStoryboardTrack(f.db, { projectId: f.projectId, scriptId: f.scriptId, trackId: f.trackId, storyboardId: Number(board.id), expectedTrackVersion: 0, expectedStoryboardVersion: boardVersion, idempotencyKey: "delete-one-storyboard" }, editorActor);
+    assert.equal(deleted.deletedVideoCount, 2); assert.match(deleted.message, /NAS/); assert.equal(await f.db("o_storyboard").where({ id: board.id }).first(), undefined); assert.equal(await f.db("o_videoTrack").where({ id: f.trackId }).first(), undefined); assert.equal(await f.db("o_video").where({ videoTrackId: f.trackId }).first(), undefined);
+    const replay = await deleteStoryboardTrack(f.db, { projectId: f.projectId, scriptId: f.scriptId, trackId: f.trackId, storyboardId: Number(board.id), expectedTrackVersion: 0, expectedStoryboardVersion: boardVersion, idempotencyKey: "delete-one-storyboard" }, editorActor); assert.equal(replay.reused, true);
+  } finally { await f.destroy(); }
+});
+
+test("batch storyboard deletion validates every linked and orphan item before one atomic commit", options, async () => {
+  const f = await fixture();
+  try {
+    const [secondTrack] = await f.db("o_videoTrack").insert({ projectId: f.projectId, scriptId: f.scriptId, duration: 3 }).returning("id");
+    const [linkedOne] = await f.db("o_storyboard").insert({ projectId: f.projectId, scriptId: f.scriptId, trackId: f.trackId, index: 0, duration: "2", prompt: "one", filePath: "/keep-one.png" }).returning("id");
+    const [linkedTwo] = await f.db("o_storyboard").insert({ projectId: f.projectId, scriptId: f.scriptId, trackId: Number(secondTrack.id), index: 1, duration: "3", prompt: "two", filePath: "/keep-two.png" }).returning("id");
+    const [orphan] = await f.db("o_storyboard").insert({ projectId: f.projectId, scriptId: f.scriptId, trackId: null, index: 2, duration: "1", prompt: "orphan", filePath: "/keep-orphan.png" }).returning("id");
+    const items = [
+      { scriptId: f.scriptId, storyboardId: Number(linkedOne.id), trackId: f.trackId, expectedTrackVersion: 0, expectedStoryboardVersion: 0 },
+      { scriptId: f.scriptId, storyboardId: Number(linkedTwo.id), trackId: Number(secondTrack.id), expectedTrackVersion: 0, expectedStoryboardVersion: 0 },
+      { scriptId: f.scriptId, storyboardId: Number(orphan.id), trackId: null, expectedTrackVersion: null, expectedStoryboardVersion: 0 },
+    ];
+
+    await assert.rejects(batchDeleteStoryboardTracks(f.db, {
+      projectId: f.projectId,
+      items: items.map((item, index) => index === 1 ? { ...item, expectedStoryboardVersion: 1 } : item),
+      idempotencyKey: "batch-storyboard-stale",
+    }, editorActor), (error: any) => error instanceof TrackWorkspaceError && error.code === "VERSION_CONFLICT");
+    assert.ok(await f.db("o_storyboard").where({ id: linkedOne.id }).first(), "an early valid item must roll back when a later item fails validation");
+    assert.ok(await f.db("o_videoTrack").where({ id: f.trackId }).first());
+    assert.equal(await f.db("o_video").where({ videoTrackId: f.trackId }).count("id as count").first().then((row) => Number(row?.count)), 2);
+
+    const deleted = await batchDeleteStoryboardTracks(f.db, { projectId: f.projectId, items, idempotencyKey: "batch-storyboard-success" }, editorActor);
+    assert.equal(deleted.deletedStoryboardCount, 3);
+    assert.equal(deleted.deletedTrackCount, 2);
+    assert.equal(deleted.items.reduce((sum: number, item: any) => sum + item.deletedVideoCount, 0), 2);
+    assert.equal(await f.db("o_storyboard").whereIn("id", [linkedOne.id, linkedTwo.id, orphan.id]).first(), undefined);
+    assert.equal(await f.db("o_videoTrack").whereIn("id", [f.trackId, secondTrack.id]).first(), undefined);
+    assert.equal(await f.db("o_video").where({ videoTrackId: f.trackId }).first(), undefined);
+    const replay = await batchDeleteStoryboardTracks(f.db, { projectId: f.projectId, items: [...items].reverse(), idempotencyKey: "batch-storyboard-success" }, editorActor);
+    assert.equal(replay.reused, true);
+    assert.equal(replay.deletedStoryboardCount, 3);
+  } finally { await f.destroy(); }
 });

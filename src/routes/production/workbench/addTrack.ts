@@ -13,7 +13,7 @@ function userId(req: Request): number {
 function sendError(res: Response, error: unknown) {
   if (error instanceof TeamSecurityError) return res.status(error.status).send({ code: error.code, message: error.message });
   if (error instanceof TrackWorkspaceError) {
-    const status = { INVALID_INPUT: 400, NOT_FOUND: 404, PROJECT_MISMATCH: 403, VERSION_CONFLICT: 409, IDEMPOTENCY_CONFLICT: 409, LOCKED: 423, ACTIVE_JOB: 409 }[error.code];
+    const status = { INVALID_INPUT: 400, NOT_FOUND: 404, PROJECT_MISMATCH: 403, VERSION_CONFLICT: 409, IDEMPOTENCY_CONFLICT: 409, LOCKED: 423, ACTIVE_JOB: 409, MIGRATION_REQUIRED: 409 }[error.code];
     return res.status(status).send({ code: error.code, message: error.message });
   }
   return res.status(500).send({ code: "TRACK_CREATE_FAILED", message: "视频轨道创建失败" });

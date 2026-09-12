@@ -27,8 +27,10 @@ export async function readProductionFlow(db: Knex, projectId: number, scriptId: 
     const links = await trx("o_assets2Storyboard").whereIn("storyboardId", storyboards.map((row) => row.id)).orderBy(isPostgres(trx) ? "id" : "rowid");
     const states = await trx("ext_entity_state").where({ projectId, entityType: "storyboard" })
       .whereIn("entityId", storyboards.map((row) => row.id));
+    const trackIds = [...new Set(storyboards.map((row) => Number(row.trackId)).filter((value) => Number.isSafeInteger(value) && value > 0))];
+    const trackStates = await trx("ext_creative_state").where({ projectId, entityType: "track" }).whereIn("entityId", trackIds);
     const assetStates = await trx.schema.hasTable("ext_creative_state") ? await trx("ext_creative_state").where({ projectId, entityType: "asset" }).whereIn("entityId", assets.map((row) => row.id)) : [];
-    return { script, saved, assets, storyboards, links, states, assetStates };
+    return { script, saved, assets, storyboards, links, states, trackStates, assetStates };
   });
   let cached: Record<string, any> = {};
   try { cached = JSON.parse(rows.saved?.data || "{}"); } catch { /* damaged planning must not hide existing entities */ }
@@ -50,6 +52,7 @@ export async function readProductionFlow(db: Knex, projectId: number, scriptId: 
       associateAssetsIds: rows.links.filter((item) => item.storyboardId === row.id).map((item) => item.assetId),
       src: await url(row.filePath), state: row.state, videoDesc: row.videoDesc ?? "", shouldGenerateImage: row.shouldGenerateImage,
       reason: row.reason ?? "", flowId: row.flowId, trackId: row.trackId,
+      trackVersion: row.trackId == null ? null : Number(rows.trackStates.find((item) => Number(item.entityId) === Number(row.trackId))?.version ?? 0),
       collaboration: { entityType: "storyboard", entityId: row.id, projectId, version: state?.version ?? 0,
         reviewState: state?.reviewState ?? "draft", locked: Boolean(state?.locked), lockedBy: state?.lockedBy ?? null,
         updatedBy: state?.updatedBy ?? null, updatedAt: state?.updatedAt ?? null },
@@ -77,9 +80,7 @@ export async function addProductionStoryboards(db: Knex, projectId: number, scri
     let index = Number(last?.last ?? -1) + 1;
     const inserted: number[] = [];
     for (const item of items) {
-      const existing = await trx("o_storyboard").where({ scriptId, track: item.track }).whereNotNull("trackId").first();
-      let trackId = existing?.trackId;
-      if (!trackId) [trackId] = await insertRowsReturningIds(trx, "o_videoTrack", { scriptId, projectId, duration: 0 });
+      const [trackId] = await insertRowsReturningIds(trx, "o_videoTrack", { scriptId, projectId, duration: item.duration });
       const [id] = await insertRowsReturningIds(trx, "o_storyboard", {
         projectId, scriptId, trackId, track: item.track, index: index++, prompt: item.prompt, duration: String(item.duration),
         videoDesc: item.videoDesc, shouldGenerateImage: item.shouldGenerateImage, state: "未生成", createTime: Date.now(),
@@ -87,8 +88,6 @@ export async function addProductionStoryboards(db: Knex, projectId: number, scri
       if (item.associateAssetsIds.length) await trx("o_assets2Storyboard").insert(
         [...new Set(item.associateAssetsIds)].map((assetId) => ({ assetId, storyboardId: id })),
       );
-      const total = await trx("o_storyboard").where({ scriptId, trackId }).sum("duration as total").first();
-      await trx("o_videoTrack").where({ id: trackId, scriptId, projectId }).update({ duration: Number(total?.total) || 0 });
       inserted.push(id);
     }
     return inserted;

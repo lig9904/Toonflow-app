@@ -8,6 +8,7 @@ import { lockProjectTransaction } from "@/lib/dbTransaction";
 import { advanceCreativeState, getCreativeState } from "@/services/creativeWorkspace";
 import { buildStoryboardVideoPrompt, visualText } from "@/lib/storyboardVisualContract";
 import { isVolcengineTrustedModel, readPromptTrustedBindings } from "./volcengineReferenceRuntime";
+import { assertTrackWritable } from "./storyboardTrackIndependence";
 import { acknowledgeVideoPromptReferences, ensureVideoModeIntentSchema, type VideoModeIntent, type VideoReferencePurpose } from "./videoModeResolution";
 
 const JOBS = "ext_video_prompt_jobs";
@@ -158,6 +159,8 @@ export async function prepareVideoPromptJob(db: Knex, input: VideoPromptJobInput
     if (!(await trx("o_script").where({ id: scriptId, projectId }).first())) throw new VideoPromptJobError("CONFLICT", "剧集不属于当前项目");
     const track = await trx("o_videoTrack").where({ id: trackId, projectId, scriptId }).forUpdate().first();
     if (!track) throw new VideoPromptJobError("CONFLICT", "视频轨道不属于当前项目或剧集");
+    await assertTrackWritable(trx, projectId, trackId).catch(() => { throw new VideoPromptJobError("CONFLICT", "历史共享轨道已归档，不能继续生成提示词"); });
+    if (Number((await trx("o_storyboard").where({ projectId, scriptId, trackId }).count("id as count").first())?.count ?? 0) > 1) throw new VideoPromptJobError("CONFLICT", "该历史片段仍包含多条分镜，请先完成一镜一片段迁移");
     const requestIdentityHash = hash({ projectId, scriptId, trackId, model: input.model, mode: input.mode, info: input.info, modeIntentSnapshot: input.modeIntentSnapshot, expectedVersion, ...(input.generation === undefined ? {} : { generation: input.generation }) });
     const existingByRequest = await trx(JOBS).where({ projectId, scriptId, trackId, idempotencyKey }).first();
     if (existingByRequest) {
@@ -305,11 +308,11 @@ async function executeVideoPromptJobOnce(db: Knex, jobId: string, generate: (job
       const referencesChanged = hash(currentReferences) !== hash(savedReferences);
       if (state.version !== claimed.job.trackVersion || locked || sourceChanged || referencesChanged) {
         const reason = sourceChanged || referencesChanged
-          ? "源分镜或参考身份已变化，已保留当前内容，未覆盖晚到的生成结果"
-          : "轨道已被人工修改，已保留人工提示词，未覆盖晚到的生成结果";
-        await trx(JOBS).where({ id: claimed.job.id }).update({ state: "failed", reason, updatedAt: Date.now() });
+          ? "源分镜或参考身份已变化，已保留当前内容；晚到的生成结果保存在任务记录中，未自动采用"
+          : "轨道已被人工修改，已保留人工提示词；晚到的生成结果保存在任务记录中，未自动采用";
+        await trx(JOBS).where({ id: claimed.job.id }).update({ state: "failed", resultPrompt, reason, updatedAt: Date.now() });
         await trx("o_videoTrack").where({ id: claimed.job.trackId, projectId: claimed.job.projectId, scriptId: claimed.job.scriptId }).where("state", "生成中").update({ state: "生成失败", reason });
-        return { ...claimed.job, state: "failed", reason };
+        return { ...claimed.job, state: "failed", resultPrompt, reason };
       }
       await advanceCreativeState(trx, { entityType: "track", entityId: claimed.job.trackId, projectId: claimed.job.projectId, expectedVersion: claimed.job.trackVersion, actor: { kind: "system", id: `video-prompt:${claimed.job.id}` } });
       await trx("o_videoTrack").where({ id: claimed.job.trackId, projectId: claimed.job.projectId, scriptId: claimed.job.scriptId }).update({ prompt: resultPrompt, state: "已完成", reason: null });

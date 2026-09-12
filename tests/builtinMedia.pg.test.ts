@@ -82,7 +82,7 @@ test("unsupported video combinations fail before a provider submission", () => {
 
 test("Agent uses the persisted per-track reference selection instead of rebuilding the default inventory", () => {
   const inventory = { storyboards: [{ id: 1, trackId: 9, filePath: "/default.png" }], linkedAssets: [], boundAudio: [] };
-  const persisted = { trackId: 9, modeIntent: "startFrameOptional", references: [{ id: 22, sources: "storyboard" as const, fileType: "image" as const, purpose: "last_frame" as const }], referencesInitialized: true, promptReferenceRevision: 1, revision: 1, source: "track" as const };
+  const persisted = { trackId: 9, modeIntent: "startFrameOptional", references: [{ id: 22, sources: "storyboard" as const, fileType: "image" as const, purpose: "last_frame" as const }], referencesInitialized: true, referenceSourceSnapshot: [], promptReferenceRevision: 1, revision: 1, source: "track" as const };
   assert.deepEqual(agentVideoReferenceSelection(persisted, inventory, 9), persisted.references);
   assert.deepEqual(agentVideoReferenceSelection({ ...persisted, modeIntent: "text", references: [] }, inventory, 9), []);
   assert.deepEqual(agentVideoReferenceSelection({ ...persisted, referencesInitialized: false, references: [] }, inventory, 9).map((item) => item.id), [1]);

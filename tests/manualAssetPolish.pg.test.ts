@@ -19,3 +19,12 @@ test('manual polish freezes identity/style rules, saves by version, and never ov
   const third=await worker.create(make('polish-cancel',2));await worker.control(third.run.id,third.run.version,'cancel','test',1);await reconcileManualPolishStates(f.db,[assetId]);assert.equal((await f.db('o_assets').where({id:assetId}).first()).promptState,'生成失败');assert.equal(calls,2);await worker.stop();
  }finally{await f.destroy();}
 });
+
+import {assetPromptSystem,requestsSingleAssetImage,assertSingleAssetImage} from '../src/lib/creativePromptPolicy';
+test('single-image requests override layout examples and cannot save a positive multi-view instruction',()=>{
+ assert.equal(requestsSingleAssetImage('角色只展示单个完整神兽，不多视图'),true);
+ assert.equal(requestsSingleAssetImage('制作标准四视图'),false);
+ assert.match(assetPromptSystem('四视图是模板默认',true),/本次版式已明确为单幅/);
+ assert.throws(()=>assertSingleAssetImage('标准四视图，正侧背面拼版'),/未保存/);
+ assert.doesNotThrow(()=>assertSingleAssetImage('单幅角色图，不要四视图，不做拼版。'));
+});

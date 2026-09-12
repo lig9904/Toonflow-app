@@ -8,7 +8,7 @@ import {builtinThinkLevelFromIntent} from './contracts';
 import type {StructuredScriptModel} from './scriptExecutor';
 import {getCreativeState} from '../creativeWorkspace';
 import {updateAsset} from '../assetWorkspace';
-import {assetPromptSystem} from '../../lib/creativePromptPolicy';
+import {assetPromptSystem,requestsSingleAssetImage,assertSingleAssetImage} from '../../lib/creativePromptPolicy';
 export interface PolishItem {assetsId:number;expectedVersion:number;name:string;describe:string;type:string;system:string}
 export interface PolishContext {projectId:number;items:PolishItem[];otherTextPrompt:string;concurrentCount?:number}
 export async function ensureManualPolishSchema(db:Knex){if(!await db.schema.hasColumn('o_assets','promptRunId'))await db.schema.alterTable('o_assets',t=>t.uuid('promptRunId').nullable());}
@@ -34,8 +34,9 @@ export function createManualPolishExecutor(deps:{db:Knex;model:StructuredScriptM
    try{
     const generated=await ctx.step(`polish.model:${item.assetsId}`,{item,otherTextPrompt:c.otherTextPrompt},async()=>{
      if((await getCreativeState(deps.db,'asset',item.assetsId,c.projectId)).version!==item.expectedVersion)throw new BuiltinRuntimeError('CONFLICT','素材已经修改，本次旧润色未执行');
-     const response=await deps.model.generate({role:'universalAi',system:assetPromptSystem(item.system),input:{asset:{id:item.assetsId,name:item.name,describe:item.describe,type:item.type},request:c.otherTextPrompt},schema,maxOutputTokens:0,useModelOutputLimit:true,signal:ctx.signal,thinkLevel:builtinThinkLevelFromIntent(ctx.run.intent)});
-     return {value:schema.parse(response.value),outputTokens:response.outputTokens};
+     const response=await deps.model.generate({role:'universalAi',system:assetPromptSystem(item.system,requestsSingleAssetImage(c.otherTextPrompt)),input:{asset:{id:item.assetsId,name:item.name,describe:item.describe,type:item.type},request:c.otherTextPrompt},schema,maxOutputTokens:0,useModelOutputLimit:true,signal:ctx.signal,thinkLevel:builtinThinkLevelFromIntent(ctx.run.intent)});
+     const value=schema.parse(response.value);if(requestsSingleAssetImage(c.otherTextPrompt))assertSingleAssetImage(value.prompt);
+     return {value,outputTokens:response.outputTokens};
     },{modelCall:true});
     const saved=await ctx.commit(`polish.save:${item.assetsId}`,{item,prompt:generated.value.prompt},async trx=>{
      const row=await trx('o_assets').where({id:item.assetsId,projectId:c.projectId,promptRunId:ctx.run.id}).first();if(!row)throw new BuiltinRuntimeError('CONFLICT','素材提示词任务已更换');

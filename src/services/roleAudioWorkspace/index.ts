@@ -6,6 +6,7 @@ import { advanceCreativeState, CreativeWorkspaceError, ensureCreativeWorkspaceSc
 import type { TrustedActor } from "../productionState";
 
 const RECEIPTS = "ext_role_audio_mutations";
+const VOICES = "ext_role_voice_references";
 const id = z.number().int().positive();
 const version = z.number().int().nonnegative();
 const key = z.string().min(8).max(150).regex(/^[\w:.-]+$/);
@@ -54,6 +55,7 @@ export interface BoundAudioReference {
   prompt: string;
   filePath: string;
   version: number;
+  pinned?: boolean;
 }
 
 export interface AudioMatchContext {
@@ -114,6 +116,11 @@ const hash = (value: unknown) => createHash("sha256").update(canonical(value)).d
 
 export async function ensureRoleAudioWorkspaceSchema(db: Knex): Promise<void> {
   await ensureCreativeWorkspaceSchema(db);
+  if (!(await db.schema.hasTable(VOICES))) await db.schema.createTable(VOICES, t => {
+    t.bigInteger("projectId").notNullable(); t.bigInteger("roleAssetId").notNullable();
+    t.bigInteger("audioAssetId").notNullable(); t.bigInteger("audioVersion").notNullable();
+    t.text("filePath").notNullable(); t.primary(["projectId", "roleAssetId"]);
+  });
   if (!(await db.schema.hasTable(RECEIPTS))) {
     await db.schema.createTable(RECEIPTS, (table) => {
       table.text("actorId").notNullable();
@@ -204,7 +211,17 @@ async function bindingView(db: Knex | Knex.Transaction, projectId: number, roleA
     .whereNull("family.assetsId")
     .select("family.id", "family.name", "family.describe")
     .orderBy("family.id");
-  return { roleAssetId, version, audioFamilies: links.map((row) => ({ id: Number(row.id), name: String(row.name ?? ""), describe: String(row.describe ?? "") })) };
+  const pin = await db.schema.hasTable(VOICES) ? await db(VOICES).where({projectId,roleAssetId}).first() : null;
+  const audioFamilies = await Promise.all(links.map(async row => {
+    const children=await db("o_assets as asset").join("o_image as media","media.id","asset.imageId")
+      .where({"asset.projectId":projectId,"asset.assetsId":Number(row.id),"asset.type":"audio","media.type":"audio"})
+      .whereIn("media.state",["已完成","生成成功"]).whereNotNull("media.filePath").select("asset.id","asset.name","media.filePath").orderBy("asset.id");
+    const voiceOptions = await Promise.all(children.map(async child => ({id:Number(child.id),name:String(child.name ?? ""),filePath:String(child.filePath),version:(await getCreativeState(db as Knex,"asset",Number(child.id),projectId)).version})));
+    const selected = voiceOptions.find(x=>x.id===Number(pin?.audioAssetId)) ?? (!pin ? voiceOptions[0] : undefined);
+    return {id:Number(row.id),name:String(row.name ?? ""),describe:String(row.describe ?? ""),voiceOptions,
+      voiceReference:selected ?? null,voicePinned:!!pin,voiceStale:!!pin && (!selected || selected.version!==Number(pin.audioVersion) || selected.filePath!==pin.filePath)};
+  }));
+  return { roleAssetId, version, audioFamilies };
 }
 
 export async function readRoleAudioBindings(db: Knex, projectId: number, roleAssetIds: readonly number[]): Promise<any[]> {
@@ -223,7 +240,7 @@ export async function saveRoleAudioBindings(db: Knex, raw: unknown, actor: Trust
     const old = await receipt<{ bindings: any[] }>(trx, who, input.projectId, input.idempotencyKey, requestHash);
     if (old) return { ...old, reused: true };
     await assertProject(trx, input.projectId);
-    const changes: Array<{ item: typeof input.items[number]; familyId?: number; currentIds: number[]; familyIds: number[] }> = [];
+    const changes: Array<{ item: typeof input.items[number]; familyId?: number; currentIds: number[]; familyIds: number[]; voice?: {id:number;version:number;filePath:string} }> = [];
     for (const item of normalized.items) {
       const role = await roleFamily(trx, input.projectId, item.roleAssetId);
       const state = await getCreativeState(trx, "asset", item.roleAssetId, input.projectId);
@@ -237,11 +254,16 @@ export async function saveRoleAudioBindings(db: Knex, raw: unknown, actor: Trust
       const versionMap = new Map((item.audioVersions ?? []).map((entry) => [entry.id, entry.expectedVersion]));
       if (versionMap.size !== item.audioIds.length || item.audioIds.some((audioId) => !versionMap.has(audioId))) throw new RoleAudioWorkspaceError("INVALID_INPUT", "每个所选音频必须携带最新版本");
       const families = [] as number[];
+      const selectedVoices: Array<{id:number;version:number;filePath:string}> = [];
       for (const audioId of item.audioIds) {
         const audio = await audioFamily(trx, input.projectId, audioId);
         const selectedState = await getCreativeState(trx, "asset", audioId, input.projectId);
         if (selectedState.version !== versionMap.get(audioId)) throw new RoleAudioWorkspaceError("VERSION_CONFLICT", "音频素材已被修改，请重新选择", 409);
         families.push(Number(audio.family.id));
+        const explicitChild=Number(audio.selected.id)!==Number(audio.family.id);
+        const chosen = explicitChild ? audio.children.find(child=>Number(child.id)===audioId) : audio.children[0];
+        if(!chosen)throw new RoleAudioWorkspaceError("INVALID_INPUT","所选声音片段尚无可用音频，请选择已完成的片段");
+        selectedVoices.push({id:Number(chosen.id),version:(await getCreativeState(trx,"asset",Number(chosen.id),input.projectId)).version,filePath:String(chosen.filePath)});
       }
       const uniqueFamilies = [...new Set(families)];
       if (uniqueFamilies.length > 1) throw new RoleAudioWorkspaceError("INVALID_INPUT", "一个角色最多绑定一个顶层音频家族");
@@ -259,15 +281,20 @@ export async function saveRoleAudioBindings(db: Knex, raw: unknown, actor: Trust
           if (childState.version !== child.expectedVersion) throw new RoleAudioWorkspaceError("VERSION_CONFLICT", "音频家族子项已被修改，请重新匹配", 409);
         }
       }
-      changes.push({ item, familyId: uniqueFamilies[0], currentIds, familyIds: role.familyIds });
+      if(new Set(selectedVoices.map(x=>x.id)).size>1)throw new RoleAudioWorkspaceError("INVALID_INPUT","每个角色请选择一份固定声音参考");
+      changes.push({ item, familyId: uniqueFamilies[0], currentIds, familyIds: role.familyIds, voice:selectedVoices[0] });
     }
 
     for (const change of changes) {
       if (change.item.audioIds === undefined) continue;
       const nextIds = change.familyId === undefined ? [] : [change.familyId];
-      if (change.currentIds.length === nextIds.length && change.currentIds.every((value, index) => value === nextIds[index])) continue;
+      const oldPin=await trx(VOICES).where({projectId:input.projectId,roleAssetId:change.item.roleAssetId}).first();
+      const samePin=change.voice ? oldPin && Number(oldPin.audioAssetId)===change.voice.id && Number(oldPin.audioVersion)===change.voice.version && oldPin.filePath===change.voice.filePath : !oldPin;
+      if (samePin && change.currentIds.length === nextIds.length && change.currentIds.every((value, index) => value === nextIds[index])) continue;
       await assertUnlocked(trx, input.projectId, change.familyIds);
       await advanceRoleState(trx, change.item.roleAssetId, input.projectId, change.item.expectedVersion, actor);
+      await trx(VOICES).where({projectId:input.projectId,roleAssetId:change.item.roleAssetId}).delete();
+      if(change.voice)await trx(VOICES).insert({projectId:input.projectId,roleAssetId:change.item.roleAssetId,audioAssetId:change.voice.id,audioVersion:change.voice.version,filePath:change.voice.filePath});
       await trx("o_assetsRole2Audio").where({ assetsRoleId: change.item.roleAssetId }).delete();
       if (change.familyId !== undefined) await trx("o_assetsRole2Audio").insert({ assetsRoleId: change.item.roleAssetId, assetsAudioId: change.familyId });
     }
@@ -310,11 +337,20 @@ export async function readBoundAudioReferences(db: Knex, projectId: number, role
     .select("link.assetsRoleId", "family.id as familyId", "child.id", "child.name", "child.describe", "child.prompt", "media.filePath")
     .orderBy(["link.assetsRoleId", "family.id", "child.id"]);
   const states = rows.length ? await db("ext_creative_state").where({ entityType: "asset", projectId }).whereIn("entityId", rows.map((row) => row.id)) : [];
-  return rows.map((row) => ({
+  const candidates = rows.map((row) => ({
     roleAssetId: Number(row.assetsRoleId), familyId: Number(row.familyId), id: Number(row.id), name: String(row.name ?? ""),
     describe: String(row.describe ?? ""), prompt: String(row.prompt ?? ""), filePath: String(row.filePath),
     version: Number(states.find((state) => Number(state.entityId) === Number(row.id))?.version ?? 0),
   }));
+  const pins = await db.schema.hasTable(VOICES) ? await db(VOICES).where({projectId}).whereIn("roleAssetId",uniqueRoleIds) : [];
+  const result:BoundAudioReference[]=[];
+  for(const roleId of uniqueRoleIds){
+    const pin=pins.find(x=>Number(x.roleAssetId)===roleId);
+    const candidate=candidates.find(x=>x.roleAssetId===roleId && (!pin || x.id===Number(pin.audioAssetId)));
+    if(pin && (!candidate || candidate.version!==Number(pin.audioVersion) || candidate.filePath!==pin.filePath))throw new RoleAudioWorkspaceError("VERSION_CONFLICT",`角色 ${roleId} 的固定声音参考已变化，请在角色素材中重新选择并保存`,409);
+    if(candidate)result.push({...candidate,pinned:!!pin});
+  }
+  return result;
 }
 
 export async function prepareAudioMatchContext(db: Knex, raw: unknown): Promise<AudioMatchContext> {
@@ -372,4 +408,13 @@ export async function startAudioMatchRun(db: Knex, raw: unknown, requestedBy: nu
 /** Model output is untrusted and passes through the same ownership/version/lock checks as manual edits. */
 export async function applyAudioMatchProposal(db: Knex, input: z.infer<typeof saveRoleAudioBindingsSchema>, actor: TrustedActor): Promise<{ bindings: any[]; reused: boolean }> {
   return saveRoleAudioBindings(db, input, actor);
+}
+
+/** Stable voice identity, including inheritance by a derived character. Never inferred from age or personality. */
+export async function readRoleVoiceCasting(db:Knex,projectId:number,roleIds:readonly number[]){
+  if(!roleIds.length)return [];
+  const roles=await db("o_assets").where({projectId,type:"role"}).whereIn("id",[...new Set(roleIds)]).select("id","name","assetsId");
+  const ids=[...new Set(roles.flatMap(r=>[Number(r.id),Number(r.assetsId)]).filter(id=>id>0))];
+  const bound=await readBoundAudioReferences(db,projectId,ids);
+  return roles.map(role=>{const voice=bound.find(v=>v.roleAssetId===Number(role.id))??bound.find(v=>v.roleAssetId===Number(role.assetsId));return voice?{roleAssetId:Number(role.id),roleName:String(role.name),audioId:voice.id,audioVersion:voice.version,filePath:voice.filePath,pinned:!!voice.pinned}:null;}).filter((v):v is NonNullable<typeof v>=>v!==null);
 }

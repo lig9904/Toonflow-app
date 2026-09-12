@@ -375,3 +375,32 @@ test("real composition honors common overrides, relevant mode, explicit model ma
     await assert.rejects(composeVideoPrompt(f.db, input, paths), /超出模板目录/);
   } finally { await f.destroy(); await fs.rm(temp, { recursive: true, force: true }); }
 });
+
+import {ensureRoleAudioWorkspaceSchema,saveRoleAudioBinding} from '../src/services/roleAudioWorkspace';
+test('role voice casting reaches prompt snapshots and late binding changes cannot be adopted',options,async()=>{
+ const f=await fixture();try{
+  await ensureRoleAudioWorkspaceSchema(f.db);
+  const [role]=await insertRowsReturningIds(f.db,'o_assets',{projectId:f.projectId,type:'role',name:'雪璃'});
+  const [family]=await insertRowsReturningIds(f.db,'o_assets',{projectId:f.projectId,type:'audio',name:'雪璃声音'});
+  const [clip]=await insertRowsReturningIds(f.db,'o_assets',{projectId:f.projectId,type:'audio',assetsId:family,name:'固定片段'});
+  const [media]=await insertRowsReturningIds(f.db,'o_image',{assetsId:clip,type:'audio',state:'已完成',filePath:'/voice.mp3'});
+  await f.db('o_assets').where({id:clip}).update({imageId:media});
+  const board=await f.db('o_storyboard').where({trackId:f.secondTrack}).first();await f.db('o_assets2Storyboard').insert({assetId:role,storyboardId:board.id});
+  await saveRoleAudioBinding(f.db,{projectId:f.projectId,roleAssetId:role,expectedVersion:0,audioIds:[clip],audioVersions:[{id:clip,expectedVersion:0}],idempotencyKey:'cast-test-bind'}, {id:'human:1',kind:'human'});
+  const prepared=await prepareVideoPromptJob(f.db,{projectId:f.projectId,scriptId:f.scriptId,trackId:f.secondTrack,expectedVersion:0,idempotencyKey:'cast-test-prompt',model:'fixture:seedance-2',mode:JSON.stringify(['imageReference:9','audioReference:3']),info:[{id:board.id,sources:'storyboard',fileType:'image'},{id:clip,sources:'assets',fileType:'audio'}]});
+  assert.match(prepared.job.promptInput,/固定音色参考对应角色：雪璃/);assert.match(prepared.job.promptInput,/@音频1/);
+  const completed=await executeVideoPromptJob(f.db,prepared.job.id,async()=>{
+    await saveRoleAudioBinding(f.db,{projectId:f.projectId,roleAssetId:role,expectedVersion:1,audioIds:[],audioVersions:[],idempotencyKey:'cast-test-clear'}, {id:'human:1',kind:'human'});
+    return '雪璃转身，音色参考@音频1';
+  });
+  assert.equal(completed.state,'failed');assert.equal((await f.db('o_videoTrack').where({id:f.secondTrack}).first()).prompt,'');
+ }finally{await f.destroy();}
+});
+
+test('official Seedance policy is included even with explicit model prompt mapping',options,async()=>{
+ const f=await fixture();try{
+  await f.db('o_modelPrompt').insert({vendorId:'volcengineSd2',model:'doubao-seedance-2-0-mini-260615',path:'video/textMode.md'});
+  const value=await composeVideoPrompt(f.db,{model:'volcengineSd2:doubao-seedance-2-0-mini-260615',mode:'text',referenceCount:0,scriptDuration:4,generation:{duration:4,resolution:'480p',audio:true},capabilities:{mode:['text'],audio:'optional',durationResolutionMap:[{duration:[4],resolution:['480p']}]}},{skillsDir:path.resolve('data/skills'),modelPromptDir:path.resolve('data/modelPrompt')});
+  assert.ok(value.versions.some(x=>x.key==='video.volcengineOfficial'));assert.match(value.system,/generate_audio 仅控制/);assert.match(value.system,/未实际上传音频/);
+ }finally{await f.destroy();}
+});

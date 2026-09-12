@@ -151,7 +151,7 @@ export default router.post(
           if (!otherDataMap[sid]) otherDataMap[sid] = [];
           otherDataMap[sid].push(item);
           if (audioRecord[i.id]) otherDataMap[sid].push(...audioRecord[i.id]);
-          if (audioRecord[i.assetsId]) otherDataMap[sid].push(...audioRecord[i.assetsId]);
+          else if (audioRecord[i.assetsId]) otherDataMap[sid].push(...audioRecord[i.assetsId]);
         }),
       );
     }

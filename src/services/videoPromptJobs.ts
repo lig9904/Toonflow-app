@@ -1,3 +1,4 @@
+import { readRoleVoiceCasting } from "./roleAudioWorkspace";
 import { assertVideoPromptDialogue, type VideoPromptReviewReport } from "@/lib/videoPromptContract";
 import { validatePromptReferenceSelection, type VideoPromptComposition, type VideoGenerationSettings } from "./videoPromptComposition";
 import { currentPromptReferences, deterministicPromptFindings, promptReviewBinding } from "./videoPromptReview";
@@ -206,6 +207,7 @@ export async function prepareVideoPromptJob(db: Knex, input: VideoPromptJobInput
     const versionedLinkedAssets = linkedAssets.map((row) => ({ ...row, version: referenceVersion("asset", row.id) }));
     const selectedStoryboardById = new Map(versionedStoryboards.map((row) => [Number(row.id), row]));
     const selectedAssetById = new Map(versionedAssets.map((row) => [Number(row.id), row]));
+    const voiceCasting=await readRoleVoiceCasting(trx,projectId,linkedAssets.filter(row=>row.type==="role").map(row=>Number(row.id)));
     const referenceCounts = { image: 0, video: 0, audio: 0 };
     const referenceLabels: string[] = [];
     const trustedAssets = isVolcengineTrustedModel(input.model) ? await readPromptTrustedBindings(trx, projectId, scriptId, input.info ?? []) : undefined;
@@ -220,7 +222,9 @@ export async function prepareVideoPromptJob(db: Knex, input: VideoPromptJobInput
       const number = ++referenceCounts[mediaType];
       referenceLabels.push(`@${label}${number}`);
       const framePosition = item.purpose === "first_frame" ? "，帧位置：首帧" : item.purpose === "last_frame" ? "，帧位置：尾帧" : !item.purpose && ["singleImage", "startEndRequired", "endFrameOptional", "startFrameOptional"].includes(input.mode) ? (index === 0 ? "，帧位置：首帧" : "，帧位置：尾帧") : "";
-      return `选择顺序${index + 1}，@${label}${number}${framePosition}${item.purpose ? `，用途：${item.purpose}` : ""}，来源 ${item.sources} ${Number(item.id)}：${row.name ?? "分镜参考"}；${visualText(row.describe ?? row.prompt ?? "")}${trusted ? "；实际输入为已绑定火山素材，本地图片仅用于关联；最终提示词仍使用上述引用标签，不能用素材 ID 指代" : ""}`;
+      const speakers=mediaType==="audio"?voiceCasting.filter(v=>v.audioId===Number(item.id)).map(v=>v.roleName):[];
+      const voiceNote=speakers.length?`；固定音色参考对应角色：${speakers.join("、")}。仅参考声音身份，不复制音频原台词、配乐和噪声；情绪服从本镜剧本`:"";
+      return `${voiceNote}选择顺序${index + 1}，@${label}${number}${framePosition}${item.purpose ? `，用途：${item.purpose}` : ""}，来源 ${item.sources} ${Number(item.id)}：${row.name ?? "分镜参考"}；${visualText(row.describe ?? row.prompt ?? "")}${trusted ? "；实际输入为已绑定火山素材，本地图片仅用于关联；最终提示词仍使用上述引用标签，不能用素材 ID 指代" : ""}`;
     }).filter(Boolean);
     const semanticIdentity = versionedLinkedAssets.map((row) => `语义身份（仅用于理解，不代表已上传参考图）：${row.name ?? "未命名"}：${row.describe ?? ""}`).join("\n");
     validatePromptReferenceSelection(input.mode, [...Array(referenceCounts.image).fill("image"), ...Array(referenceCounts.video).fill("video"), ...Array(referenceCounts.audio).fill("audio")]);
@@ -229,9 +233,10 @@ export async function prepareVideoPromptJob(db: Knex, input: VideoPromptJobInput
       compositionSnapshot ? `实际生成参数：${JSON.stringify(compositionSnapshot.context)}` : `模型：${input.model}；模式：${input.mode}；脚本总时长：${sourceSnapshot.reduce((total, row) => total + (Number(row.duration) || 0), 0)}秒；生成参数：${JSON.stringify(input.generation ?? {})}（旧调用未提供字段，不能猜测参数）`,
       `源分镜（必须覆盖当前轨道全部分镜）：\n${buildStoryboardVideoPrompt(sourceSnapshot)}`,
       semanticIdentity,
+      voiceCasting.length?`角色声音绑定：${JSON.stringify(voiceCasting.map(v=>({role:v.roleName,audioAssetId:v.audioId,version:v.audioVersion,selected:input.info.some(i=>i.sources==="assets"&&Number(i.id)===v.audioId)})))}。只有本次已选中的音频才实际传入；缺失时不得声称音色已固定。`:"没有已绑定声音参考，不得声称音色固定，也不得仅凭角色名推断其声音。",
       selectedVisual.length ? `本次用户选择的视觉参考（仅这些素材会作为视觉输入）：\n${selectedVisual.join("\n")}` : "本次未选择视觉参考图，不能假定存在已上传参考图。",
     ].filter(Boolean).join("\n\n");
-    const referenceSnapshot = { info: input.info, selectedStoryboards: versionedStoryboards, selectedAssets: versionedAssets, linkedAssets: versionedLinkedAssets, ...(input.modeIntentSnapshot ? { modeIntent: input.modeIntentSnapshot } : {}), ...(trustedAssets ? { trustedAssets } : {}) };
+    const referenceSnapshot = { voiceCasting, info: input.info, selectedStoryboards: versionedStoryboards, selectedAssets: versionedAssets, linkedAssets: versionedLinkedAssets, ...(input.modeIntentSnapshot ? { modeIntent: input.modeIntentSnapshot } : {}), ...(trustedAssets ? { trustedAssets } : {}) };
     const requestHash = hash({ requestIdentityHash, sourceSnapshot, referenceSnapshot });
     const active = await trx(JOBS).where({ projectId, scriptId, trackId }).whereIn("state", ["queued", "running"]).first();
     if (active) throw new VideoPromptJobError("CONFLICT", "当前轨道已有提示词任务正在生成");

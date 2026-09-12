@@ -1,3 +1,4 @@
+import {readRoleVoiceCasting} from "./roleAudioWorkspace";
 import { classifyImageFinding, videoPreflightVerdict, videoSettingsIssues, type VideoPreflightTarget } from "../lib/videoPreflightContract";
 import { createHash } from "node:crypto";
 import type { Knex } from "knex";
@@ -73,7 +74,8 @@ export async function currentPromptReferences(db: Knex, projectId: number, scrip
   const withVersion = (entityType: "storyboard" | "asset", row: any) => ({ ...row, version: Number((entityType === "storyboard" ? storyboardStates : assetStates).find((state) => Number(state.entityId) === Number(row.id))?.version ?? 0) });
   const trustedAssets = Object.hasOwn(saved ?? {}, "trustedAssets") ? await readPromptTrustedBindings(db, projectId, scriptId, info) : undefined;
   const modeIntent = saved?.modeIntent && Number.isSafeInteger(trackId) && Number(trackId) > 0 ? await readVideoModeIntent(db, { projectId, scriptId, trackId: Number(trackId) }).catch(() => null) : null;
-  return { info, selectedStoryboards: info.filter((item: any) => item.sources === "storyboard").map((item: any) => storyboards.find((row) => Number(row.id) === Number(item.id))).filter(Boolean).map((row: any) => withVersion("storyboard", row)), selectedAssets: info.filter((item: any) => item.sources === "assets").map((item: any) => assets.find((row) => Number(row.id) === Number(item.id))).filter(Boolean).map((row: any) => withVersion("asset", row)), linkedAssets: linkedAssets.map((row) => withVersion("asset", row)), ...(modeIntent ? { modeIntent: { modeIntent: modeIntent.modeIntent, revision: modeIntent.revision } } : {}), ...(trustedAssets ? { trustedAssets } : {}) };
+  const voiceCasting=Object.hasOwn(saved ?? {},"voiceCasting")?await readRoleVoiceCasting(db,projectId,linkedAssets.filter(row=>row.type==="role").map(row=>Number(row.id))):undefined;
+  return { ...(voiceCasting ? {voiceCasting} : {}), info, selectedStoryboards: info.filter((item: any) => item.sources === "storyboard").map((item: any) => storyboards.find((row) => Number(row.id) === Number(item.id))).filter(Boolean).map((row: any) => withVersion("storyboard", row)), selectedAssets: info.filter((item: any) => item.sources === "assets").map((item: any) => assets.find((row) => Number(row.id) === Number(item.id))).filter(Boolean).map((row: any) => withVersion("asset", row)), linkedAssets: linkedAssets.map((row) => withVersion("asset", row)), ...(modeIntent ? { modeIntent: { modeIntent: modeIntent.modeIntent, revision: modeIntent.revision } } : {}), ...(trustedAssets ? { trustedAssets } : {}) };
 }
 
 export async function readCurrentVideoPromptReview(db: Knex, input: { projectId: number; scriptId: number; trackId: number; prompt: string; model?: string; mode?: unknown; generation?: VideoGenerationSettings; info?: Array<{ id: number; sources: string; fileType?: string }> }): Promise<VideoPromptReviewReport | null> {
@@ -139,10 +141,20 @@ async function currentImageReferenceFindings(db: Knex, input: { projectId: numbe
 /** Pre-submission is read-only and never rewrites a manually edited prompt or calls a paid model. */
 export async function preflightVideoPrompt(db: Knex, input: { projectId: number; scriptId: number; trackId: number; prompt: string; model: string; mode: unknown; generation: VideoGenerationSettings; info: Array<{ id: number; sources: string; fileType?: string; purpose?: string }>; referenceTypes?: Array<"image" | "video" | "audio">; collectOnly?: boolean; acknowledgement?: string; referenceBinding?: unknown; capabilities?: unknown }): Promise<VideoPromptReviewReport> {
   const source = await db("o_storyboard").where({ projectId: input.projectId, scriptId: input.scriptId, trackId: input.trackId }).orderBy("index").orderBy("id").select("id", "prompt", "videoDesc", "duration");
-  const references = await currentPromptReferences(db, input.projectId, input.scriptId, source, { info: input.info, ...(isVolcengineTrustedModel(input.model) ? { trustedAssets: [] } : {}) });
+  const references = await currentPromptReferences(db, input.projectId, input.scriptId, source, { voiceCasting: [], info: input.info, ...(isVolcengineTrustedModel(input.model) ? { trustedAssets: [] } : {}) });
   const counts = { image: 0, video: 0, audio: 0 };
   const labels = input.info.map((item, index) => { const type = input.referenceTypes?.[index] ?? item.fileType ?? "image"; if (!(type in counts)) throw new VideoJobError("INVALID_INPUT", "参考媒体类型无效"); const media = type as keyof typeof counts; return `@${{ image: "图片", video: "视频", audio: "音频" }[media]}${++counts[media]}`; });
   const findings = [...deterministicPromptFindings({ sourceSnapshot: source, referenceSnapshot: references, referenceLabels: labels }, input.prompt), ...await currentImageReferenceFindings(db, input)];
+  if(input.model.startsWith("volcengineSd2:") && input.generation.audio){
+    const casting=references.voiceCasting ?? [];
+    const roles=(references.linkedAssets ?? []).filter((a:any)=>a.type==="role");
+    for(const role of [...new Map(roles.map((r:any)=>[Number(r.id),r])).values()] as any[]){
+      const voice=casting.find((v:any)=>v.roleAssetId===Number(role.id));
+      const index=voice?input.info.findIndex(i=>i.sources==="assets" && Number(i.id)===voice.audioId):-1;
+      if(index<0)findings.push({code:"VOICE_REFERENCE_MISSING",severity:"warning",field:"references",message:`${role.name}：${voice?"已绑定的固定声音未加入本次参考，可重新载入片段参考后核对提示词":"尚未绑定固定声音参考；如本镜有该角色对白，跨片段音色可能变化"}`,suggestion:"在角色素材中选择固定声音片段；已有片段可重新载入参考。无对白角色可忽略此项。"});
+      else if(!input.prompt.includes(labels[index]))findings.push({code:"VOICE_CASTING_UNCLEAR",severity:"warning",field:"prompt",message:`${role.name} 的声音参考 ${labels[index]} 已加入，但提示词未明确引用`,suggestion:`在提示词中说明该角色音色参考 ${labels[index]}，保存后再生成；不复制参考音频原台词。`});
+    }
+  }
   if (!input.prompt.trim()) findings.push({code:"PROMPT_EMPTY",severity:"error",field:"prompt",message:"视频提示词不能为空",overridable:false,suggestion:"生成或手动填写提示词后保存"});
   findings.push(...videoSettingsIssues(input.capabilities,input.generation));
   const scriptDuration=source.reduce((sum,row)=>sum+(Number(row.duration)||0),0);

@@ -20,6 +20,8 @@ export const promptDefinitions: readonly PromptDefinition[] = [
   define("common.audioBindPrompt", "音色绑定", "common", ["builtinAgent.audioExecutor"], ["selectedRoles", "candidateAudioFamilies", "existingBindings", "outputSchema"], { commonType: "audioBindPrompt", defaultContent: promptDefaults.audioBindPrompt }),
   define("review.videoPromptReview", "视频提示词校验与最小修正", "review", ["videoPromptJobs.review"], [...videoContext, "candidatePrompt", "outputSchema"], { defaultContent: promptDefaults.videoPromptReview }),
   define("review.generatedImageReview", "生成图片视觉核验", "review", ["generatedImageReview"], ["referenceImages", "generatedImage", "shotRequirements", "outputSchema"], { defaultContent: promptDefaults.generatedImageReview }),
+  define("skill.volcengine_seedream", "火山官方图片制作", "skill", ["builtinAgent.productionExecutor"], ["workspaceSnapshot", "imageModel", "referenceMapping"], {file:"volcengine_seedream.md"}),
+  define("video.volcengineOfficial", "火山官方视频与角色声音", "video", ["videoPromptJobs", "builtinAgent.productionExecutor"], [...videoContext, "voiceCasting"], {file:"video/volcengineOfficialVideo.md"}),
   ...([
     ["text", "文生视频", "textMode.md"], ["firstFrame", "单图首帧", "firstFrameMode.md"],
     ["firstLastFrame", "首尾帧", "universalFirstAndLastFrameMode.md"], ["multiReference", "混合参考", "universalMulti-parameterMode.md"], ["seedance", "Seedance 模型差异", "seedance2Multi-parameterMode.md"], ["wan26", "Wan 2.6 模型差异", "wan2.6Single-imageFirstFrameMode.md"],

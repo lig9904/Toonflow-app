@@ -58,7 +58,7 @@ test("panel and builtin generation use the same repaired identities and visual p
     const run = await agent.get(created.run.id);
     assert.equal(run.status, "succeeded", run.errorMessage ?? "");
     assert.equal(f.submitted.length, 2);
-    assert.deepEqual(f.submitted[0], { ...f.submitted[1], prompt: f.submitted[1].prompt.replace("\n本次画面调整：generate", "") });
+    assert.deepEqual(f.submitted[0], { ...f.submitted[1], prompt: f.submitted[1].prompt.replace(/\n本次画面调整：[^\n]*/, "") });
     assert.equal(f.submitted[0].referenceList.length, 4);
     assert.match(f.submitted[0].prompt, /参考图4（@图4）=雪璃：狐族年轻成年女性/);
     assert.match(f.submitted[0].prompt, /特写反应/); assert.doesNotMatch(f.submitted[0].prompt, /我已知道|今天安静/);

@@ -47,17 +47,17 @@ test("concurrent editors cannot overwrite and exact snapshots stay stable after 
     assert.equal(results.filter(r => r.status === "fulfilled").length, 1);
     assert.equal(results.filter(r => r.status === "rejected" && r.reason.code === "VERSION_CONFLICT").length, 1);
     const snapshot = await capturePromptSnapshot(f.db, paths);
-    assert.equal(Object.keys(snapshot).length, 21);
+    assert.equal(Object.keys(snapshot).length, 23);
     const current = snapshot[key]; await resetManagedPrompt(f.db, key, { actor, expectedVersion: current.version, idempotencyKey: "snapshot-reset-001" }, paths);
     assert.equal(snapshot[key].content, current.content); assert.notEqual((await readManagedPrompt(f.db, key, paths)).version, current.version);
   } finally { await f.destroy(); }
 });
-test("all 21 entries read whitelisted real defaults; file edits preserved and stale file versions conflict", options, async () => {
+test("all 23 entries read whitelisted real defaults; file edits preserved and stale file versions conflict", options, async () => {
   const f = await fixture(); const temp = await fs.mkdtemp(path.join(os.tmpdir(), "prompt-registry-"));
   try {
     const entries = await listManagedPrompts(f.db, paths);
-    assert.equal(entries.length, 21); assert.equal(new Set(entries.map(p => p.key)).size, 21);
-    assert.equal(entries.filter(p => p.group === "skill").length, 9);
+    assert.equal(entries.length, 23); assert.equal(new Set(entries.map(p => p.key)).size, 23);
+    assert.equal(entries.filter(p => p.group === "skill").length, 10);
     assert.ok(entries.every(p => p.content.trim() && p.editable && p.requiredContext.length));
     const key = "skill.builtin_production_review"; const file = "builtin_production_review.md";
     await fs.writeFile(path.join(temp, file), "locally customized file"); const localPaths = { ...paths, skillsDir: temp };

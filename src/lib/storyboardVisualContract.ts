@@ -107,7 +107,7 @@ export function buildStoryboardImagePrompt(input: {
     : /特写|近景/.test(`${picture}\n${camera}`) && !/全景|远景/.test(picture)
       ? "取景约束：特写或近景，画面描述指定的局部主体占据画面，不擅自替换为其他主体，不要改成全身站姿展示；只在本镜头明确要求时让角色入画。"
       : "取景约束：按本镜头构图合理裁切参考素材，不要求把参考图中的全身或全部物件同时展示。";
-  const references = input.assets.map((asset, index) => `参考图${index + 1}（@图${index + 1}）=${asset.name || `素材${asset.id}`}：${asset.describe || asset.desc || "严格保持该参考图中的身份与外形"}`);
+  const references = input.assets.map((asset, index) => `参考图${index + 1}（@图${index + 1}）=${asset.name || `素材${asset.id}`}：${asset.describe || asset.desc || "严格保持该参考图中的身份与外形"}；用途：${asset.type === "role" ? "仅参考角色身份与外形，不复制多视图排版" : asset.type === "scene" ? "参考环境与空间，不添加无关人物" : "参考道具外形与材质"}`);
   return [
     "生成一张视频开始时的首帧静态画面，不把后续切镜、冲击波、离场等时序动作合并进这一帧。后续才出现的角色不要求在首帧入画。参考图只定义对应素材，不复制设定图的多视图排版。角色的物种、年龄、性别、发色、服饰和体型必须保持参考设定；不新增未要求的角色。",
     ...references,
@@ -115,7 +115,7 @@ export function buildStoryboardImagePrompt(input: {
     camera && camera !== picture ? `镜头与动作补充（仅表现可见部分）：${camera}` : "",
     composition,
     input.style ? `视觉风格：${input.style}` : "",
-    input.instruction ? `本次画面调整：${visualText(input.instruction)}` : "",
+    input.instruction ? `本次画面调整：${visualText(input.instruction)}；只调整明确指定部分，未指定的角色身份、画风与场景保持一致。` : "",
     "对白、旁白和音效不绘制成文字；除画面明确要求的标牌、屏幕等文字外，不添加字幕、气泡、标题或水印。仅按镜头构图取景，未入画或只在画外发声的角色不要画出。",
   ].filter(Boolean).join("\n");
 }

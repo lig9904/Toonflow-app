@@ -176,3 +176,17 @@ test("requesting model matching is a separate action and never reports completio
     assert.equal((await f.db("o_assets").where({ id: f.roleId }).first()).audioBindState, null);
   } finally { await f.destroy(); }
 });
+
+test("fixed voice keeps one clip across additions, supports explicit replacement and rejects changed source", options, async()=>{
+ const f=await fixture();try{
+  await saveRoleAudioBinding(f.db,{projectId:f.projectId,roleAssetId:f.roleId,expectedVersion:1,audioIds:[f.firstAudio.familyId],audioVersions:[{id:f.firstAudio.familyId,expectedVersion:1}],idempotencyKey:"pin-first-voice"},actor);
+  const [child]=await f.db("o_assets").insert({projectId:f.projectId,type:"audio",assetsId:f.firstAudio.familyId,name:"different take"}).returning("id");
+  const [media]=await f.db("o_image").insert({assetsId:child.id,type:"audio",filePath:"/other-take.mp3",state:"已完成"}).returning("id");await f.db("o_assets").where({id:child.id}).update({imageId:media.id});
+  await f.db("ext_creative_state").insert({entityType:"asset",entityId:child.id,projectId:f.projectId,version:1,updatedBy:actor.id,updatedAt:1});
+  assert.deepEqual((await readBoundAudioReferences(f.db,f.projectId,[f.roleId])).map(x=>x.id),[f.firstAudio.childId]);
+  const changed=await saveRoleAudioBinding(f.db,{projectId:f.projectId,roleAssetId:f.roleId,expectedVersion:2,audioIds:[Number(child.id)],audioVersions:[{id:Number(child.id),expectedVersion:1}],idempotencyKey:"pin-second-voice"},actor);
+  assert.equal(changed.binding.version,3);assert.equal(changed.binding.audioFamilies[0].voiceReference.id,Number(child.id));assert.equal(changed.binding.audioFamilies[0].voiceOptions.length,2);
+  await f.db("o_image").where({id:media.id}).update({filePath:"/changed.mp3"});
+  await assert.rejects(()=>readBoundAudioReferences(f.db,f.projectId,[f.roleId]),code("VERSION_CONFLICT"));
+ }finally{await f.destroy();}
+});

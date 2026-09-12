@@ -207,6 +207,7 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
       const instructions = await deps.db("o_prompt").where({ type: "scriptAssetExtraction" }).first();
       const skills = Object.fromEntries(await Promise.all([
       "builtin_production_director.md", "builtin_production_derive.md", "builtin_production_storyboard.md", "builtin_production_review.md",
+      ...(String(project.imageModel).startsWith("volcengineSd2:") ? ["volcengine_seedream.md"] : []),
     ].map(async (name) => [name, await deps.loadSkill(name)])));
       return { ...skills, assetExtraction: String(instructions?.useData || instructions?.data || "") };
     });
@@ -223,7 +224,7 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
         input = input && typeof input === "object" ? {...input, imageReviews} : {input, imageReviews};
       }
       const system = role === "productionAgent:decisionAgent" ? `${productionDecisionPrompt}\n${scopedMediaInstructionPrompt}`
-        : `${await skill(skillName)}\n\n当前服务器执行契约：${productionStageContract(role)} 所有项目、剧集、素材、分镜 ID 必须来自输入。`;
+        : `${await skill(skillName)}\n${frozenSkills["volcengine_seedream.md"] ?? ""}\n\n当前服务器执行契约：${productionStageContract(role)} 所有项目、剧集、素材、分镜 ID 必须来自输入。`;
       const result = await ctx.step(`production.${key}:r${revision}`, { input, role, systemHash: hash(system), ...(independentOutput ? { outputBudgetMode: "model_per_call" } : { budget, reserveTokens }) }, async () => {
         const remaining = !independentOutput && ctx.remainingOutputTokens ? await ctx.remainingOutputTokens() : run.limits.maxOutputTokens;
         const effectiveBudget = independentOutput ? 0 : Math.min(budget, remaining - reserveTokens);

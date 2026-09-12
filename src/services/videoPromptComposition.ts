@@ -42,8 +42,8 @@ export function buildVideoPromptReferenceCandidates(inventory: VideoReferenceInv
   const boardIds = new Set(inventory.storyboards.filter((row) => Number(row.trackId) === Number(trackId)).map((row) => Number(row.id)));
   const linked = inventory.linkedAssets.filter((row) => boardIds.has(Number(row.storyboardId)));
   const visualAssets = [...new Map(linked.filter((row) => row.filePath).map((row) => [Number(row.id), row])).values()].map((row) => { const fileType = resolveVideoReferenceMediaType(row.storedFileType, row.type, row.filePath); return { id: Number(row.id), sources: "assets" as const, fileType, purpose: fileType === "video" ? "motion_reference" as const : fileType === "audio" ? "audio_reference" as const : row.type === "role" ? "identity_reference" as const : "style_reference" as const }; });
-  const roleIds = new Set(linked.filter((row) => row.type === "role").flatMap((row) => [Number(row.id), Number(row.assetsId)]));
-  const audioAssets = [...new Map(inventory.boundAudio.filter((row) => roleIds.has(row.roleAssetId)).map((row) => [row.id, row])).values()].map((row) => ({ id: row.id, sources: "assets" as const, fileType: "audio" as const, purpose: "audio_reference" as const }));
+  const voices = linked.filter(row=>row.type==="role").map(role=>inventory.boundAudio.find(v=>v.roleAssetId===Number(role.id))??inventory.boundAudio.find(v=>v.roleAssetId===Number(role.assetsId))).filter((v):v is BoundAudioReference=>!!v);
+  const audioAssets = [...new Map(voices.map((row) => [row.id, row])).values()].map((row) => ({ id: row.id, sources: "assets" as const, fileType: "audio" as const, purpose: "audio_reference" as const }));
   const boardRefs = boards.map((row) => ({ id: Number(row.id), sources: "storyboard" as const, fileType: "image" as const,
     purpose: boards.length === 1 ? "first_frame" as const : "style_reference" as const }));
   return [...boardRefs, ...visualAssets, ...audioAssets];
@@ -96,12 +96,13 @@ export async function composeVideoPrompt(db: Knex, input: { model: string; mode:
   const modeKey = `video.${actualMode}`;
   const parts = await Promise.all(["common.videoPromptGeneration", modeKey, ...(!bound?.path && supplement ? [supplement] : []), "review.videoPromptReview"].map(async (key) => ({ ...(await readManagedPrompt(db, key, paths)), key })));
   const review = parts.pop()!;
+  if(vendorId==="volcengineSd2" && isSeedance2Model(modelName))parts.push({...await readManagedPrompt(db,"video.volcengineOfficial",paths),key:"video.volcengineOfficial"});
   if (bound?.path) {
     const normalizedPath = String(bound.path).replace(/\\/g, "/").replace(/^\.\//, "");
     const registered = promptDefinitions.find((definition) => definition.file === normalizedPath);
     if (registered) {
       if (registered.group !== "video") throw new Error("显式视频模型映射只能选择视频提示词");
-      if (registered.key.startsWith("video.") && ![modeKey, "video.seedance", "video.wan26"].includes(registered.key)) throw new Error(`显式模型提示词映射 ${registered.key} 与当前模式 ${modeKey} 不匹配`);
+      if (registered.key.startsWith("video.") && ![modeKey, "video.seedance", "video.wan26", "video.volcengineOfficial"].includes(registered.key)) throw new Error(`显式模型提示词映射 ${registered.key} 与当前模式 ${modeKey} 不匹配`);
       if (!parts.some((part) => part.key === registered.key)) parts.push({ ...(await readManagedPrompt(db, registered.key, paths)), key: registered.key });
     } else {
       const root = await fs.realpath(paths.modelPromptDir);

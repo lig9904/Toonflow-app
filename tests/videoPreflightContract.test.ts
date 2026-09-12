@@ -33,3 +33,10 @@ test('model parameter failures remain mandatory and tail frames do not inherit f
  assert.equal(videoSettingsIssues({audio:false,durationResolutionMap:[{duration:[4,5],resolution:['480p']}]},{duration:30,resolution:'1080p',audio:true}).filter(i=>i.severity==='error'&&!i.overridable).length,2);
  assert.equal(classifyImageFinding({code:'SHOT_FRAMING_MISMATCH',severity:'error',message:'opening close-up mismatch'},'last_frame').severity,'warning');
 });
+
+test('model finding code casing cannot turn framing into an unacknowledgeable error',()=>{
+ const f={code:'shot_size_mismatch',severity:'error' as const,message:'近景生成了全身'};
+ assert.equal(classifyImageFinding(f,'first_frame').overridable,true);
+ assert.equal(classifyImageFinding(f,'identity_reference').severity,'info');
+ assert.equal(classifyImageFinding({...f,code:'identity_mismatch'},'first_frame').overridable,false);
+});

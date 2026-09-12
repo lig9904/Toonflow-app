@@ -1,3 +1,4 @@
+import {readProductionFlow} from "../src/services/productionFlow";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createPostgresFixture, migratePostgresFixture } from "../src/lib/postgresTest";
@@ -211,6 +212,7 @@ test('fixed voice is usable by its character episode without granting unrelated 
   await f.db('o_scriptAssets').insert({scriptId:script.id,assetId:f.roleId});
   await saveRoleAudioBinding(f.db,{projectId:f.projectId,roleAssetId:f.roleId,expectedVersion:1,audioIds:[f.firstAudio.childId],audioVersions:[{id:f.firstAudio.childId,expectedVersion:1}],idempotencyKey:'episode-voice-bind'},actor);
   assert.equal(await canUseScriptAsset(f.db,f.projectId,Number(script.id),f.firstAudio.childId),true);
+  const flow=await readProductionFlow(f.db,f.projectId,Number(script.id),async p=>p);assert.equal(flow.voiceReferences[0].audioId,f.firstAudio.childId);
   assert.equal(await canUseScriptAsset(f.db,f.projectId,Number(other.id),f.firstAudio.childId),false);
   assert.equal(await canUseScriptAsset(f.db,f.projectId,Number(script.id),f.secondAudio.childId),false);
   assert.equal(await canUseScriptAsset(f.db,f.otherProjectId,Number(script.id),f.firstAudio.childId),false);

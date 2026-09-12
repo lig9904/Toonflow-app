@@ -1,3 +1,4 @@
+import {readRoleVoiceCasting} from "./roleAudioWorkspace";
 import { insertRowsReturningIds } from "../lib/insertRows";
 import { isPostgres, withProjectTransaction } from "../lib/dbTransaction";
 import type { Knex } from "knex";
@@ -30,7 +31,8 @@ export async function readProductionFlow(db: Knex, projectId: number, scriptId: 
     const trackIds = [...new Set(storyboards.map((row) => Number(row.trackId)).filter((value) => Number.isSafeInteger(value) && value > 0))];
     const trackStates = await trx("ext_creative_state").where({ projectId, entityType: "track" }).whereIn("entityId", trackIds);
     const assetStates = await trx.schema.hasTable("ext_creative_state") ? await trx("ext_creative_state").where({ projectId, entityType: "asset" }).whereIn("entityId", assets.map((row) => row.id)) : [];
-    return { script, saved, assets, storyboards, links, states, trackStates, assetStates };
+    const voiceReferences=await trx.schema.hasTable("o_assetsRole2Audio")?await readRoleVoiceCasting(trx as unknown as Knex,projectId,assets.filter(a=>a.type==="role").map(a=>Number(a.id))):[];
+    return { script, saved, assets, storyboards, links, states, trackStates, assetStates,voiceReferences };
   });
   let cached: Record<string, any> = {};
   try { cached = JSON.parse(rows.saved?.data || "{}"); } catch { /* damaged planning must not hide existing entities */ }
@@ -62,7 +64,7 @@ export async function readProductionFlow(db: Knex, projectId: number, scriptId: 
     planningVersion: Number.isSafeInteger(cached.planningVersion) ? cached.planningVersion : 0,
     script: rows.script.content ?? "", scriptPlan: typeof cached.scriptPlan === "string" ? cached.scriptPlan : "",
     storyboardTable: typeof cached.storyboardTable === "string" ? cached.storyboardTable : "",
-    assets, storyboard, workbench: { videoList: [] },
+    voiceReferences: rows.voiceReferences, assets, storyboard, workbench: { videoList: [] },
   };
 }
 

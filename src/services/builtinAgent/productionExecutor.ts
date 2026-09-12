@@ -223,8 +223,8 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
         const imageReviews = await ctx.step(`production.imageReviews.${key}:r${revision}`, {projectId,scriptId}, () => deps.imageReviewContext!(projectId,scriptId));
         input = input && typeof input === "object" ? {...input, imageReviews} : {input, imageReviews};
       }
-      const system = role === "productionAgent:decisionAgent" ? `${productionDecisionPrompt}\n${scopedMediaInstructionPrompt}`
-        : `${await skill(skillName)}\n${frozenSkills["volcengine_seedream.md"] ?? ""}\n\n当前服务器执行契约：${productionStageContract(role)} 所有项目、剧集、素材、分镜 ID 必须来自输入。`;
+      const system = role === "productionAgent:decisionAgent" ? `${productionDecisionPrompt}\n声音绑定以 flow.voiceReferences 为准；音频不在视觉素材 assets 列表不代表没有声音参考。已有绑定不得报告为未配置。\n${scopedMediaInstructionPrompt}`
+        : `${await skill(skillName)}\n${frozenSkills["volcengine_seedream.md"] ?? ""}\n\n当前服务器执行契约：${productionStageContract(role)} 所有项目、剧集、素材、分镜 ID 必须来自输入。声音绑定以 flow.voiceReferences 为准，不能仅因音频不在视觉素材列表而断言缺失。`;
       const result = await ctx.step(`production.${key}:r${revision}`, { input, role, systemHash: hash(system), ...(independentOutput ? { outputBudgetMode: "model_per_call" } : { budget, reserveTokens }) }, async () => {
         const remaining = !independentOutput && ctx.remainingOutputTokens ? await ctx.remainingOutputTokens() : run.limits.maxOutputTokens;
         const effectiveBudget = independentOutput ? 0 : Math.min(budget, remaining - reserveTokens);

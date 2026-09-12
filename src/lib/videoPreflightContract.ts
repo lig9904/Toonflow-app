@@ -4,10 +4,11 @@ export interface VideoPreflightIssue { code: string; severity: 'error' | 'warnin
 export interface VideoPreflightVerdict { fingerprint: string; trackId: number; shotLabel: string; canSubmit: boolean; acknowledged: boolean; issues: VideoPreflightIssue[] }
 export const SUBJECTIVE_IMAGE_CODES = new Set(['SHOT_FRAMING_MISMATCH','ENVIRONMENT_STYLE_DEVIATION','COMPOSITION_MISMATCH','SHOT_SIZE_MISMATCH']);
 export function classifyImageFinding(finding: {code:string;severity:'error'|'warning'|'info';message:string}, purpose?: string) {
-  const framing=/FRAMING|SHOT_SIZE|COMPOSITION/.test(finding.code);
+  const canonicalCode=finding.code.toUpperCase();
+  const framing=/FRAMING|SHOT_SIZE|COMPOSITION/.test(canonicalCode);
   // A character/style reference defines identity or appearance, not the output camera framing.
   const contextualReference=purpose==='identity_reference'||purpose==='style_reference';
-  return {...finding,message:framing&&contextualReference?`${finding.message} 此图仅用于身份或风格参考，该取景发现不限制输出镜头。`:framing&&purpose==='last_frame'?`${finding.message} 此图当前用作尾帧，应按结束状态核对，不能直接套用首帧构图结论。`:finding.message,severity:framing&&purpose==='last_frame'?'warning' as const:framing&&contextualReference?'info' as const:finding.severity,overridable:SUBJECTIVE_IMAGE_CODES.has(finding.code)};
+  return {...finding,message:framing&&contextualReference?`${finding.message} 此图仅用于身份或风格参考，该取景发现不限制输出镜头。`:framing&&purpose==='last_frame'?`${finding.message} 此图当前用作尾帧，应按结束状态核对，不能直接套用首帧构图结论。`:finding.message,severity:framing&&purpose==='last_frame'?'warning' as const:framing&&contextualReference?'info' as const:finding.severity,overridable:SUBJECTIVE_IMAGE_CODES.has(canonicalCode)};
 }
 const stable=(v:any):any=>Array.isArray(v)?v.map(stable):v&&typeof v==='object'?Object.fromEntries(Object.entries(v).sort(([a],[b])=>a.localeCompare(b)).map(([k,x])=>[k,stable(x)])):v;
 export function videoPreflightVerdict(input: {trackId:number;shotLabel:string;binding:unknown;issues:VideoPreflightIssue[];acknowledgement?:string}): VideoPreflightVerdict {

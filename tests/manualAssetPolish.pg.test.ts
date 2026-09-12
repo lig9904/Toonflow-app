@@ -27,4 +27,6 @@ test('single-image requests override layout examples and cannot save a positive 
  assert.match(assetPromptSystem('四视图是模板默认',true),/本次版式已明确为单幅/);
  assert.throws(()=>assertSingleAssetImage('标准四视图，正侧背面拼版'),/未保存/);
  assert.doesNotThrow(()=>assertSingleAssetImage('单幅角色图，不要四视图，不做拼版。'));
+ assert.doesNotThrow(()=>assertSingleAssetImage('单幅画面，禁止四宫格拼版或多视图，不能出现文字。'));
+ assert.doesNotThrow(()=>assertSingleAssetImage('单一角色，无四视图和拼图排版。'));
 });

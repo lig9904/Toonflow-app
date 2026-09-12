@@ -8,7 +8,7 @@ import { resolveStoredVideoMode, captureVideoModeSelectionSnapshot } from '@/ser
 import { preflightVideoPrompt } from '@/services/videoPromptReview';
 import { videoPreflightVerdict } from '@/lib/videoPreflightContract';
 const ref=z.object({id:z.number().int().positive(),sources:z.enum(['assets','storyboard']),fileType:z.enum(['image','video','audio']).optional(),purpose:z.enum(['first_frame','last_frame','identity_reference','style_reference','motion_reference','audio_reference']).optional()}).strict();
-const schema=z.object({projectId:z.number().int().positive(),scriptId:z.number().int().positive(),model:z.string().min(1),resolution:z.string(),audio:z.boolean().optional(),trackData:z.array(z.object({trackId:z.number().int().positive(),prompt:z.string(),duration:z.number().positive(),references:z.array(ref).max(100),modeIntentRevision:z.number().int().nonnegative(),acknowledgement:z.string().optional()}).strict()).min(1).max(20)}).strict();
+const schema=z.object({projectId:z.number().int().positive(),scriptId:z.number().int().positive(),model:z.string().min(1),resolution:z.string(),audio:z.boolean().optional(),trackData:z.array(z.object({trackId:z.number().int().positive(),prompt:z.string(),duration:z.number().finite(),references:z.array(ref).max(100),modeIntentRevision:z.number().int().nonnegative(),acknowledgement:z.string().optional()}).strict()).min(1).max(20)}).strict();
 export default express.Router().post('/',async(req,res)=>{try{
  const input=schema.parse(req.body);await requireProductionOwner(req,input.projectId,u.db);
  const reports=[];

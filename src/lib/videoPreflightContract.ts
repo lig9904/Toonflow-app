@@ -19,6 +19,7 @@ export function videoPreflightVerdict(input: {trackId:number;shotLabel:string;bi
 
 export function videoSettingsIssues(capabilities:any,generation:{duration?:number;resolution?:string;audio?:boolean}):VideoPreflightIssue[]{
  const issues:VideoPreflightIssue[]=[];
+ if(typeof generation.duration==='number'&&generation.duration<=0)issues.push({code:'INVALID_DURATION',severity:'error',overridable:false,message:'生成时长必须大于0秒'});
  if(Array.isArray(capabilities?.durationResolutionMap)&&!capabilities.durationResolutionMap.some((entry:any)=>entry.duration?.includes(generation.duration)&&entry.resolution?.includes(generation.resolution)))issues.push({code:'UNSUPPORTED_VIDEO_SETTINGS',severity:'error',overridable:false,message:'当前模型不支持所选时长与清晰度组合',suggestion:'在视频参数中选择该模型支持的时长和清晰度'});
  if(generation.audio&&capabilities?.audio===false)issues.push({code:'AUDIO_UNSUPPORTED',severity:'error',overridable:false,message:'当前模型不支持生成音频',suggestion:'关闭音频或选择支持音频的模型'});
  return issues;

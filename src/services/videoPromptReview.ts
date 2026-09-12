@@ -145,6 +145,8 @@ export async function preflightVideoPrompt(db: Knex, input: { projectId: number;
   const findings = [...deterministicPromptFindings({ sourceSnapshot: source, referenceSnapshot: references, referenceLabels: labels }, input.prompt), ...await currentImageReferenceFindings(db, input)];
   if (!input.prompt.trim()) findings.push({code:"PROMPT_EMPTY",severity:"error",field:"prompt",message:"视频提示词不能为空",overridable:false,suggestion:"生成或手动填写提示词后保存"});
   findings.push(...videoSettingsIssues(input.capabilities,input.generation));
+  const scriptDuration=source.reduce((sum,row)=>sum+(Number(row.duration)||0),0);
+  if(typeof input.generation.duration==="number"&&input.generation.duration<scriptDuration)findings.push({code:"SOURCE_DURATION_EXCEEDS_GENERATION",severity:"error",field:"duration",overridable:false,message:`脚本 ${scriptDuration} 秒，当前生成时长 ${input.generation.duration} 秒不足以覆盖本镜头`,suggestion:"选择支持的更长时长，或先在画布明确拆分镜头"});
   try { validatePromptReferenceSelection(input.mode, [...Array(counts.image).fill("image"), ...Array(counts.video).fill("video"), ...Array(counts.audio).fill("audio")]); }
   catch (error) { findings.push({code:"REFERENCE_MODE_INVALID",severity:"error",field:"references",message:error instanceof Error ? error.message : "参考模式无效",overridable:false}); }
 

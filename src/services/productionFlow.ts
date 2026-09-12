@@ -97,7 +97,7 @@ export async function addProductionStoryboards(db: Knex, projectId: number, scri
 
 export async function saveProductionPlanning(db: Knex, projectId: number, scriptId: number, expectedPlanningVersion: number, data: {
   scriptPlan: string; storyboardTable: string; storyboard?: Array<{ id?: number; collaboration?: { version: number } }>;
-}) {
+}, policy?: { fields: Array<"scriptPlan" | "storyboardTable">; allowClear?: boolean }) {
   return withProjectTransaction(db, projectId, async (trx) => {
     await assertEpisode(trx, projectId, scriptId);
     const key = { projectId, episodesId: scriptId, key: "productionAgent" };
@@ -107,6 +107,17 @@ export async function saveProductionPlanning(db: Knex, projectId: number, script
     if (!cached || typeof cached !== "object" || Array.isArray(cached)) cached = {};
     const version = Number.isSafeInteger(cached.planningVersion) ? cached.planningVersion : 0;
     if (version !== expectedPlanningVersion) throw new ProductionFlowError("制作规划已被其他客户端修改，请重新载入", 409);
+    // Browser background/order writes must never carry an entire stale planning snapshot.
+    if (policy) {
+      const next = { ...data };
+      for (const field of ["scriptPlan", "storyboardTable"] as const) {
+        if (!policy.fields.includes(field)) next[field] = typeof cached[field] === "string" ? cached[field] : "";
+        else if (!policy.allowClear && String(cached[field] ?? "").trim() && !next[field].trim()) {
+          throw new ProductionFlowError("清空已保存正文需要明确确认，请重新打开编辑器并点击保存", 409);
+        }
+      }
+      data = next;
+    }
     const storyboardVersions: Record<number, number> = {};
     let reordered = false;
     if (data.storyboard?.length && data.storyboard.every((item) => item.id)) {

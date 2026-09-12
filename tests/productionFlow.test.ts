@@ -146,4 +146,25 @@ describe("production flow relational source of truth", () => {
     assert.deepEqual((await f.db("o_storyboard").where({ scriptId: 10 }).orderBy("index")).map(row => row.id), [912, 911, 910]);
   });
 
+  it("background order writes cannot clear planning even with a current version and an empty snapshot", async () => {
+    await saveProductionPlanning(f.db, 100, 10, 0, { scriptPlan: "saved plan", storyboardTable: "saved table" });
+    const result = await saveProductionPlanning(f.db, 100, 10, 1, { scriptPlan: "", storyboardTable: "" }, { fields: [] });
+    assert.equal(result.planningVersion, 1);
+    const saved = JSON.parse((await f.db("o_agentWorkData").where({projectId:100,episodesId:10,key:"productionAgent"}).first()).data);
+    assert.equal(saved.scriptPlan,"saved plan"); assert.equal(saved.storyboardTable,"saved table");
+  });
+  it("manual planning saves only the explicitly edited field, preserving sibling content", async () => {
+    await saveProductionPlanning(f.db, 100, 10, 0, {scriptPlan:"saved plan",storyboardTable:"saved table"});
+    await saveProductionPlanning(f.db, 100, 10, 1, {scriptPlan:"new plan",storyboardTable:""},{fields:["scriptPlan"]});
+    const saved=JSON.parse((await f.db("o_agentWorkData").where({projectId:100,episodesId:10,key:"productionAgent"}).first()).data);
+    assert.equal(saved.scriptPlan,"new plan"); assert.equal(saved.storyboardTable,"saved table");
+  });
+  it("clearing existing text requires explicit confirmation and rejects generated empty output", async () => {
+    await saveProductionPlanning(f.db,100,10,0,{scriptPlan:"plan",storyboardTable:"table"});
+    await assert.rejects(saveProductionPlanning(f.db,100,10,1,{scriptPlan:"",storyboardTable:""},{fields:["storyboardTable"]}), (e:any)=>e.status===409);
+    await saveProductionPlanning(f.db,100,10,1,{scriptPlan:"",storyboardTable:""},{fields:["storyboardTable"],allowClear:true});
+    const saved=JSON.parse((await f.db("o_agentWorkData").where({projectId:100,episodesId:10,key:"productionAgent"}).first()).data);
+    assert.equal(saved.scriptPlan,"plan"); assert.equal(saved.storyboardTable,""); assert.equal(saved.planningVersion,2);
+  });
+
 });

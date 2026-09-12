@@ -682,3 +682,19 @@ test("upgrading the old varchar workspace preserves data and accepts long serial
     assert.equal((await f.db("o_user").where({ id: 1 }).first()).name, "admin");
   } finally { await f.destroy(); }
 });
+
+test('format retry is budgeted and does not repeat saved planning', options, async()=>{
+ const f=await fixture();let reviews=0,plans=0;
+ try{
+  const model=modelFor(req=>{
+   if(req.role==='productionAgent:decisionAgent')return{actions:['planning','review'],assetIds:[],storyboardIds:[],question:null,summary:'plan and review'};
+   if(req.role==='productionAgent:directorPlanAgent'){plans++;return{scriptPlan:'Only one committed plan'};}
+   reviews++;if(reviews===1)throw new StructuredModelOutputError('MODEL_OUTPUT_FORMAT',{role:req.role,finishReason:'stop',maxOutputTokens:4000,textCharacters:120,outputTokens:20});
+   assert.match(req.system,/上次输出未通过 JSON/);return{findings:[],summary:'review passed'};
+  },[]);
+  const result=await runOnce(f,model);
+  assert.equal(result.run.status,'succeeded',result.run.errorMessage??'');assert.equal(plans,1);assert.equal(reviews,2);assert.equal(result.run.modelCalls,4);
+  const saved=await f.db('o_agentWorkData').where({projectId:f.projectId,key:'productionAgent'});assert.equal(saved.length,1);assert.equal(JSON.parse(saved[0].data).planningVersion,1);
+  const retry=await f.db('ext_builtin_run_steps').where({runId:result.run.id,stepKey:'production.review.formatRetry:r0'}).first();assert.equal(retry.status,'completed');assert.equal(retry.modelCall,true);
+ }finally{await f.destroy();}
+});

@@ -1,3 +1,4 @@
+import { runStructuredStage, formatRetryInstruction } from "./structuredStage";
 import { createHash } from "node:crypto";
 import type { Knex } from "knex";
 import { z } from "zod";
@@ -225,7 +226,7 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
       }
       const system = role === "productionAgent:decisionAgent" ? `${productionDecisionPrompt}\n声音绑定以 flow.voiceReferences 为准；音频不在视觉素材 assets 列表不代表没有声音参考。已有绑定不得报告为未配置。\n${scopedMediaInstructionPrompt}`
         : `${await skill(skillName)}\n${frozenSkills["volcengine_seedream.md"] ?? ""}\n\n当前服务器执行契约：${productionStageContract(role)} 所有项目、剧集、素材、分镜 ID 必须来自输入。声音绑定以 flow.voiceReferences 为准，不能仅因音频不在视觉素材列表而断言缺失。`;
-      const result = await ctx.step(`production.${key}:r${revision}`, { input, role, systemHash: hash(system), ...(independentOutput ? { outputBudgetMode: "model_per_call" } : { budget, reserveTokens }) }, async () => {
+      const result = await runStructuredStage(attempt => ctx.step(`production.${key}${attempt ? ".formatRetry" : ""}:r${revision}`, { input, role, systemHash: hash(system + (attempt ? formatRetryInstruction : "")), ...(independentOutput ? { outputBudgetMode: "model_per_call" } : { budget, reserveTokens }) }, async () => {
         const remaining = !independentOutput && ctx.remainingOutputTokens ? await ctx.remainingOutputTokens() : run.limits.maxOutputTokens;
         const effectiveBudget = independentOutput ? 0 : Math.min(budget, remaining - reserveTokens);
         if (!independentOutput && effectiveBudget < 128) throw new BuiltinRuntimeError("BUDGET_EXCEEDED", "本次运行的剩余文本输出额度不足，请缩小下一步范围；已保存结果保留");
@@ -240,9 +241,9 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
           lastPreviewAt = Date.now(); lastText = text;
           await ctx.emit("artifact.preview", { target, text: text.slice(0, 200_000), inputRevision: revision });
         } : undefined;
-        const generated = await deps.model.generate({ role, system, input, schema, maxOutputTokens: effectiveBudget, ...(independentOutput ? { useModelOutputLimit: true } : {}), ...(preview ? { onPartial: preview } : {}), signal: ctx.signal, thinkLevel });
+        const generated = await deps.model.generate({ role, system: system + (attempt ? formatRetryInstruction : ""), input, schema, maxOutputTokens: effectiveBudget, ...(independentOutput ? { useModelOutputLimit: true } : {}), ...(preview ? { onPartial: preview } : {}), signal: ctx.signal, thinkLevel });
         return { value: schema.parse(generated.value), outputTokens: generated.outputTokens, ...(generated.maxOutputTokens ? { maxOutputTokens: generated.maxOutputTokens } : {}) };
-      }, { modelCall: true });
+      }, { modelCall: true }), async () => { await ctx.assertActive(); await ctx.emit("message.completed", { text: "本步骤输出格式不完整，正在自动重新整理一次；已保存内容保留。" }); });
       return result.value;
     };
     const explicitVideoOnly = isExplicitVideoOnlyRequest(requestText);

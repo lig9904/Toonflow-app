@@ -257,7 +257,7 @@ test("all accepted batch tracks are durably queued before execution begins", opt
   } finally { await f.destroy(); }
 });
 
-import { preflightVideoPrompt, readCurrentVideoPromptReview, reviewGeneratedVideoPrompt } from "../src/services/videoPromptReview";
+import { preflightVideoPrompt, readCurrentVideoPromptReview, reviewGeneratedVideoPrompt, VideoPreflightError } from "../src/services/videoPromptReview";
 import type { VideoPromptComposition } from "../src/services/videoPromptComposition";
 const frozenComposition = (version = "v1"): VideoPromptComposition => ({ system: `generation-${version}`, reviewSystem: `review-${version}`, visualManual: "fixture style", versions: [{ key: "common.videoPromptGeneration", version }, { key: "review.videoPromptReview", version }], context: { model: "fixture:model", mode: "text", actualMode: "text", scriptDuration: 3, generation: { duration: 4, resolution: "480p", audio: false }, parameterSource: "用户本次选择", capabilities: { mode: ["text"], audio: "optional", durationResolutionMap: [{ duration: [4, 6], resolution: ["480p"] }] } } });
 
@@ -306,7 +306,7 @@ test("failed semantic review stays durable, retries do not repeat the model call
     assert.equal((await f.db("o_videoTrack").where({ id: f.firstTrack }).first()).prompt, "灵兽说：我已知道");
     await f.db("o_storyboard").where({ trackId: f.firstTrack }).update({ videoDesc: "source camera edited" });
     assert.equal(await readCurrentVideoPromptReview(f.db, { ...input, prompt: completed.resultPrompt! }), null);
-    await assert.rejects(preflightVideoPrompt(f.db, { ...input, prompt: "@图片1 灵兽说：我已知道" }), /未提供的标签/);
+    await assert.rejects(preflightVideoPrompt(f.db, { ...input, prompt: "@图片1 灵兽说：我已知道" }), (error:any) => error instanceof VideoPreflightError && error.report.findings.some(finding=>/未提供的标签/.test(finding.message)));
   } finally { await f.destroy(); }
 });
 
@@ -333,7 +333,7 @@ test("video preflight reports the current selected image review boundary", optio
     const reference = await f.db("o_storyboard").where({ trackId: f.secondTrack }).first();
     const report = await preflightVideoPrompt(f.db, { projectId: f.projectId, scriptId: f.scriptId, trackId: f.firstTrack, prompt: "灵兽说：我已知道", model: "fixture:model", mode: "singleImage", generation: { duration: 4, resolution: "480p", audio: false }, info: [{ id: Number(reference.id), sources: "storyboard", fileType: "image" }] });
     assert(report.findings.some((finding) => finding.code === "IMAGE_REFERENCE_UNREVIEWED"));
-    assert.match(report.summary, /确定性检查/);
+    assert.match(report.summary, /检查/); assert.equal(report.preflight?.canSubmit,true);
   } finally { await f.destroy(); }
 });
 

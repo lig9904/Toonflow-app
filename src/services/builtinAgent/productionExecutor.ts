@@ -64,7 +64,7 @@ const deriveSchema = z.object({ assets: z.array(z.object({ id: z.number().int().
 const storyboardSchema = z.object({
   items: z.array(z.object({
     id: z.number().int().positive().nullable().default(null),
-    prompt: z.string().max(20_000).describe("图片的可见画面：景别、构图、角色、动作、场景、道具；对白和画外声音放 videoDesc"), duration: z.number().positive().max(300), track: z.string().trim().min(1).max(100),
+    prompt: z.string().max(20_000).describe("只写镜头开始时首帧的景别、构图、可见角色、场景、道具；后续切镜、动作、对白和画外声音完整放videoDesc"), duration: z.number().positive().max(300), track: z.string().trim().min(1).max(100),
     videoDesc: z.string().max(20_000).describe("完整视频动作、运镜和声音；台词逐字保留，明确说话人及画外声音"), shouldGenerateImage: z.number().int().min(0).max(1),
     associateAssetsIds: z.array(z.number().int().positive()).max(100).describe("本镜可见角色、场景、道具的真实素材ID，不能遗漏或只在场头引用"), expectedVersion: z.number().int().nonnegative().nullable().default(null),
   }).strict()).min(1).max(500),

@@ -451,7 +451,8 @@ export class VideoJobService {
         if (Number(finalLease.submissionLeaseUntil ?? 0) <= this.now()) {
           throw Object.assign(new Error("参考素材核验期间提交租约已到期，视频未提交"), { submissionOutcome: "not_submitted" });
         }
-        const submitted = await provider.submit(submitConfig);
+        const { toonflowPreflightAcknowledgement: _approval, ...providerConfig } = submitConfig as Record<string, unknown>;
+        const submitted = await provider.submit(providerConfig);
         if (!submitted?.taskId) throw new Error("上游未返回任务 ID");
         await this.db.transaction(async (trx) => {
           const updated = await trx("ext_video_jobs")

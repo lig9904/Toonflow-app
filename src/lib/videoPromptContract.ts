@@ -1,3 +1,4 @@
+import type { VideoPreflightTarget, VideoPreflightVerdict } from "./videoPreflightContract";
 import type { VideoPromptReviewFailure } from "../services/videoPromptReviewRuntime";
 
 /** Server-owned input/output protocol, shared by every model and mode. */
@@ -8,8 +9,9 @@ export function videoPromptSystem(reference?: string): string {
 保留用户明确的光影、配乐、镜像、记忆同框和当前创作要求，不擅自增加角色或剧情。按源时间线安排动作与对白；额外生成时长可自然延续或静持，精确裁剪由后期处理，不承诺逐帧时序。音频关闭时保留对白作为剧情与表演依据，不声称生成有声对白。模式、时长、分辨率和参考上限以程序参数为准。`;
 }
 
-export interface VideoPromptFinding { code: string; severity: "error" | "warning" | "info"; message: string; shotId?: number; field?: string }
+export interface VideoPromptFinding { code: string; severity: "error" | "warning" | "info"; message: string; shotId?: number; field?: string; target?: VideoPreflightTarget; overridable?: boolean; expected?: string; suggestion?: string }
 export interface VideoPromptReviewReport {
+  preflight?: VideoPreflightVerdict;
   status: "passed" | "issues" | "failed" | "pending" | "skipped";
   findings: VideoPromptFinding[];
   summary: string;

@@ -276,3 +276,23 @@ test("selected old storyboard and root asset reviews survive over 200 newer hist
     assert.equal(hydrated, 500);
   } finally { await f.destroy(); }
 });
+
+import {ensureTrackWorkspaceSchema} from "../src/services/trackWorkspace";
+import {preflightVideoPrompt,VideoPreflightError} from "../src/services/videoPromptReview";
+test("video preflight attributes output framing to S10 image3, collects it, and requires current confirmation",options,async()=>{
+ const f=await fixture({generate:async()=>({summary:"wrong crop",findings:[{code:"SHOT_FRAMING_MISMATCH",severity:"error",message:"full body instead of opening close-up",confidence:0.95}]})});
+ try{
+  await ensureTrackWorkspaceSchema(f.db);
+  const [trackId]=await insertRowsReturningIds(f.db,"o_videoTrack",{projectId:f.projectId,scriptId:f.scriptId,duration:4,prompt:"saved human prompt"});
+  await f.db("o_storyboard").where({id:f.targetId}).update({trackId,index:9});
+  await f.jobs.prepareAndSubmit(f.input);await f.reviews.runDue();
+  const info=[...f.refs.map(r=>({id:r.assetId,sources:"assets" as const,fileType:"image" as const,purpose:"identity_reference"})),{id:f.targetId,sources:"storyboard" as const,fileType:"image" as const,purpose:"first_frame"}];
+  const input={projectId:f.projectId,scriptId:f.scriptId,trackId,prompt:"@图片3 是首帧",model:"fixture:video",mode:["imageReference:9"],generation:{duration:4,resolution:"480p",audio:false},info};
+  const report=await preflightVideoPrompt(f.db,{...input,collectOnly:true});const issue=report.preflight!.issues.find(i=>i.code==="IMAGE_REFERENCE_SHOT_FRAMING_MISMATCH")!;
+  assert.equal(issue.target?.referenceLabel,"图片3");assert.equal(issue.target?.referenceIndex,2);assert.equal(issue.target?.shotLabel,"S10");assert.equal(issue.target?.id,f.targetId);assert.equal(report.preflight?.canSubmit,false);
+  await assert.rejects(preflightVideoPrompt(f.db,input),VideoPreflightError);
+  const confirmed=await preflightVideoPrompt(f.db,{...input,acknowledgement:report.preflight!.fingerprint});assert.equal(confirmed.preflight?.acknowledged,true);
+  await assert.rejects(preflightVideoPrompt(f.db,{...input,prompt:"新提示词",acknowledgement:report.preflight!.fingerprint}),VideoPreflightError);
+  assert.equal((await f.db("o_videoTrack").where({id:trackId}).first()).prompt,"saved human prompt");assert.equal(await f.db.schema.hasTable("ext_video_jobs") ? (await f.db("ext_video_jobs")).length : 0,0);
+ }finally{await f.destroy();}
+});

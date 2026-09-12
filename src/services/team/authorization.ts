@@ -73,6 +73,7 @@ add("POST", ["/api/script/addScript"], project("edit", "projectId", [{ table: "o
 add("POST", ["/api/script/extractAssets"], project("edit", "projectId", [{ table: "o_script", field: "scriptIds", many: true }]));
 add("POST", ["/api/production/assets/batchGenerateAssetsImage"], project("edit", "projectId", [{ table: "o_script", field: "scriptId" }, { table: "o_assets", field: "assetIds", many: true }]));
 add("POST", ["/api/production/storyboard/batchGenerateImage"], project("edit", "projectId", [{ table: "o_script", field: "scriptId" }, { table: "o_storyboard", field: "storyboardIds", many: true }]));
+add("POST", ["/api/production/workbench/inspectVideoGeneration"], project("read", "projectId", [{ table: "o_script", field: "scriptId" }, { table: "o_videoTrack", field: "trackData", nestedIdField: "trackId", many: true }]));
 add("POST", ["/api/production/workbench/checkVideoPrompt"], project("read", "projectId", [{ table: "o_script", field: "scriptId" }, { table: "o_videoTrack", field: "trackIds", many: true }]));
 add("POST", ["/api/production/workbench/resolveVideoMode"], project("read", "projectId", [{ table: "o_script", field: "scriptId" }, { table: "o_videoTrack", field: "trackId" }]));
 add("POST", ["/api/production/workbench/planIndependentTracks"], project("read", "projectId", [{ table: "o_script", field: "scriptId", optional: true }]));

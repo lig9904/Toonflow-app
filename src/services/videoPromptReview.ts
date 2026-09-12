@@ -1,3 +1,4 @@
+import { classifyImageFinding, videoPreflightVerdict, videoSettingsIssues, type VideoPreflightTarget } from "../lib/videoPreflightContract";
 import { createHash } from "node:crypto";
 import type { Knex } from "knex";
 import { z } from "zod";
@@ -95,10 +96,10 @@ export async function readCurrentVideoPromptReview(db: Knex, input: { projectId:
   return null;
 }
 
-function imageReviewBoundaryFinding(item: CurrentImageReviewResult): VideoPromptFinding[] {
-  const label = `${item.targetKind === "storyboard" ? "分镜" : "素材"} ${item.targetId}`;
+function imageReviewBoundaryFinding(item: CurrentImageReviewResult, target: VideoPreflightTarget): VideoPromptFinding[] {
+  const label = `${target.shotLabel ? target.shotLabel + " · " : ""}${target.referenceLabel}${target.purpose === "first_frame" ? "（首帧）" : target.purpose === "last_frame" ? "（尾帧）" : ""}`;
   if (item.state === "passed") return [];
-  if (item.state === "issues" && item.review) return item.review.findings.map((finding) => ({ ...finding, code: `IMAGE_REFERENCE_${finding.code}`, field: "references", message: `参考图片 ${label}：${finding.message}` }));
+  if (item.state === "issues" && item.review) return item.review.findings.map((finding) => ({ ...classifyImageFinding(finding, target.purpose), target, code: `IMAGE_REFERENCE_${finding.code}`, field: "references", message: `${label}：${finding.message}`, suggestion: /FRAMING|SHOT_SIZE/.test(finding.code) ? "按镜头开始状态重新生成首帧；仅当原图有足够局部细节时使用裁切" : "对照当前镜头要求检查这张参考图" }));
   const boundary = {
     pending: ["info", "图片核验仍在进行；本次没有等待或自动重画"],
     stale: ["warning", "现有图片核验与当前选中图片或其来源版本不匹配"],
@@ -107,10 +108,10 @@ function imageReviewBoundaryFinding(item: CurrentImageReviewResult): VideoPrompt
     missing: ["warning", "当前参考对象没有已选中的图片"],
     issues: ["warning", "图片核验发现需要关注的问题"],
   }[item.state] as ["info" | "warning", string] | undefined;
-  return boundary ? [{ code: `IMAGE_REFERENCE_${item.state.toUpperCase()}`, severity: boundary[0], field: "references", message: `参考图片 ${label}：${boundary[1]}` }] : [];
+  return boundary ? [{ code: `IMAGE_REFERENCE_${item.state.toUpperCase()}`, severity: boundary[0], target, field: "references", message: `参考图片 ${label}：${boundary[1]}` }] : [];
 }
 
-async function currentImageReferenceFindings(db: Knex, input: { projectId: number; scriptId: number; model?: string; info: Array<{ id: number; sources: string; fileType?: string }>; referenceTypes?: Array<"image" | "video" | "audio"> }): Promise<VideoPromptFinding[]> {
+async function currentImageReferenceFindings(db: Knex, input: { projectId: number; scriptId: number; model?: string; info: Array<{ id: number; sources: string; fileType?: string; purpose?: string }>; referenceTypes?: Array<"image" | "video" | "audio"> }): Promise<VideoPromptFinding[]> {
   const trusted = isVolcengineTrustedModel(input.model) ? await readPromptTrustedBindings(db, input.projectId, input.scriptId, input.info) : [];
   const imageInputs = input.info.filter((item, index) => (input.referenceTypes?.[index] ?? item.fileType ?? "image") === "image" && !trusted.some((entry) => entry.inputIndex === index));
   const storyboardIds = [...new Set(imageInputs.filter((item) => item.sources === "storyboard").map((item) => Number(item.id)))];
@@ -119,22 +120,43 @@ async function currentImageReferenceFindings(db: Knex, input: { projectId: numbe
     storyboardIds.length ? readCurrentImageReviewResults(db, { projectId: input.projectId, scriptId: input.scriptId, targetKind: "storyboard", targetIds: storyboardIds }).catch(() => []) : [],
     assetIds.length ? readCurrentImageReviewResults(db, { projectId: input.projectId, scriptId: input.scriptId, targetKind: "asset", targetIds: assetIds }).catch(() => []) : [],
   ]);
-  return [...storyboards, ...assets].flatMap(imageReviewBoundaryFinding).concat(trusted.map((entry) => ({ code: "VOLCENGINE_TRUSTED_REFERENCE", severity: "info" as const, field: "references", message: `引用已绑定的火山素材 ${entry.assetId}；本地图片核验结果不代表云端素材已核验，提交前会重新检查素材可用状态` })));
+  const indexes = storyboardIds.length ? await db("o_storyboard").where({projectId:input.projectId,scriptId:input.scriptId}).whereIn("id",storyboardIds).select("id","index","prompt") : [];
+  let imageIndex=0;
+  const findings:VideoPromptFinding[]=[];
+  input.info.forEach((ref,index)=>{
+    if((input.referenceTypes?.[index] ?? ref.fileType ?? "image")!=="image")return;
+    imageIndex++;
+    if(trusted.some(entry=>entry.inputIndex===index))return;
+    const item=[...storyboards,...assets].find(row=>Number(row.targetId)===Number(ref.id)&&row.targetKind===(ref.sources==="storyboard"?"storyboard":"asset"));
+    if(!item)return;
+    const shot=ref.sources==="storyboard"?indexes.find(row=>Number(row.id)===Number(ref.id)):undefined;
+    const target:VideoPreflightTarget={kind:ref.sources==="storyboard"?"storyboard":"asset",id:Number(ref.id),referenceIndex:index,referenceLabel:`图片${imageIndex}`,purpose:ref.purpose,shotLabel:shot?`S${String(Number(shot.index)+1).padStart(2,"0")}`:undefined,artifactPath:item.artifactPath,artifactHash:item.artifactHash,reviewId:item.review?.id};
+    findings.push(...imageReviewBoundaryFinding(item,target).map(f=>({...f,expected:shot?.prompt})));
+  });
+  return findings.concat(trusted.map((entry) => ({ code: "VOLCENGINE_TRUSTED_REFERENCE", severity: "info" as const, field: "references", message: `引用已绑定的火山素材 ${entry.assetId}；本地图片核验结果不代表云端素材已核验，提交前会重新检查素材可用状态` })));
 }
 
 /** Pre-submission is read-only and never rewrites a manually edited prompt or calls a paid model. */
-export async function preflightVideoPrompt(db: Knex, input: { projectId: number; scriptId: number; trackId: number; prompt: string; model: string; mode: unknown; generation: VideoGenerationSettings; info: Array<{ id: number; sources: string; fileType?: string }>; referenceTypes?: Array<"image" | "video" | "audio"> }): Promise<VideoPromptReviewReport> {
+export async function preflightVideoPrompt(db: Knex, input: { projectId: number; scriptId: number; trackId: number; prompt: string; model: string; mode: unknown; generation: VideoGenerationSettings; info: Array<{ id: number; sources: string; fileType?: string; purpose?: string }>; referenceTypes?: Array<"image" | "video" | "audio">; collectOnly?: boolean; acknowledgement?: string; referenceBinding?: unknown; capabilities?: unknown }): Promise<VideoPromptReviewReport> {
   const source = await db("o_storyboard").where({ projectId: input.projectId, scriptId: input.scriptId, trackId: input.trackId }).orderBy("index").orderBy("id").select("id", "prompt", "videoDesc", "duration");
   const references = await currentPromptReferences(db, input.projectId, input.scriptId, source, { info: input.info, ...(isVolcengineTrustedModel(input.model) ? { trustedAssets: [] } : {}) });
   const counts = { image: 0, video: 0, audio: 0 };
   const labels = input.info.map((item, index) => { const type = input.referenceTypes?.[index] ?? item.fileType ?? "image"; if (!(type in counts)) throw new VideoJobError("INVALID_INPUT", "参考媒体类型无效"); const media = type as keyof typeof counts; return `@${{ image: "图片", video: "视频", audio: "音频" }[media]}${++counts[media]}`; });
   const findings = [...deterministicPromptFindings({ sourceSnapshot: source, referenceSnapshot: references, referenceLabels: labels }, input.prompt), ...await currentImageReferenceFindings(db, input)];
-  if (!input.prompt.trim()) throw new VideoJobError("INVALID_INPUT", "视频提示词不能为空");
+  if (!input.prompt.trim()) findings.push({code:"PROMPT_EMPTY",severity:"error",field:"prompt",message:"视频提示词不能为空",overridable:false,suggestion:"生成或手动填写提示词后保存"});
+  findings.push(...videoSettingsIssues(input.capabilities,input.generation));
   try { validatePromptReferenceSelection(input.mode, [...Array(counts.image).fill("image"), ...Array(counts.video).fill("video"), ...Array(counts.audio).fill("audio")]); }
-  catch (error) { throw new VideoJobError("INVALID_INPUT", error instanceof Error ? error.message : "参考模式无效"); }
-  const invalid = findings.find((finding) => finding.severity === "error");
-  if (invalid) throw new VideoJobError("INVALID_INPUT", invalid.message);
+  catch (error) { findings.push({code:"REFERENCE_MODE_INVALID",severity:"error",field:"references",message:error instanceof Error ? error.message : "参考模式无效",overridable:false}); }
+
   const saved = await readCurrentVideoPromptReview(db, input);
-  if (saved) return { ...saved, findings: [...saved.findings, ...findings.filter((item) => !saved.findings.some((existing) => existing.code === item.code && existing.message === item.message))] };
-  return { status: findings.length ? "issues" : "skipped", findings, summary: "当前提示词已完成确定性检查；没有与当前正文、源分镜、参考和参数完全匹配的语义复核", revised: false, reviewedAt: Date.now() };
+  const row = await db("o_storyboard").where({projectId:input.projectId,scriptId:input.scriptId,trackId:input.trackId}).orderBy("index").first("index");
+  const shotLabel=row?`S${String(Number(row.index)+1).padStart(2,"0")}`:`自建片段 T${input.trackId}`;
+  const preflight=videoPreflightVerdict({trackId:input.trackId,shotLabel,issues:findings,acknowledgement:input.acknowledgement,binding:{projectId:input.projectId,scriptId:input.scriptId,trackId:input.trackId,prompt:input.prompt,source,references,model:input.model,mode:input.mode,generation:input.generation,referenceBinding:input.referenceBinding}});
+  const report:VideoPromptReviewReport=saved?{...saved,preflight,findings:[...saved.findings,...findings.filter(item=>!saved.findings.some(existing=>existing.code===item.code&&existing.message===item.message))]}:{preflight,status:findings.length?"issues":"skipped",findings,summary:"已检查当前提示词、参考图片和生成输入；未重新调用模型",revised:false,reviewedAt:Date.now()};
+  if(!preflight.canSubmit&&!input.collectOnly)throw new VideoPreflightError(report);
+  return report;
+}
+
+export class VideoPreflightError extends VideoJobError {
+  constructor(public readonly report:VideoPromptReviewReport){super("INVALID_INPUT",`${report.preflight?.shotLabel ?? "当前片段"}有${report.preflight?.issues.filter(i=>i.severity==="error").length ?? 1}项生成前问题，视频尚未提交`);}
 }

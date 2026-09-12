@@ -1,3 +1,4 @@
+import { VideoPreflightError } from "./videoPromptReview";
 import type { Knex } from "knex";
 import type { Request, Response } from "express";
 import { z, ZodError } from "zod";
@@ -25,6 +26,7 @@ export async function requireProductionOwner(req: Request, projectId: number, db
   return { id: `human:${userId}`, kind: "human" };
 }
 export function sendProductionError(res: Response, error: unknown) {
+  if (error instanceof VideoPreflightError) return res.status(422).json({code:"VIDEO_PREFLIGHT_BLOCKED",message:error.message,submissionOutcome:"not_submitted",report:error.report});
   if (error instanceof VideoModeResolutionError) return res.status(error.status).json({ code: error.code, message: error.message });
   if (error instanceof ImageFlowWorkspaceError || error instanceof MediaOwnershipError) {
     const status = error.code === "NOT_FOUND" ? 404 : error.code === "PROJECT_MISMATCH" ? 403 : error.code === "INVALID_INPUT" ? 400 : 409;
@@ -35,7 +37,7 @@ export function sendProductionError(res: Response, error: unknown) {
   if (error instanceof ZodError) return res.status(400).json({ code: "INVALID_INPUT", message: "参数错误", errors: error.issues.map((i) => i.message) });
   if (error instanceof VideoJobError) {
     const status = { CONFLICT:409, NOT_FOUND:404, PROJECT_MISMATCH:404, INVALID_INPUT:400, UNSUPPORTED_PROVIDER:422 }[error.code];
-    return res.status(status).json({ code:error.code, message:error.message });
+    return res.status(status).json({ code:error.code, message:error.message, submissionOutcome:"not_submitted" });
   }
   if (error instanceof ProductionStateError) {
     const status = { NOT_FOUND: 404, PROJECT_MISMATCH: 404, VERSION_CONFLICT: 409, LOCKED: 423, FORBIDDEN: 403, INVALID_INPUT: 400 }[error.code];

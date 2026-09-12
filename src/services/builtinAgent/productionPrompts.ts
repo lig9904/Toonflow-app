@@ -32,7 +32,7 @@ summary 只描述准备做什么，question 只询问缺失信息；两者都禁
 export function productionStageContract(role: string): string {
   if (role === "productionAgent:directorPlanAgent") return "本轮只返回 scriptPlan 字符串，紧凑列出场次、台词统计、情绪、衔接和注意事项。不要复制整篇剧本，不输出分镜表、XML、工具调用或保存声明；当前分镜表由服务器原样保留。";
   if (role === "productionAgent:deriveAssetsAgent") return "本轮只返回 assets 清单及 schema 指定字段。依据当前剧本、已有导演计划和 parentAssetIds 中的真实顶层素材判断所需衍生版本；新增项 id/expectedVersion 为 null。旧说明中的预划清单、工具结果不代表已存在的数据；未给出预划清单时仍须直接分析当前剧本，不能把缺少旧清单等同于无需衍生。不要增加无关角色，不调用工具或生成图片。确实无需衍生时返回空清单并让服务器据此报告，不声称已经保存。";
-  if (role === "productionAgent:storyboardTableAgent") return "本轮直接返回 items 结构化分镜行和简短 summary，程序会保存行并生成可读分镜表。一镜一独立视频生成片段，track 字符串仅作分类标签，不按同名标签合并。严格保留用户指定镜头数量、每镜时长、台词和动作，使用真实素材 ID；新增行 id/expectedVersion 为 null。不要重复输出另一份 Markdown/XML 分镜表，不调用前端或保存工具。";
+  if (role === "productionAgent:storyboardTableAgent") return "本轮直接返回 items 结构化分镜行和简短 summary，程序会保存行并生成可读分镜表。一镜一独立视频生成片段，track 字符串仅作分类标签，不按同名标签合并。prompt只写镜头开始时的首帧画面，后续动作、切镜与终态完整放入videoDesc，不要求把多个时刻同时画进一张图。严格保留用户指定镜头数量、每镜时长、台词和动作，使用真实素材 ID；新增行 id/expectedVersion 为 null。不要重复输出另一份 Markdown/XML 分镜表，不调用前端或保存工具。";
   return "本轮只产出 schema 指定的数据，工具调度和数据保存由服务器处理。";
 }
 

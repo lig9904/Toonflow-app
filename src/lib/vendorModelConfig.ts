@@ -22,7 +22,7 @@ export function upsertVendorModel(raw: unknown, modelName: string, model: any): 
   const index = models.findIndex((item) => item && item.modelName === modelName);
   const conflict = models.some((item, itemIndex) => itemIndex !== index && item?.modelName === nextModelName);
   if (conflict) throw new Error("模型ID已存在");
-  if (index >= 0) models[index] = model;
+  if (index >= 0) models[index] = models[index]?.modelName === nextModelName && models[index]?.type === model.type ? { ...models[index], ...model } : model;
   else models.push(model);
   return JSON.stringify(models);
 }
@@ -35,4 +35,14 @@ export function sortVendorConfigRows<T extends { id?: string | null }>(rows: T[]
     if (rightId === "toonflow" && leftId !== "toonflow") return 1;
     return leftId.localeCompare(rightId);
   });
+}
+
+/** A name-only customization must not erase the same registered model's capabilities. Explicit overrides still win. */
+export function mergeVendorModels(defaults:any[],custom:any[]):any[]{
+ const models=new Map<string,any>();
+ for(const item of [...defaults,...custom]){
+   const prior=models.get(item.modelName);
+   models.set(item.modelName,prior && prior.type===item.type ? {...prior,...item} : {...item});
+ }
+ return [...models.values()];
 }

@@ -1,3 +1,4 @@
+import {mergeVendorModels} from "../lib/vendorModelConfig";
 import { transform } from "sucrase";
 import fs from "fs";
 import { imageOutputSizes } from "../lib/imageRequestCapabilities";
@@ -27,7 +28,7 @@ export async function getModelList(id: string): Promise<Array<any>> {
   const jsCode = transform(code, { transforms: ["typescript"] }).code;
   const vendorData = u.vm(jsCode);
   if(!vendorData || !vendorData.vendor || !vendorData.vendor.models) return [];
-  const combined = [...JSON.parse(JSON.stringify(vendorData.vendor.models)), ...JSON.parse(models?.models ?? "[]")];
+  const combined = mergeVendorModels(JSON.parse(JSON.stringify(vendorData.vendor.models)), JSON.parse(models?.models ?? "[]"));
   const map = new Map<string, any>();
   for (const m of combined) {
     map.set(m.modelName, m.type === "image" ? { ...m, resolutions: imageOutputSizes(`${id}:${m.modelName}`, m) } : m);

@@ -21,6 +21,7 @@ interface TextModel {
   type: "text";
   think: boolean;
   maxOutputTokens?: number;
+  supportsVision?: boolean;
 }
 
 interface ImageModel {
@@ -143,7 +144,7 @@ const vendor: VendorConfig = {
     baseUrl: "https://api.deepseek.com/v1",
   },
   models: [
-    { name: "DeepSeek V4.1 Flash", modelName: "deepseek-flash", type: "text", think: true, maxOutputTokens: 384000 },
+    { name: "DeepSeek V4.1 Flash", modelName: "deepseek-flash", type: "text", think: true, supportsVision: true, maxOutputTokens: 384000 },
   ],
 };
 

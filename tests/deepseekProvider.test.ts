@@ -20,6 +20,7 @@ test("DeepSeek template and fresh-install bundle expose the verified V4.1 identi
   const f = fixture();
   assert.deepEqual(f.exported.vendor.models.map((model: any) => model.modelName), ["deepseek-flash"]);
   assert.equal(f.exported.vendor.models[0].maxOutputTokens, 384000);
+  assert.equal(f.exported.vendor.models[0].supportsVision,true);
   assert.equal(JSON.parse(fs.readFileSync("src/lib/vendor.json", "utf8"))["deepseek.ts"], f.code);
 });
 

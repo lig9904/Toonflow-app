@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { parseCustomModels, sortVendorConfigRows, upsertVendorModel } from "../src/lib/vendorModelConfig";
+import { parseCustomModels, sortVendorConfigRows, upsertVendorModel, mergeVendorModels } from "../src/lib/vendorModelConfig";
 
 describe("vendor configuration persistence", () => {
   it("orders toonflow first and all remaining vendors by stable id", () => {
@@ -38,4 +38,14 @@ describe("vendor configuration persistence", () => {
     assert.deepEqual(parseCustomModels(JSON.stringify(custom)), custom);
     assert.deepEqual(parseCustomModels("not-json"), []);
   });
+});
+
+it("same-model edits preserve capabilities, renamed models never inherit them",()=>{
+ const base={modelName:"flash",type:"text",name:"Flash",supportsVision:true,maxOutputTokens:384000,think:true};
+ const edited={modelName:"flash",type:"text",name:"My Flash",think:false};
+ assert.deepEqual(mergeVendorModels([base],[edited]),[{...base,...edited}]);
+ assert.equal(mergeVendorModels([base],[{...edited,supportsVision:false}])[0].supportsVision,false);
+ assert.equal(JSON.parse(upsertVendorModel(JSON.stringify([base]),"flash",edited))[0].maxOutputTokens,384000);
+ assert.equal(JSON.parse(upsertVendorModel(JSON.stringify([base]),"flash",{...edited,modelName:"other"}))[0].supportsVision,undefined);
+ assert.equal(mergeVendorModels([base],[{...edited,type:"image"}])[0].supportsVision,undefined);
 });

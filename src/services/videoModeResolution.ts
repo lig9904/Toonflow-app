@@ -4,7 +4,7 @@ import { z } from "zod";
 import { isPostgres, lockProjectTransaction } from "../lib/dbTransaction";
 import { isSeedance2Model, resolveVideoReferenceMediaType } from "../lib/videoPromptReferences";
 import { assertTrackWritable } from "./storyboardTrackIndependence";
-import { readBoundAudioReferences } from "./roleAudioWorkspace";
+import { readRoleVoiceCasting } from "./roleAudioWorkspace";
 
 const INTENTS = "ext_video_mode_intents";
 const RECEIPTS = "ext_video_mode_intent_requests";
@@ -218,9 +218,9 @@ export async function reloadStoryboardTrackReferences(db: Knex, raw: unknown, ac
     if (Number(current?.revision ?? 0) !== input.expectedModeIntentRevision) throw new VideoModeResolutionError("MODE_INTENT_CONFLICT", "视频生成方式或参考素材已变化，请刷新", 409);
     const linked = await trx("o_assets2Storyboard as link").join("o_assets as asset", "asset.id", "link.assetId").leftJoin("o_image as image", "image.id", "asset.imageId").where({ "link.storyboardId": input.storyboardId, "asset.projectId": input.projectId }).orderBy("link.id").select("asset.id", "asset.assetsId", "asset.type", "image.type as storedFileType", "image.filePath");
     const visual = linked.filter((row) => row.filePath).map((row) => { const fileType = resolveVideoReferenceMediaType(row.storedFileType, row.type, row.filePath); return { id: Number(row.id), sources: "assets" as const, fileType, purpose: fileType === "video" ? "motion_reference" as const : fileType === "audio" ? "audio_reference" as const : row.type === "role" ? "identity_reference" as const : "style_reference" as const }; });
-    const roleIds = [...new Set(linked.filter((row) => row.type === "role").flatMap((row) => [Number(row.id), Number(row.assetsId)]).filter((id) => Number.isSafeInteger(id) && id > 0))];
-    const audio = roleIds.length ? await readBoundAudioReferences(trx as unknown as Knex, input.projectId, roleIds) : [];
-    const nextReferences = [...(boards[0].filePath ? [{ id: input.storyboardId, sources: "storyboard" as const, fileType: "image" as const, purpose: "first_frame" as const }] : []), ...visual, ...audio.map((row) => ({ id: row.id, sources: "assets" as const, fileType: "audio" as const, purpose: "audio_reference" as const }))];
+    const roleIds = [...new Set(linked.filter(row=>row.type==="role").map(row=>Number(row.id)))];
+    const audio = await readRoleVoiceCasting(trx as unknown as Knex,input.projectId,roleIds);
+    const nextReferences = [...(boards[0].filePath ? [{ id: input.storyboardId, sources: "storyboard" as const, fileType: "image" as const, purpose: "first_frame" as const }] : []), ...visual, ...audio.map((row) => ({ id: row.audioId, sources: "assets" as const, fileType: "audio" as const, purpose: "audio_reference" as const }))];
     const references = [...new Map(nextReferences.map((reference) => [`${reference.sources}:${reference.id}`, reference])).values()];
     const referenceSourceSnapshot = await captureReferenceSources(trx, { ...input, references }, hashSource), previous = current ? z.array(referenceSchema).parse(parseJson(current.references ?? "[]")) : [], previousSources = current ? parseJson(current.referenceSourceSnapshot ?? "[]") : [];
     const changed = !Boolean(current?.referencesInitialized) || stable(previous) !== stable(references) || stable(previousSources) !== stable(referenceSourceSnapshot), revision = input.expectedModeIntentRevision + (changed ? 1 : 0);

@@ -7,6 +7,7 @@ import {
   ensureRoleAudioWorkspaceSchema,
   prepareAudioMatchContext,
   readBoundAudioReferences,
+  readRoleVoiceCasting,
   saveRoleAudioBinding,
   saveRoleAudioBindings,
   startAudioMatchRun,
@@ -188,5 +189,14 @@ test("fixed voice keeps one clip across additions, supports explicit replacement
   assert.equal(changed.binding.version,3);assert.equal(changed.binding.audioFamilies[0].voiceReference.id,Number(child.id));assert.equal(changed.binding.audioFamilies[0].voiceOptions.length,2);
   await f.db("o_image").where({id:media.id}).update({filePath:"/changed.mp3"});
   await assert.rejects(()=>readBoundAudioReferences(f.db,f.projectId,[f.roleId]),code("VERSION_CONFLICT"));
+ }finally{await f.destroy();}
+});
+
+test("derived characters inherit the fixed voice unless explicitly given their own", options, async()=>{
+ const f=await fixture();try{
+  await saveRoleAudioBinding(f.db,{projectId:f.projectId,roleAssetId:f.roleId,expectedVersion:1,audioIds:[f.firstAudio.childId],audioVersions:[{id:f.firstAudio.childId,expectedVersion:1}],idempotencyKey:"inherit-parent-voice"},actor);
+  assert.equal((await readRoleVoiceCasting(f.db,f.projectId,[f.derivedRoleId]))[0].audioId,f.firstAudio.childId);
+  await saveRoleAudioBinding(f.db,{projectId:f.projectId,roleAssetId:f.derivedRoleId,expectedVersion:1,audioIds:[f.secondAudio.childId],audioVersions:[{id:f.secondAudio.childId,expectedVersion:1}],idempotencyKey:"inherit-own-voice"},actor);
+  assert.equal((await readRoleVoiceCasting(f.db,f.projectId,[f.derivedRoleId]))[0].audioId,f.secondAudio.childId);
  }finally{await f.destroy();}
 });

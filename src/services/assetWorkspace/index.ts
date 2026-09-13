@@ -295,6 +295,10 @@ export async function uploadAsset(db: Knex, raw: any, actor: TrustedActor, stora
   await assertProject(db, projectId);
   const field: "base64" | "base64Data" = raw.base64Data === undefined ? "base64" : "base64Data";
   const media = await validateMedia(raw[field]);
+  if (["role", "tool", "scene"].includes(raw.type)) {
+    if (!media.image || !["png", "jpg", "webp"].includes(media.ext)) throw new AssetWorkspaceError("INVALID_INPUT", "角色、道具和场景只能上传 PNG、JPEG 或 WebP 图片");
+    if (!String(raw.name ?? "").trim()) throw new AssetWorkspaceError("INVALID_INPUT", "请输入资产名称");
+  }
   const canonical = mediaRequest(raw, media, field);
   const hash = requestHash(canonical);
   const replay = await readReceipt<any>(db, who, projectId, key, hash);

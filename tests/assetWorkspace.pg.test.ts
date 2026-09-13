@@ -243,3 +243,31 @@ test("media validation and upload reject forged bytes and missing projects witho
     await fixture.destroy();
   }
 });
+
+test("direct image uploads create role, tool and scene assets with selected reusable images; replacement keeps history and source text", options, async()=>{
+ const fixture=await makeFixture();
+ try{
+  const base64=await pngDataUrl('green');
+  for(const type of ['role','tool','scene']){
+   const body={projectId:fixture.projectId,type,name:`上传${type}`,describe:'已有设定',base64,idempotencyKey:`direct-upload-${type}`};
+   const created=await uploadAsset(fixture.db,body,actor,fixture.storage);
+   const replay=await uploadAsset(fixture.db,body,actor,fixture.storage);
+   assert.equal(replay.assetId,created.assetId);assert.equal(replay.reused,true);
+   const row=await fixture.db('o_assets').where({id:created.assetId}).first();
+   assert.equal(row.type,type);assert.equal(row.describe,'已有设定');assert.equal(Number(row.imageId),created.imageId);
+   assert.equal(row.assetsId,null);
+   const images=await getImages(fixture.db,created.assetId);assert.equal(images.tempAssets.length,1);
+   assert.ok(images.tempAssets[0].selected);
+   const originalPath=images.tempAssets[0].filePath;assert.ok(fixture.files.get(originalPath)?.equals(Buffer.from(base64.split(',')[1],'base64')));
+   const updated=await updateAsset(fixture.db,{id:created.assetId,projectId:fixture.projectId,expectedVersion:1,idempotencyKey:`text-${type}`,name:row.name,describe:row.describe,prompt:'保留人工提示词'},actor);
+   const newImage=await selectAssetImage(fixture.db,{id:created.assetId,projectId:fixture.projectId,expectedVersion:updated.asset.version,idempotencyKey:`replace-${type}`,base64:await pngDataUrl('blue')},actor,fixture.storage);
+   const after=await fixture.db('o_assets').where({id:created.assetId}).first();
+   assert.equal(after.prompt,'保留人工提示词');assert.equal(after.describe,'已有设定');assert.equal(Number(after.imageId),newImage.imageId);
+   assert.equal((await getImages(fixture.db,created.assetId)).tempAssets.length,2);assert.ok(fixture.files.has(originalPath));
+   await assert.rejects(selectAssetImage(fixture.db,{id:created.assetId,projectId:fixture.projectId,expectedVersion:updated.asset.version,idempotencyKey:`stale-${type}`,base64},actor,fixture.storage),(e:any)=>e.code==='VERSION_CONFLICT');
+  }
+  const writes=fixture.writes.length;
+  await assert.rejects(uploadAsset(fixture.db,{projectId:fixture.projectId,type:'role',name:'wrong',base64:wavDataUrl(),idempotencyKey:'role-audio-rejected'},actor,fixture.storage),(e:any)=>e.code==='INVALID_INPUT');
+  assert.equal(fixture.writes.length,writes);
+ }finally{await fixture.destroy();}
+});

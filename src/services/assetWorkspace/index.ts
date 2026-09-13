@@ -354,7 +354,7 @@ export async function selectAssetImage(db: Knex, raw: any, actor: TrustedActor, 
         if (!candidate) throw new AssetWorkspaceError("PROJECT_MISMATCH", "候选图片不属于该资产或尚未完成");
       }
       await advanceAssetState(trx, { entityId: assetId, projectId, expectedVersion: expected, actor });
-      await trx("o_assets").where({ id: assetId, projectId }).update({ imageId, prompt: raw.prompt ?? "" });
+      await trx("o_assets").where({ id: assetId, projectId }).update({ imageId, ...(raw.prompt === undefined ? {} : { prompt: raw.prompt }) });
       const result = { assetId, imageId, version: expected + 1 };
       await saveReceipt(trx, who, projectId, key, hash, result);
       return { ...result, reused: false };

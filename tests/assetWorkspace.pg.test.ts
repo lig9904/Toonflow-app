@@ -74,8 +74,8 @@ test("asset CAS, deterministic media replay, candidate ownership, and locked ref
       createAsset(fixture.db, { projectId: 999999, name: "ghost", describe: "", type: "role", mutationKey: "missing-project-1" }, actor),
       (error: any) => error instanceof AssetWorkspaceError && error.code === "NOT_FOUND",
     );
-    const created = await createAsset(fixture.db, { projectId: fixture.projectId, name: "hero", describe: "d", type: "role", idempotencyKey: "asset-create-1" }, actor);
-    const replay = await createAsset(fixture.db, { projectId: fixture.projectId, name: "hero", describe: "d", type: "role", mutationKey: "asset-create-1" }, actor);
+    const created = await createAsset(fixture.db, { projectId: fixture.projectId, name: "hero", describe: "d", type: "role", prompt: "Keep the saved character prompt", idempotencyKey: "asset-create-1" }, actor);
+    const replay = await createAsset(fixture.db, { projectId: fixture.projectId, name: "hero", describe: "d", type: "role", prompt: "Keep the saved character prompt", mutationKey: "asset-create-1" }, actor);
     assert.equal(replay.reused, true);
     assert.equal(replay.assetId, created.assetId);
     assert.equal(await fixture.db("o_assets").where({ projectId: fixture.projectId }).count("id as count").first().then((row: any) => Number(row?.count)), 1);
@@ -84,6 +84,7 @@ test("asset CAS, deterministic media replay, candidate ownership, and locked ref
     const selected = await selectAssetImage(fixture.db, { id: created.assetId, projectId: fixture.projectId, expectedVersion: 1, idempotencyKey: "asset-image-1", type: "role", base64: image }, actor, fixture.storage);
     const selectedReplay = await selectAssetImage(fixture.db, { id: created.assetId, projectId: fixture.projectId, expectedVersion: 1, mutationKey: "asset-image-1", type: "role", base64: image }, actor, fixture.storage);
     assert.equal(selectedReplay.reused, true);
+    assert.equal((await fixture.db("o_assets").where({id:created.assetId}).first()).prompt,"Keep the saved character prompt","Selecting an image without a prompt must preserve saved text");
     assert.equal(selectedReplay.imageId, selected.imageId);
     assert.equal(fixture.writes.length, 1, "a receipt replay must not stage another file");
     assert.equal(fixture.files.size, 1);

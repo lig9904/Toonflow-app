@@ -146,6 +146,8 @@ test("the route registry is exact, complete for router.ts, and classifies reads 
   assert.deepEqual(missing, []);
   assert.equal(getRouteAuthorization("POST", "/api/setting/loginConfig/getUser"), undefined);
   assert.equal(getRouteAuthorization("POST", "/api/assets/pollingImageAssets")?.action, "read");
+  assert.equal(getRouteAuthorization("POST", "/api/assets/uploadImage")?.action, "edit");
+  assert.equal(getRouteAuthorization("POST", "/api/assets/uploadImage")?.scope, "project");
   assert.equal(getRouteAuthorization("POST", "/api/project/getModelDetails")?.action, "read");
   assert.equal(getRouteAuthorization("POST", "/api/setting/vendorConfig/deleteVendor")?.scope, "admin");
   assert.equal(getRouteAuthorization("POST", "/api/other/deleteAllData")?.scope, "admin");

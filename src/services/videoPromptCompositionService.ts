@@ -1,6 +1,6 @@
 import type { Knex } from "knex";
 import type { VideoPromptReviewReport } from "../lib/videoPromptContract";
-import { executeVideoPromptJob, findVideoPromptJobByIdempotency, VideoPromptJobError, type VideoPromptJob, type VideoPromptJobInput } from "./videoPromptJobs";
+import { recordVideoPromptDraft, executeVideoPromptJob, findVideoPromptJobByIdempotency, VideoPromptJobError, type VideoPromptJob, type VideoPromptJobInput } from "./videoPromptJobs";
 import { preflightVideoPrompt } from "./videoPromptReview";
 
 export interface RuntimeVideoPromptHooks {
@@ -69,6 +69,7 @@ export async function prepareVideoPromptForGeneration(db: Knex, input: VideoProm
   const prepared = await actions.prepare(input);
   const completed = await executeVideoPromptJob(db, prepared.job.id, async (job) => {
     const draft = hooks.generateDraft ? await hooks.generateDraft(job, () => actions.generateDraft(job)) : await actions.generateDraft(job);
+    await recordVideoPromptDraft(db,job.id,draft);
     return hooks.reviewDraft ? hooks.reviewDraft(job, draft, () => actions.reviewDraft(job, draft)) : actions.reviewDraft(job, draft);
   });
   if (completed.state !== "succeeded" || !completed.resultPrompt) throw new VideoPromptJobError("CONFLICT", completed.reason ?? "视频提示词生成未完成");

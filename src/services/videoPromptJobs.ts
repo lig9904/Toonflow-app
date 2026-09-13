@@ -54,6 +54,9 @@ export interface VideoPromptJob {
   referenceLabels?: string[];
   promptReview?: VideoPromptReviewReport | null;
   resultPrompt?: string | null;
+  draftPrompt?: string | null;
+  reviewDraftPrompt?: string | null;
+  failureStage?: string | null;
   reason?: string | null;
 }
 
@@ -126,10 +129,11 @@ export async function ensureVideoPromptJobSchema(db: Knex): Promise<void> {
       if (!(await trx.schema.hasColumn(JOBS, column))) await trx.schema.alterTable(JOBS, (table) => table.jsonb(column).nullable());
     }
     if (!(await trx.schema.hasColumn(JOBS, "reviewBinding"))) await trx.schema.alterTable(JOBS, (table) => table.text("reviewBinding").nullable());
+    for (const column of ["draftPrompt", "reviewDraftPrompt", "failureStage"]) if (!(await trx.schema.hasColumn(JOBS, column))) await trx.schema.alterTable(JOBS, table => table.text(column).nullable());
     // A process restart cannot resume an in-memory model call. Resolve jobs
     // left active by the previous process so the UI never polls forever.
     const reason = "提示词任务因服务重启未完成，请重新生成";
-    await trx(JOBS).whereIn("state", ["queued", "running"]).update({ state: "failed", reason, updatedAt: Date.now() });
+    await trx(JOBS).whereIn("state", ["queued", "running"]).update({ state: "failed", reason, failureStage: "interrupted", updatedAt: Date.now() });
     // Version 4.6 did not have durable prompt receipts. Its orphaned track
     // flags must converge too; video generation state lives on o_video.
     await trx("o_videoTrack").where("state", "生成中").update({ state: "生成失败", reason });
@@ -142,7 +146,7 @@ function toJob(row: any): VideoPromptJob {
   return {
     id: String(row.id), projectId: Number(row.projectId), scriptId: Number(row.scriptId), trackId: Number(row.trackId), model: String(row.model), mode: String(row.mode),
     compositionSnapshot: json(row.compositionSnapshot ?? null), referenceLabels: json(row.referenceLabels ?? []), promptReview: json(row.reviewReport ?? null),
-    state: row.state, trackVersion: Number(row.trackVersion), sourceSnapshot: json<VideoPromptSource[]>(row.sourceSnapshot), referenceSnapshot: json(row.referenceSnapshot ?? null), promptInput: String(row.promptInput), resultPrompt: row.resultPrompt ?? null, reason: row.reason ?? null,
+    state: row.state, trackVersion: Number(row.trackVersion), sourceSnapshot: json<VideoPromptSource[]>(row.sourceSnapshot), referenceSnapshot: json(row.referenceSnapshot ?? null), promptInput: String(row.promptInput), resultPrompt: row.resultPrompt ?? null, draftPrompt: row.draftPrompt ?? null, reviewDraftPrompt: row.reviewDraftPrompt ?? null, failureStage: row.failureStage ?? null, reason: row.reason ?? null,
   };
 }
 
@@ -260,7 +264,7 @@ export async function markVideoPromptPreparationFailed(db: Knex, input: Pick<Vid
     const failureKey = `preflight:${hash({ ...input, reason }).slice(0, 100)}`;
     await trx(JOBS).insert({
       id: `vprompt-failed-${hash({ ...input, reason }).slice(0, 40)}`, projectId: input.projectId, scriptId: input.scriptId, trackId: input.trackId,
-      model: "", mode: "", idempotencyKey: failureKey, requestHash: hash({ ...input, reason }), requestIdentityHash: hash(input), state: "failed", trackVersion: Number((await getCreativeState(trx, "track", input.trackId, input.projectId)).version), sourceSnapshot: JSON.stringify([]), referenceSnapshot: JSON.stringify({}), promptInput: "", resultPrompt: null, reason: reason.slice(0, 4000), createdAt: now, updatedAt: now,
+      model: "", mode: "", failureStage: "preparation", idempotencyKey: failureKey, requestHash: hash({ ...input, reason }), requestIdentityHash: hash(input), state: "failed", trackVersion: Number((await getCreativeState(trx, "track", input.trackId, input.projectId)).version), sourceSnapshot: JSON.stringify([]), referenceSnapshot: JSON.stringify({}), promptInput: "", resultPrompt: null, reason: reason.slice(0, 4000), createdAt: now, updatedAt: now,
     }).onConflict(["projectId", "scriptId", "trackId", "idempotencyKey"]).ignore();
     await trx("o_videoTrack").where({ projectId: input.projectId, scriptId: input.scriptId, id: input.trackId, state: "生成中" }).update({ state: "生成失败", reason: reason.slice(0, 4000) });
   });
@@ -282,7 +286,7 @@ async function executeVideoPromptJobOnce(db: Knex, jobId: string, generate: (job
     const row = await trx(JOBS).where({ id: jobId }).forUpdate().first();
     if (!row) throw new VideoPromptJobError("NOT_FOUND", "提示词任务不存在");
     if (row.state === "succeeded" || row.state === "failed" || row.state === "running") return { job: toJob(row), started: false };
-    await trx(JOBS).where({ id: jobId, state: "queued" }).update({ state: "running", updatedAt: Date.now() });
+    await trx(JOBS).where({ id: jobId, state: "queued" }).update({ state: "running", failureStage: "generation", updatedAt: Date.now() });
     return { job: toJob({ ...row, state: "running" }), started: true };
   });
   if (!claimed.started) return claimed.job;
@@ -290,6 +294,7 @@ async function executeVideoPromptJobOnce(db: Knex, jobId: string, generate: (job
     const generated = await generate(claimed.job);
     const resultPrompt = typeof generated === "string" ? generated : generated.prompt;
     const promptReview = typeof generated === "string" ? null : generated.review;
+    await db(JOBS).where({ id: claimed.job.id, state: "running" }).update({ resultPrompt: typeof resultPrompt === "string" ? resultPrompt : null, failureStage: "validation", updatedAt: Date.now() });
     if (typeof resultPrompt !== "string" || !resultPrompt.trim()) throw new VideoPromptJobError("INVALID_INPUT", "模型未返回有效提示词");
     if (promptReview) await db(JOBS).where({ id: claimed.job.id, state: "running" }).update({ reviewReport: JSON.stringify(promptReview), reviewBinding: promptReviewBinding(claimed.job, resultPrompt) });
     // Generated drafts must preserve deterministic source content; semantic uncertainty remains visible.
@@ -297,6 +302,7 @@ async function executeVideoPromptJobOnce(db: Knex, jobId: string, generate: (job
     const invalidReference = deterministicPromptFindings(claimed.job, resultPrompt).find((finding) => ["INVALID_REFERENCE_LABEL", "SPEAKER_CHANGED", "OFFSCREEN_SPEECH_CHANGED"].includes(finding.code));
     if (invalidReference) throw new VideoPromptJobError("INVALID_INPUT", invalidReference.message);
 
+    await db(JOBS).where({ id: claimed.job.id, state: "running" }).update({ failureStage: "save" });
     return await db.transaction(async (trx) => {
       await lockProjectTransaction(trx, claimed.job.projectId);
       const current = await trx("o_videoTrack").where({ id: claimed.job.trackId, projectId: claimed.job.projectId, scriptId: claimed.job.scriptId }).forUpdate().first();
@@ -323,7 +329,7 @@ async function executeVideoPromptJobOnce(db: Knex, jobId: string, generate: (job
       await trx("o_videoTrack").where({ id: claimed.job.trackId, projectId: claimed.job.projectId, scriptId: claimed.job.scriptId }).update({ prompt: resultPrompt, state: "已完成", reason: null });
       const promptModeRevision = (claimed.job.referenceSnapshot as any)?.modeIntent?.revision;
       await acknowledgeVideoPromptReferences(trx, { projectId: claimed.job.projectId, scriptId: claimed.job.scriptId, trackId: claimed.job.trackId, expectedRevision: Number.isSafeInteger(promptModeRevision) ? Number(promptModeRevision) : undefined }, `video-prompt:${claimed.job.id}`);
-      await trx(JOBS).where({ id: claimed.job.id }).update({ state: "succeeded", resultPrompt, reason: null, updatedAt: Date.now() });
+      await trx(JOBS).where({ id: claimed.job.id }).update({ state: "succeeded", resultPrompt, failureStage: null, reason: null, updatedAt: Date.now() });
       return { ...claimed.job, state: "succeeded", resultPrompt, promptReview, reason: null };
     });
   } catch (error) {
@@ -334,4 +340,33 @@ async function executeVideoPromptJobOnce(db: Knex, jobId: string, generate: (job
     });
     throw error;
   }
+}
+
+/** Candidate persistence is separate from selecting the track's saved prompt. */
+export async function recordVideoPromptDraft(db: Knex, jobId: string, text: string, reviewed = false): Promise<void> {
+  if (typeof text !== "string") return;
+  await db(JOBS).where({id:jobId,state:"running"}).update({[reviewed?"reviewDraftPrompt":"draftPrompt"]:text,failureStage:"review",updatedAt:Date.now()});
+}
+export interface VideoPromptFailureView {
+  jobId:string;stage:string;reason:string;
+  drafts:Array<{label:string;text:string}>;
+  sources:Array<{id:number;prompt:string;videoDesc:string}>;
+}
+export function promptJobSuperseded(row:any,track:any,currentVersion:number):boolean {
+  return !!row && row.state==="failed" && ["已完成","未生成"].includes(track?.state) && currentVersion>Number(row.trackVersion);
+}
+export function videoPromptFailureView(row:any):VideoPromptFailureView|null {
+  if(!row || row.state!=="failed")return null;
+  const drafts:Array<{label:string;text:string}>=[];
+  for(const [label,text] of [["生成原稿",row.draftPrompt],["审核建议稿",row.reviewDraftPrompt],["待保存稿",row.resultPrompt]])if(typeof text==="string" && text.trim() && !drafts.some(d=>d.text===text))drafts.push({label,text});
+  let sources:any[]=[];try{const value=typeof row.sourceSnapshot==="string"?JSON.parse(row.sourceSnapshot):row.sourceSnapshot;if(Array.isArray(value))sources=value;}catch{}
+  return {jobId:String(row.id),stage:row.failureStage??"legacy",reason:String(row.reason??"提示词任务未完成"),drafts,sources:sources.map(s=>({id:Number(s.id),prompt:String(s.prompt??""),videoDesc:String(s.videoDesc??"")}))};
+}
+export async function latestVideoPromptFailures(db:Knex,projectId:number,scriptId:number):Promise<Map<number,VideoPromptFailureView|null>> {
+  await ensureVideoPromptJobSchema(db);
+  const rows=await db(JOBS).where({projectId,scriptId}).distinctOn("trackId").orderBy("trackId").orderBy("createdAt","desc").orderBy("id","desc")
+    .select("id","trackId","trackVersion","state","reason","failureStage","draftPrompt","reviewDraftPrompt","resultPrompt","sourceSnapshot");
+  const tracks=await db("o_videoTrack").where({projectId,scriptId}).select("id","state");
+  const versions=await db("ext_creative_state").where({projectId,entityType:"track"}).whereIn("entityId",tracks.map(t=>t.id)).select("entityId","version");
+  return new Map(rows.map(row=>[Number(row.trackId),promptJobSuperseded(row,tracks.find(t=>Number(t.id)===Number(row.trackId)),Number(versions.find(v=>Number(v.entityId)===Number(row.trackId))?.version??0))?null:videoPromptFailureView(row)]));
 }

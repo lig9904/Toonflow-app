@@ -1,3 +1,4 @@
+import { latestVideoPromptFailures, type VideoPromptFailureView } from "@/services/videoPromptJobs";
 import type { VideoPromptReviewReport } from "@/lib/videoPromptContract";
 import express from "express";
 import u from "@/utils";
@@ -29,6 +30,7 @@ interface TrackMedia {
 }
 
 interface TrackItem {
+  promptFailure?: VideoPromptFailureView | null;
   id?: number;
   version: number;
   prompt: string;
@@ -167,6 +169,7 @@ export default router.post(
     const videoJobs = videoList.length ? await u.db("ext_video_jobs").whereIn("videoId", videoList.map((video) => String(video.id))).select("id", "videoId", "status", "upstreamTaskId", "resultUrl") : [];
     const jobByVideo = new Map(videoJobs.map((job) => [Number(job.videoId), job]));
     const trackList: TrackItem[] = [];
+    const promptFailures = await latestVideoPromptFailures(u.db,projectId,scriptId);
     const trackIdMap = [...new Set<number>(trackData.map((t) => t.id!))];
     for (const trackId of trackIdMap) {
       const item = trackData.find((t) => t.id === trackId);
@@ -184,6 +187,7 @@ export default router.post(
       try { modeResolution = await resolveStoredVideoMode(u.db, { projectId, scriptId, trackId, model: projectData.videoModel, capabilities, references: modeSelection.referencesInitialized ? modeSelection.references : defaultReferences, expectedIntentRevision: modeSelection.revision }); }
       catch (error) { modeResolution = { trackId, modeIntent: modeSelection.modeIntent, modeIntentRevision: modeSelection.revision, resolvedMode: null, resolvedReferences: modeSelection.referencesInitialized ? modeSelection.references : defaultReferences, referenceSummary: null, compatibility: { ok: false, code: error instanceof VideoModeResolutionError ? error.code : "VIDEO_MODE_INCOMPATIBLE", message: error instanceof Error ? error.message : "视频生成方式无法匹配" } }; }
       trackList.push({
+        promptFailure:promptFailures.get(trackId)??null,
         id: trackId,
         version: (await getCreativeState(u.db, "track", trackId, projectId)).version,
         duration: item?.duration ?? 0,

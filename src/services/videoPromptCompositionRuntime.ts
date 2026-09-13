@@ -1,7 +1,7 @@
 import u from "../utils";
 import { getConfiguredMediaModel, getConfiguredTextOutputLimit } from "../utils/ai";
 import { composeVideoPrompt } from "./videoPromptComposition";
-import { prepareVideoPromptJob, type VideoPromptJob, type VideoPromptJobInput } from "./videoPromptJobs";
+import { recordVideoPromptDraft, prepareVideoPromptJob, type VideoPromptJob, type VideoPromptJobInput } from "./videoPromptJobs";
 import { reviewGeneratedVideoPrompt } from "./videoPromptReview";
 import type { VideoPromptReviewReport } from "../lib/videoPromptContract";
 import { invokeVideoPromptReview } from "./videoPromptReviewRuntime";
@@ -26,12 +26,13 @@ export async function generateRuntimeVideoPromptDraft(job: VideoPromptJob): Prom
     ...(job.compositionSnapshot.visualManual ? [{ role: "assistant" as const, content: job.compositionSnapshot.visualManual }] : []),
     { role: "user", content: job.promptInput },
   ] });
+  await recordVideoPromptDraft(u.db,job.id,response.text);
   return response.text;
 }
 export async function reviewRuntimeVideoPrompt(job: VideoPromptJob, draft: string): Promise<{ prompt: string; review: VideoPromptReviewReport }> {
   return reviewGeneratedVideoPrompt(job, draft, async (request) => invokeVideoPromptReview(
     request, (options) => u.Ai.Text("universalAi", true, 1).invoke(options), await getConfiguredTextOutputLimit("universalAi"),
-  ));
+  ), candidate=>recordVideoPromptDraft(u.db,job.id,candidate,true));
 }
 export async function generateRuntimeVideoPrompt(job: VideoPromptJob) {
   return reviewRuntimeVideoPrompt(job, await generateRuntimeVideoPromptDraft(job));

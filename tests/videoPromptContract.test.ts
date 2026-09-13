@@ -53,3 +53,28 @@ test("explicit fields, speech verbs, quoted names and line-boundary character di
     assert.doesNotThrow(() => assertVideoPromptDialogue(source, `保留台词：${speech}`, [...names]));
   }
 });
+
+test('legacy inline stage directions stop after complete multi-sentence speech',()=>{
+ const source='甲（同期口型）：不要慌。我会回来。说完下巴微扬。镜头继续推近。';
+ assert.deepEqual(extractVideoDialogue(source,['甲']),['不要慌。我会回来。']);
+ assert.doesNotThrow(()=>assertVideoPromptDialogue(source,'甲说：“不要慌。我会回来。”随后保持表情。',['甲']));
+ assert.throws(()=>assertVideoPromptDialogue(source,'甲说：“不要慌。”',['甲']),/我会回来/);
+});
+test('quoted stage-like speech and quoted terms inside unquoted dialogue are not truncated',()=>{
+ for(const source of ['导演：“镜头继续推近。不要切！”','导演：这叫“风暴”，不是玩笑。']){
+  assert.throws(()=>assertVideoPromptDialogue(source,'空镜',['导演']),/遗漏或改写/);
+ }
+ assert.deepEqual(extractVideoDialogue('导演：“镜头继续推近。不要切！”',['导演']),['镜头继续推近。不要切！']);
+ assert.deepEqual(extractVideoDialogue('导演：这叫“风暴”，不是玩笑。',['导演']),['这叫“风暴”，不是玩笑。']);
+});
+test('inline staging does not hide a swapped speaker or offscreen mismatch',()=>{
+ const source='甲（画外音）：等着我。我很快回来。镜头停在门上。';
+ assert.ok(speakerFindings(source,'乙：“等着我。我很快回来。”',['甲','乙']).some(f=>f.code==='SPEAKER_CHANGED'));
+ assert.ok(speakerFindings(source,'甲：“等着我。我很快回来。”',['甲','乙']).some(f=>f.code==='OFFSCREEN_SPEECH_CHANGED'));
+ assert.deepEqual(speakerFindings(source,'甲（画外音）：“等着我。我很快回来。”',['甲','乙']),[]);
+});
+
+test("paired quotes preserve nested terms and apostrophes",()=>{
+ assert.deepEqual(extractVideoDialogue('甲：“这是‘风暴’，别怕。”镜头拉远。',['甲']),['这是‘风暴’，别怕。']);
+ assert.deepEqual(extractVideoDialogue(`甲：“I'm ready. Don't go.”镜头拉远。`,['甲']),["I'm ready. Don't go."]);
+});

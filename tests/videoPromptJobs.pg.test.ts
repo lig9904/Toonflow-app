@@ -6,7 +6,7 @@ import { ensureTrackWorkspaceSchema, updateTrackPrompt } from "../src/services/t
 import { getCreativeState } from "../src/services/creativeWorkspace";
 import { StructuredModelOutputError } from "../src/lib/structuredModelOutput";
 import { ensureImageReviewSchema } from "../src/services/imageReviews";
-import { executeVideoPromptJob, markVideoPromptPreparationFailed, prepareVideoPromptJob, ensureVideoPromptJobSchema } from "../src/services/videoPromptJobs";
+import { recordVideoPromptDraft, latestVideoPromptFailures, videoPromptFailureView, executeVideoPromptJob, markVideoPromptPreparationFailed, prepareVideoPromptJob, ensureVideoPromptJobSchema } from "../src/services/videoPromptJobs";
 import { prepareVideoPromptForGeneration } from "../src/services/videoPromptCompositionService";
 import { saveVideoModeIntent, saveVideoReferences } from "../src/services/videoModeResolution";
 
@@ -402,5 +402,26 @@ test('official Seedance policy is included even with explicit model prompt mappi
   await f.db('o_modelPrompt').insert({vendorId:'volcengineSd2',model:'doubao-seedance-2-0-mini-260615',path:'video/textMode.md'});
   const value=await composeVideoPrompt(f.db,{model:'volcengineSd2:doubao-seedance-2-0-mini-260615',mode:'text',referenceCount:0,scriptDuration:4,generation:{duration:4,resolution:'480p',audio:true},capabilities:{mode:['text'],audio:'optional',durationResolutionMap:[{duration:[4],resolution:['480p']}]}},{skillsDir:path.resolve('data/skills'),modelPromptDir:path.resolve('data/modelPrompt')});
   assert.ok(value.versions.some(x=>x.key==='video.volcengineOfficial'));assert.match(value.system,/generate_audio 仅控制/);assert.match(value.system,/未实际上传音频/);
+ }finally{await f.destroy();}
+});
+
+
+test("failed validation retains raw and suggested drafts without selecting them; manual save supersedes failure", options, async()=>{
+ const f=await fixture();try{
+  const prepared=await prepareVideoPromptJob(f.db,{projectId:f.projectId,scriptId:f.scriptId,trackId:f.firstTrack,model:"fixture:model",mode:"text",info:[],idempotencyKey:"failure-draft-test",expectedVersion:0});
+  await assert.rejects(executeVideoPromptJob(f.db,prepared.job.id,async job=>{await recordVideoPromptDraft(f.db,job.id,"原稿没有对白");await recordVideoPromptDraft(f.db,job.id,"建议稿仍遗漏对白",true);return "待保存稿没有对白";}),/遗漏或改写/);
+  const row=await f.db("ext_video_prompt_jobs").where({id:prepared.job.id}).first();assert.equal(row.failureStage,"validation");assert.equal(row.draftPrompt,"原稿没有对白");assert.equal(row.resultPrompt,"待保存稿没有对白");assert.equal(videoPromptFailureView(row)?.drafts.length,3);
+  assert.equal((await f.db("o_videoTrack").where({id:f.firstTrack}).first()).prompt,"");
+  assert.ok((await latestVideoPromptFailures(f.db,f.projectId,f.scriptId)).get(f.firstTrack));
+  await updateTrackPrompt(f.db,{projectId:f.projectId,scriptId:f.scriptId,id:f.firstTrack,expectedVersion:0,idempotencyKey:"failure-draft-human-save",prompt:"灵兽说：我已知道"},{id:"human:1",kind:"human"});
+  assert.equal((await latestVideoPromptFailures(f.db,f.projectId,f.scriptId)).get(f.firstTrack),null);
+  assert.equal((await f.db("ext_video_prompt_jobs").where({id:prepared.job.id}).first()).draftPrompt,"原稿没有对白");
+ }finally{await f.destroy();}
+});
+test("a review exception cannot discard the already produced draft", options, async()=>{
+ const f=await fixture();try{
+  const prepared=await prepareVideoPromptJob(f.db,{projectId:f.projectId,scriptId:f.scriptId,trackId:f.firstTrack,model:"fixture:model",mode:"text",info:[],idempotencyKey:"review-draft-test",expectedVersion:0});
+  await assert.rejects(executeVideoPromptJob(f.db,prepared.job.id,async job=>{await recordVideoPromptDraft(f.db,job.id,"灵兽说：我已知道");throw new Error("review unavailable");}),/review unavailable/);
+  const row=await f.db("ext_video_prompt_jobs").where({id:prepared.job.id}).first();assert.equal(row.failureStage,"review");assert.equal(row.draftPrompt,"灵兽说：我已知道");assert.equal((await f.db("o_videoTrack").where({id:f.firstTrack}).first()).prompt,"");
  }finally{await f.destroy();}
 });

@@ -26,8 +26,7 @@ export function promptReviewBinding(job: Pick<VideoPromptJob, "sourceSnapshot" |
 export function deterministicPromptFindings(job: Pick<VideoPromptJob, "sourceSnapshot" | "referenceSnapshot" | "referenceLabels">, prompt: string): VideoPromptFinding[] {
   const assets = (job.referenceSnapshot as any)?.linkedAssets ?? [];
   const names = assets.filter((asset: any) => asset.type === "role").map((asset: any) => String(asset.name ?? ""));
-  const source = buildStoryboardVideoPrompt(job.sourceSnapshot);
-  return [...dialogueFindings(source, prompt, names), ...speakerFindings(source, prompt, names), ...referenceLabelFindings(prompt, job.referenceLabels ?? [])];
+  return [...job.sourceSnapshot.flatMap(shot => { const source=buildStoryboardVideoPrompt([shot]); return [...dialogueFindings(source,prompt,names),...speakerFindings(source,prompt,names)].map(finding=>({...finding,shotId:shot.id})); }), ...referenceLabelFindings(prompt, job.referenceLabels ?? [])];
 }
 function preservesExplicitIntent(job: VideoPromptJob, draft: string, candidate: string): boolean {
   const source = buildStoryboardVideoPrompt(job.sourceSnapshot);
@@ -38,7 +37,7 @@ function preservesExplicitIntent(job: VideoPromptJob, draft: string, candidate: 
 }
 
 /** One text-only review, with at most one returned minimal correction. No media calls or retries. */
-export async function reviewGeneratedVideoPrompt(job: VideoPromptJob, draft: string, model: VideoPromptReviewModel): Promise<{ prompt: string; review: VideoPromptReviewReport }> {
+export async function reviewGeneratedVideoPrompt(job: VideoPromptJob, draft: string, model: VideoPromptReviewModel, onCandidate?: (text:string)=>Promise<void>): Promise<{ prompt: string; review: VideoPromptReviewReport }> {
   const deterministic = deterministicPromptFindings(job, draft);
   const reviewedAt = Date.now();
   if (!job.compositionSnapshot) return { prompt: draft, review: { status: "skipped", findings: deterministic, summary: "旧任务未保存复核模板快照，仅执行确定性检查", revised: false, reviewedAt } };
@@ -48,6 +47,7 @@ export async function reviewGeneratedVideoPrompt(job: VideoPromptJob, draft: str
     let revised = false;
     // Never accept a cosmetic rewrite, and require all deterministic content checks after correction.
     const candidate = response.correctedPrompt?.trim();
+    if(candidate)await onCandidate?.(candidate);
     if (candidate && candidate !== draft && (deterministic.length || response.findings.some((finding) => finding.severity === "error")) && deterministicPromptFindings(job, candidate).length === 0 && preservesExplicitIntent(job, draft, candidate)) { prompt = candidate; revised = true; }
     const findings = [...deterministicPromptFindings(job, prompt), ...response.findings.map((finding) => ({ ...finding, ...(revised ? { message: `原稿发现（已应用一次最小修正，修正后待语义复核）：${finding.message}` } : {}) }))];
     return { prompt, review: { status: findings.length ? "issues" : "passed", findings, summary: revised ? `${response.summary} 已应用一次最小修正；原发现保留，修正效果未经再次语义复核。` : response.summary, revised, reviewedAt } };

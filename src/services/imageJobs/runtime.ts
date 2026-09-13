@@ -202,6 +202,7 @@ export class ImageGenerationService {
   private readonly pollMs: number;
   private schema?: Promise<void>;
   private timer?: ReturnType<typeof setInterval>;
+  private recovery?: Promise<void>;
   private readonly artifactHashes = new Map<string, string | null>();
 
   constructor(options: ImageGenerationServiceOptions) {
@@ -299,9 +300,16 @@ export class ImageGenerationService {
     return this.submitAndWait({ projectId: input.projectId, jobId: prepared.jobId, maxWaitMs });
   }
 
-  async recover(): Promise<void> {
+  recover(): Promise<void> {
+    if (this.recovery) return this.recovery;
+    this.recovery = this.recoverOnce().finally(() => { this.recovery = undefined; });
+    return this.recovery;
+  }
+
+  private async recoverOnce(): Promise<void> {
     await this.ensure();
-    const orphans = await this.db("ext_image_jobs as job").leftJoin(`${BINDINGS} as binding`, "binding.jobId", "job.id").whereNull("binding.jobId").select("job.id");
+    const orphans = await this.db("ext_image_jobs as job").leftJoin(`${BINDINGS} as binding`, "binding.jobId", "job.id").whereNull("binding.jobId")
+      .whereNotIn("job.status", ["FAILED", "RECONCILIATION_REQUIRED"]).select("job.id").orderBy("job.id").limit(25);
     for (const row of orphans) {
       const job = await this.jobs.get(Number(row.id));
       const context = job.payload.context as BindingContext | undefined;
@@ -317,8 +325,21 @@ export class ImageGenerationService {
       }
     }
     await this.jobs.resumeDueJobs();
-    const rows = await this.db("ext_image_jobs").whereIn("status", ["SUCCEEDED", "FAILED", "RECONCILIATION_REQUIRED"]);
+    // Finished history can contain large request bodies. Fetch only IDs whose
+    // binding still needs repair, never deserialize the entire history each tick.
+    const rows = await this.db("ext_image_jobs as job").join(`${BINDINGS} as binding`, "binding.jobId", "job.id")
+      .whereIn("job.status", ["FAILED", "RECONCILIATION_REQUIRED"]).whereRaw("?? <> ??", ["binding.state", "job.status"])
+      .select("job.id").orderBy("job.id").limit(25);
     for (const row of rows) await this.syncTerminal(await this.jobs.get(Number(row.id)));
+    if (this.options.imageReviews) {
+      const pendingReviews = this.db("ext_image_jobs as job").where("job.status", "SUCCEEDED");
+      if (isPostgres(this.db)) pendingReviews.whereRaw("job.payload::jsonb #> '{context,imageReview}' IS NOT NULL");
+      else pendingReviews.whereRaw("json_extract(job.payload, '$.context.imageReview') IS NOT NULL");
+      if (await this.db.schema.hasTable("ext_image_reviews")) pendingReviews.whereNotExists(
+        this.db("ext_image_reviews as review").select(this.db.raw("1")).whereRaw("?? = ??", ["review.jobId", "job.id"]));
+      const reviews = await pendingReviews.select("job.id").orderBy("job.id").limit(25);
+      for (const row of reviews) await this.syncTerminal(await this.jobs.get(Number(row.id)));
+    }
   }
 
   async continueKnown(jobId: number): Promise<ImageJob> {
@@ -330,8 +351,9 @@ export class ImageGenerationService {
 
   start(): void {
     if (this.timer) return;
-    void this.recover();
-    this.timer = setInterval(() => { void this.recover().catch((error) => console.error("[imageJobs] recovery tick failed", error)); }, this.pollMs);
+    const tick = () => { if (!this.recovery) void this.recover().catch((error) => console.error("[imageJobs] recovery tick failed", error)); };
+    tick();
+    this.timer = setInterval(tick, this.pollMs);
     this.timer.unref?.();
   }
 

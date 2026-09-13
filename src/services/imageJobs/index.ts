@@ -220,6 +220,7 @@ export class ImageJobService {
   private readonly timers = new Map<number, ReturnType<typeof setTimeout>>();
   private running = 0;
   private stopped = false;
+  private recovery?: Promise<void>;
   private readonly waiters: Array<() => void> = [];
 
   constructor(db: Knex, dependencies: ImageJobDependencies);
@@ -292,21 +293,29 @@ export class ImageJobService {
     return this.runExclusive(jobId, () => this.runJob(jobId, false));
   }
 
-  async resumeDueJobs(): Promise<void> {
+  resumeDueJobs(): Promise<void> {
+    if (this.recovery) return this.recovery;
+    this.recovery = this.resumeDueJobsOnce().finally(() => { this.recovery = undefined; });
+    return this.recovery;
+  }
+
+  private async resumeDueJobsOnce(): Promise<void> {
     if (this.stopped) return;
     const now = this.now();
     await this.db.transaction(async (trx) => {
-      const stranded = await trx<JobRow>(TABLE).where({ status: "SUBMITTING" }).whereNull("upstreamTaskId");
+      const stranded = await trx<JobRow>(TABLE).where({ status: "SUBMITTING" }).whereNull("upstreamTaskId")
+        .select("id", "status", "executionMode", "updatedAt", "submissionLeaseUntil", "submissionOwner", "upstreamTaskId");
       for (const row of stranded) {
         if (this.localSubmitting.has(Number(row.id))) continue;
         const leaseUntil = row.submissionLeaseUntil == null
           ? Number(row.updatedAt) + (row.executionMode === "sync" ? SYNC_SUBMISSION_LEASE_MS : this.submissionLeaseMs)
           : Number(row.submissionLeaseUntil);
         if (leaseUntil > now) continue;
-        await this.markReconciliation(trx, row, row.executionMode === "sync" ? "同步图片请求租约已到期，结果未知，禁止重复提交" : "提交前进程中断，未记录上游任务 ID", { status: "SUBMITTING", owner: row.submissionOwner, submissionLeaseUntil: row.submissionLeaseUntil == null ? null : Number(row.submissionLeaseUntil), upstreamTaskId: row.upstreamTaskId });
+        const fullRow = await trx<JobRow>(TABLE).where({ id: row.id, status: "SUBMITTING" }).whereNull("upstreamTaskId").first();
+        if (fullRow) await this.markReconciliation(trx, fullRow, row.executionMode === "sync" ? "同步图片请求租约已到期，结果未知，禁止重复提交" : "提交前进程中断，未记录上游任务 ID", { status: "SUBMITTING", owner: row.submissionOwner, submissionLeaseUntil: row.submissionLeaseUntil == null ? null : Number(row.submissionLeaseUntil), upstreamTaskId: row.upstreamTaskId });
       }
     });
-    const rows = await this.db<JobRow>(TABLE).whereIn("status", ["POLLING", "DOWNLOADING"]);
+    const rows = await this.db<JobRow>(TABLE).whereIn("status", ["POLLING", "DOWNLOADING"]).select("id", "nextPollAt");
     const due = rows.filter((row) => row.nextPollAt == null || Number(row.nextPollAt) <= now);
     for (const row of rows.filter((item) => item.nextPollAt != null && Number(item.nextPollAt) > now)) this.schedule(Number(row.id), Number(row.nextPollAt));
     await Promise.all(due.map((row) => this.runExclusive(Number(row.id), () => this.runJob(Number(row.id), false))));

@@ -1,0 +1,3 @@
+import test from 'node:test';import assert from 'node:assert/strict';import {databasePoolSettings} from '../src/lib/databasePool';
+test('database pool keeps team-sized headroom and allows overrides',()=>{assert.deepEqual(databasePoolSettings({}).pool,{min:2,max:30,idleTimeoutMillis:60000});assert.equal(databasePoolSettings({TOONFLOW_DB_POOL_MIN:'0',TOONFLOW_DB_POOL_MAX:'50'}).pool.max,50)});
+test('database pool rejects malformed or contradictory bounds',()=>{for(const e of [{TOONFLOW_DB_POOL_MAX:'NaN'},{TOONFLOW_DB_POOL_MAX:'0'},{TOONFLOW_DB_POOL_MAX:'2.5'},{TOONFLOW_DB_POOL_MIN:'40',TOONFLOW_DB_POOL_MAX:'30'}])assert.throws(()=>databasePoolSettings(e))});

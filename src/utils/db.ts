@@ -1,3 +1,4 @@
+import { databasePoolSettings } from "@/lib/databasePool";
 import { readFile, writeFile } from "fs/promises";
 import knex from "knex";
 import initDB from "@/lib/initDB";
@@ -32,8 +33,8 @@ configurePostgresTypeParsers();
 
 const db = knex({
   client: "pg",
-  connection: connectionString,
-  pool: { min: 0, max: 10 },
+  connection: { connectionString, application_name: "toonflow-app" },
+  ...databasePoolSettings(),
 });
 
 export const dbReady = (async () => {

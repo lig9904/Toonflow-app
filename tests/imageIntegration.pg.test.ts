@@ -345,3 +345,24 @@ test('running builtin jobs keep chosen root images while still applying new deri
   for(const [id,previous,expectedSelected] of [[rootId,oldImageId,false],[childId,0,true]] as const){const prepared=await service.prepare({generationKey:`protect-root-${id}`,projectId:f.projectId,modelKey:'zhenzhen:seedream-v5',config:{prompt:'same identity',referenceList:[],size:'1K',aspectRatio:'16:9'},target:{kind:'asset',id,scriptId:f.scriptId,expectedVersion:previous},builtinRun:{id:runId,inputRevision:0}});const result=await service.submitAndWait({projectId:f.projectId,jobId:prepared.jobId});assert.equal(result.status,'succeeded');assert.equal(result.selected,expectedSelected);const row=await f.db('o_assets').where({id}).first();if(!expectedSelected)assert.equal(Number(row.imageId),oldImageId);else assert.ok(Number(row.imageId)>0);}
  }finally{await f.destroy();}
 });
+
+test('recovery is single-flight and does not reload settled historical payloads', options, async()=>{
+ const f=await fixture();try{
+  const id=await asset(f);const service=jobs(f.db,provider({submits:[],queries:[]}));
+  await generateRootAssetImage(f.db,service,{projectId:f.projectId,assetId:id,type:'role',name:'history',prompt:'history',model:'zhenzhen:seedream-v5',resolution:'1K',generationKey:'settled-history-key',expectedVersion:0});
+  const internal=(service as any).jobs;let entered!:()=>void,release!:()=>void,calls=0,reads=0;const started=new Promise<void>(r=>entered=r),gate=new Promise<void>(r=>release=r);
+  internal.resumeDueJobs=async()=>{calls++;entered();await gate};internal.get=async()=>{reads++;throw new Error('Settled history must not be loaded')};
+  const pending=Array.from({length:30},()=>service.recover());await started;assert.equal(calls,1);release();await Promise.all(pending);assert.equal(calls,1);assert.equal(reads,0);
+  await service.recover();assert.equal(calls,2,'later ticks can run after completion');assert.equal(reads,0);
+ }finally{await f.destroy();}
+});
+
+test('recovery queues only missing reviews and skips already reviewed successful history', options, async()=>{
+ const f=await fixture();try{
+  const service=jobs(f.db,provider({submits:[],queries:[]}));const id=await asset(f);const result=await generateRootAssetImage(f.db,service,{projectId:f.projectId,assetId:id,type:'role',name:'review',prompt:'review',model:'zhenzhen:seedream-v5',resolution:'1K',generationKey:'review-recovery-key',expectedVersion:0});
+  const row=await f.db('ext_image_jobs').where({id:result.jobId}).first();const payload=JSON.parse(row.payload);payload.context.imageReview={version:1};await f.db('ext_image_jobs').where({id:row.id}).update({payload:JSON.stringify(payload)});
+  await f.db.schema.createTable('ext_image_reviews',t=>{t.integer('jobId').primary()});let queued=0;
+  (service as any).options.imageReviews={enqueue:async(input:any)=>{queued++;await f.db('ext_image_reviews').insert({jobId:input.jobId})}};
+  await service.recover();assert.equal(queued,1);await service.recover();assert.equal(queued,1,'finished review must not enqueue every second');
+ }finally{await f.destroy();}
+});

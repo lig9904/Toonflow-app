@@ -125,6 +125,7 @@ export function createProductionMediaCapabilities(deps: Dependencies): Productio
           referenceAssets, referencePaths,
           config: { prompt, size: String(request.params.size ?? ""), aspectRatio: String(request.params.aspectRatio ?? ""), referenceList: references as Array<{ type: "image"; base64: string }> },
           target: { kind: request.targetKind, id: request.targetId, scriptId: request.scriptId, expectedVersion },
+          ...(request.targetKind === "asset" && typeof request.params.expectedAssetVersion === "number" ? { sourceVersion: request.params.expectedAssetVersion } : {}),
           builtinRun: { id: request.ctx.run.id, inputRevision: request.ctx.run.inputRevision ?? 0 },
         });
         await request.ctx.emit("media.reserved", { kind: "image", jobId: receipt.jobId, targetKind: request.targetKind, targetId: request.targetId });

@@ -512,7 +512,12 @@ export class ImageGenerationService {
       const asset = await trx("o_assets").where({ id: Number(binding.targetId), projectId: job.projectId }).first();
       const sourceVersionCurrent = binding.sourceVersion == null || (await getCreativeState(trx, "asset", Number(binding.targetId), job.projectId)).version === Number(binding.sourceVersion);
       const pointerIsExpected = asset && (Number(asset.imageId) === candidateImageId || (binding.runId && Number(asset.imageId ?? 0) === Number(binding.previousImageId ?? 0)));
-      selected = Boolean(runMaySelect && sourceVersionCurrent && referencesCurrent && pointerIsExpected && assetSignature(asset) === binding.targetSignature && !(await lockedAssetReference(trx, Number(binding.targetId))));
+      const priorRootImage = binding.runId && asset?.assetsId == null && binding.previousImageId != null
+        ? await trx("o_image").where({ id: Number(binding.previousImageId), assetsId: Number(binding.targetId), state: "已完成" }).first() : undefined;
+      // Builtin background runs may add a root-image candidate, but an existing
+      // chosen root remains authoritative. Derived rows have their own pointer.
+      const preserveRootSelection = Boolean(priorRootImage?.filePath);
+      selected = Boolean(!preserveRootSelection && runMaySelect && sourceVersionCurrent && referencesCurrent && pointerIsExpected && assetSignature(asset) === binding.targetSignature && !(await lockedAssetReference(trx, Number(binding.targetId))));
       if (selected && asset && Number(asset.imageId) !== candidateImageId) await trx("o_assets").where({ id: asset.id, projectId: job.projectId, imageId: binding.previousImageId ?? null }).update({ imageId: candidateImageId });
       if (!selected && asset && Number(asset.imageId) === candidateImageId) {
         await trx("o_assets").where({ id: asset.id, projectId: job.projectId, imageId: candidateImageId }).update({ imageId: binding.previousImageId == null ? null : Number(binding.previousImageId) });

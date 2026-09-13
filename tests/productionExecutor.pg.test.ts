@@ -698,3 +698,20 @@ test('format retry is budgeted and does not repeat saved planning', options, asy
   const retry=await f.db('ext_builtin_run_steps').where({runId:result.run.id,stepKey:'production.review.formatRetry:r0'}).first();assert.equal(retry.status,'completed');assert.equal(retry.modelCall,true);
  }finally{await f.destroy();}
 });
+
+test('derived-only commands override a planner that targets roots and preserve root images', options, async()=>{
+ const f=await fixture();const targets:number[]=[];
+ try{
+  const [oldImage]=await insertRowsReturningIds(f.db,'o_image',{assetsId:f.assetId,state:'已完成',filePath:'/old-root.jpg',type:'role'});await f.db('o_assets').where({id:f.assetId}).update({imageId:oldImage});
+  const model=modelFor(req=>req.role==='productionAgent:decisionAgent'?{actions:['generateImages','storyboard'],assetIds:[f.assetId],storyboardIds:[],question:'Which asset?',summary:'wrong plan'}:{assets:[{parentAssetId:f.assetId,id:null,expectedVersion:null,name:'Wet variant',description:'Same hero after rain'}]},[]);
+  const result=await runOnce(f,model,{generateImage:async req=>{targets.push(req.targetId);return{status:'succeeded',jobId:1,selected:true}}},{...defaultBuiltinRunLimits,maxImageGenerations:1},'生产衍生资产');
+  assert.equal(result.run.status,'succeeded',result.run.errorMessage??'');const child=await f.db('o_assets').where({assetsId:f.assetId}).first();assert.ok(child);assert.deepEqual(targets,[Number(child.id)]);assert.equal(Number((await f.db('o_assets').where({id:f.assetId}).first()).imageId),oldImage);assert.equal((await f.db('o_storyboard').where({projectId:f.projectId})).length,0);
+ }finally{await f.destroy();}
+});
+test('empty derived analysis and full production never fall back to regenerating completed roots', options, async()=>{
+ for(const prompt of ['生成全部衍生资产','全部生成']){const f=await fixture();let images=0;try{
+  const [oldImage]=await insertRowsReturningIds(f.db,'o_image',{assetsId:f.assetId,state:'已完成',filePath:'/old-root.jpg',type:'role'});await f.db('o_assets').where({id:f.assetId}).update({imageId:oldImage});
+  const model=modelFor(req=>req.role==='productionAgent:decisionAgent'?{actions:['generateImages'],assetIds:[f.assetId],storyboardIds:[],question:null,summary:'all'}:{assets:[]},[]);
+  const result=await runOnce(f,model,{generateImage:async()=>{images++;return{status:'succeeded',jobId:1}}},defaultBuiltinRunLimits,prompt);assert.equal(result.run.status,'succeeded',result.run.errorMessage??'');assert.equal(images,0);assert.equal(Number((await f.db('o_assets').where({id:f.assetId}).first()).imageId),oldImage);
+ }finally{await f.destroy();}}
+});

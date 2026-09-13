@@ -334,3 +334,14 @@ async function prepareRootAssetImageForTest(db: Knex, service: ImageGenerationSe
   const cfg = `style:${project.artStyle};name:${input.name};prompt:${input.prompt}`;
   return service.prepare({ generationKey: input.generationKey, projectId: input.projectId, modelKey: input.model, config: { prompt: cfg, referenceList: [], size: input.resolution, aspectRatio: "16:9" }, target: { kind: "asset", id: input.assetId } });
 }
+
+test('running builtin jobs keep chosen root images while still applying new derived images', options, async()=>{
+ const f=await fixture();try{
+  await f.db.schema.createTable('ext_builtin_runs',t=>{t.uuid('id').primary();t.bigInteger('projectId');t.text('status');t.integer('inputRevision');t.integer('requestedBy');t.integer('executionUserId')});
+  await f.db.schema.createTable('team_users',t=>{t.integer('user_id').primary();t.boolean('enabled');t.text('role')});await f.db('team_users').insert({user_id:7,enabled:true,role:'editor'});
+  const runId='00000000-0000-4000-8000-000000000011';await f.db('ext_builtin_runs').insert({id:runId,projectId:f.projectId,status:'running',inputRevision:0,requestedBy:7});
+  const rootId=await asset(f,{name:'selected-root'});const [oldImageId]=await insertRowsReturningIds(f.db,'o_image',{assetsId:rootId,filePath:'/old.jpg',state:'已完成',type:'role'});await f.db('o_assets').where({id:rootId}).update({imageId:oldImageId});
+  const childId=await asset(f,{name:'child',assetsId:rootId});const service=jobs(f.db,provider({submits:[],queries:[]}));
+  for(const [id,previous,expectedSelected] of [[rootId,oldImageId,false],[childId,0,true]] as const){const prepared=await service.prepare({generationKey:`protect-root-${id}`,projectId:f.projectId,modelKey:'zhenzhen:seedream-v5',config:{prompt:'same identity',referenceList:[],size:'1K',aspectRatio:'16:9'},target:{kind:'asset',id,scriptId:f.scriptId,expectedVersion:previous},builtinRun:{id:runId,inputRevision:0}});const result=await service.submitAndWait({projectId:f.projectId,jobId:prepared.jobId});assert.equal(result.status,'succeeded');assert.equal(result.selected,expectedSelected);const row=await f.db('o_assets').where({id}).first();if(!expectedSelected)assert.equal(Number(row.imageId),oldImageId);else assert.ok(Number(row.imageId)>0);}
+ }finally{await f.destroy();}
+});

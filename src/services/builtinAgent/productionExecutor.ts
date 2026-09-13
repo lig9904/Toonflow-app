@@ -16,6 +16,7 @@ import pLimit from "p-limit";
 import { builtinThinkLevelFromIntent, hasIndependentProductionOutput, hasUnlimitedMediaBudget } from "./contracts";
 import { productionActionLabels, productionDecisionPrompt, productionStageContract, explicitProductionTextScope, isExplicitVideoOnlyRequest, explicitVideoSettings } from "./productionPrompts";
 import { reconcileStoryboardAssetIds } from "../../lib/storyboardVisualContract";
+import { isDerivedAssetGenerationRequest, isFullProductionRequest } from "./productionPrompts";
 
 export interface ProductionMediaRequest {
   ctx: BuiltinExecutionContext;
@@ -61,7 +62,7 @@ const planSchema = z.object({
   videoSettings: z.object({ resolution: z.string().max(50).nullable().default(null), audio: z.boolean().nullable().default(null) }).strict().nullable().default(null),
 }).strict();
 const planningSchema = z.object({ scriptPlan: z.string().min(1).max(200_000) }).strict();
-const deriveSchema = z.object({ assets: z.array(z.object({ id: z.number().int().positive().nullable().default(null), expectedVersion: z.number().int().nonnegative().nullable().default(null), parentAssetId: z.number().int().positive(), name: z.string().trim().min(1).max(500), description: z.string().max(20_000) }).strict()).max(500) }).strict();
+const deriveSchema = z.object({ assets: z.array(z.object({ id: z.number().int().positive().nullable().default(null), expectedVersion: z.number().int().nonnegative().nullable().default(null), parentAssetId: z.number().int().positive(), name: z.string().trim().min(1).max(500), description: z.string().max(20_000) }).strict()).max(500), summary: z.string().max(2000).default("") }).strict();
 const storyboardSchema = z.object({
   items: z.array(z.object({
     id: z.number().int().positive().nullable().default(null),
@@ -264,6 +265,25 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
       requestedActions.clear();
       for (const action of explicitTextScope) requestedActions.add(action);
     }
+    const derivedOnly = isDerivedAssetGenerationRequest(requestText);
+    const fullProduction = isFullProductionRequest(requestText);
+    if (derivedOnly) {
+      const childParents = new Map<number, number>(flow.assets.flatMap((parent: any) => parent.derive.map((child: any) => [Number(child.id), Number(parent.id)])));
+      if (!plan.assetIds.length) plan.assetIds = flow.assets.map((asset: any) => Number(asset.id));
+      const childrenOnly = plan.assetIds.length > 0 && plan.assetIds.every(id => childParents.has(id));
+      requestedActions.clear();
+      if (!childrenOnly) {
+        requestedActions.add("deriveAssets");
+        plan.assetIds = [...new Set(plan.assetIds.map(id => childParents.get(id) ?? id))];
+      }
+      requestedActions.add("generateImages");
+      plan.storyboardIds = [];
+      plan.mediaInstructions = [];
+      plan.question = null;
+    } else if (fullProduction && requestedActions.has("generateImages") && flow.assets.length) {
+      requestedActions.add("deriveAssets");
+      if (!plan.assetIds.length) plan.assetIds = flow.assets.map((asset: any) => Number(asset.id));
+    }
     const actions: CanonicalPhase[] = ORDER.filter((action) => requestedActions.has(action));
     let knownTopAssets = new Set(flow.assets.map((asset: any) => Number(asset.id)));
     let knownAssets = new Set(flow.assets.flatMap((asset: any) => [Number(asset.id), ...asset.derive.map((child: any) => Number(child.id))]));
@@ -332,6 +352,7 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
           return ids;
         });
         output.derivedAssets = created;
+        output.derivedSummary = derived.summary;
         const savedAssetIds = (created as Array<{ id: number; reused?: boolean }>).filter((item) => !item.reused).map((item) => Number(item.id));
         targetAssetIds = savedAssetIds;
         flow = await refreshFlow("deriveAssets");
@@ -339,7 +360,7 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
         knownAssets = new Set(flow.assets.flatMap((asset: any) => [Number(asset.id), ...asset.derive.map((child: any) => Number(child.id))]));
         if (selected.has("generateImages")) targetAssetIds = [...new Set([...targetAssetIds, ...flow.assets.filter((asset: any) => requestedParentIds.includes(Number(asset.id))).flatMap((asset: any) => asset.derive.filter((child: any) => !child.src).map((child: any) => Number(child.id)))])];
         if (savedAssetIds.length) await ctx.emit("artifact.saved", { kind: "assets", ids: savedAssetIds });
-        else await ctx.emit("message.completed", { text: targetAssetIds.length && selected.has("generateImages") ? `衍生描述已存在，准备生成 ${targetAssetIds.length} 个缺失的衍生素材图片。` : "衍生素材分析完成，本次没有新增或更新衍生版本。" });
+        else await ctx.emit("message.completed", { text: targetAssetIds.length && selected.has("generateImages") ? `衍生描述已存在，准备生成 ${targetAssetIds.length} 个缺失的衍生素材图片。` : `衍生素材分析完成，本次没有新增或更新衍生版本。${derived.summary}` });
         if (savedAssetIds.length && !selected.has("generateImages")) await ctx.emit("message.completed", { text: `已保存 ${savedAssetIds.length} 个衍生素材描述，本次没有生成图片。需要出图时可授权图片次数并生成衍生素材图片。` });
       } else if (action === "storyboard") {
         // Long shot lists can use tokens left over from the compact director plan.
@@ -400,7 +421,8 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
       } else if (action === "generateImages" || action === "generateVideos") {
         if (!deps.media || (action === "generateImages" ? typeof deps.media.generateImage !== "function" : typeof deps.media.generateVideo !== "function")) throw new BuiltinRuntimeError("INVALID_INPUT", `${action} 媒体能力未配置，不能声称已完成`);
         const storyboardIds = targetStoryboardIds;
-        const assetIds = action === "generateImages" ? targetAssetIds : [];
+        const assetIds = action === "generateImages" ? [...new Set([...targetAssetIds,
+          ...(fullProduction ? flow.assets.filter((asset: any) => !asset.src).map((asset: any) => Number(asset.id)) : [])])] : [];
         const targets: MediaTarget[] = [];
         if (action === "generateVideos") {
           const grouped = new Map<number, number[]>();
@@ -409,6 +431,9 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
         } else {
           targets.push(...assetIds.map((id) => ({ targetKind: "asset" as const, targetId: id, storyboardIds: [], source: flow.assets.flatMap((asset: any) => [asset, ...asset.derive]).find((asset: any) => Number(asset.id) === id) })));
           targets.push(...storyboardIds.map((id) => ({ targetKind: "storyboard" as const, targetId: id, storyboardIds: [id], source: knownStoryboards.get(id) })));
+        }
+        if (derivedOnly && targets.some(target => target.targetKind !== "asset" || target.source?.assetsId == null)) {
+          throw new BuiltinRuntimeError("INVALID_INPUT", "衍生素材任务只能写入衍生素材，不能替换原资产");
         }
         const limit = action === "generateImages" ? run.limits.maxImageGenerations : run.limits.maxVideoGenerations;
         if (action === "generateImages" && selected.has("deriveAssets") && !targets.length) {
@@ -454,6 +479,7 @@ export function createProductionAgentExecutor(deps: ProductionExecutorDependenci
             expectedVersions: Object.fromEntries(videoSources.map((item) => [Number(item.id), Number(item.collaboration?.version ?? 0)])),
           } : { ...(project.visualStyleGuideConfigured ? {visualStyleGuide:project.visualStyleGuide} : {}), prompt: [storedImagePrompt, project.artStyle ? `画风：${project.artStyle}` : "", imageRequest ? `本目标画面要求：${imageRequest}` : ""].filter(Boolean).join("\n"), imageInstruction: imageRequest, size: project.imageQuality, aspectRatio: project.videoRatio,
             expectedVersion: target.targetKind === "storyboard" ? Number(source.collaboration?.version ?? 0) : Number(source.imageId ?? 0),
+            ...(target.targetKind === "asset" ? { expectedAssetVersion: Number(source.version ?? 0) } : {}),
             referenceAssetIds: target.targetKind === "storyboard" ? source.associateAssetsIds ?? [] : source.assetsId != null ? [Number(source.assetsId)] : Number(source.imageId ?? 0) > 0 ? [target.targetId] : [],
             referenceStoryboardIds: [] };
           if (action === "generateVideos" && (videoParams.mode === undefined || videoParams.resolution === undefined || Number(videoParams.duration) <= 0)) throw new BuiltinRuntimeError("INVALID_INPUT", "视频生成缺少已验证的模式、分辨率、时长或提示词");

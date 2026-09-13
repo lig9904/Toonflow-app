@@ -418,7 +418,14 @@ export function teamAuthMiddleware(db: Db, options: { allowedOrigins?: readonly 
       (req as any).teamPrincipal = principal;
       next();
     } catch (error) {
-      const e = error instanceof TeamSecurityError ? error : new TeamSecurityError("AUTH_FAILED", "认证失败", 401);
+      // A database outage is not evidence of an invalid session. Keep access
+      // denied while allowing clients to retain their cookie and retry.
+      if (!(error instanceof TeamSecurityError)) {
+        res.setHeader("Retry-After", "3");
+        res.status(503).send({ code: "AUTH_SERVICE_UNAVAILABLE", message: "登录验证服务暂时繁忙，请稍后重试；当前登录状态已保留" });
+        return;
+      }
+      const e = error;
       res.status(e.status).send({ code: e.code, message: e.message });
     }
   };
